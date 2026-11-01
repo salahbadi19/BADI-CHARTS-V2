@@ -1,22 +1,16 @@
 /* =============================================================================
- * TRADING CHART ENGINE - Pure JavaScript Canvas Implementation
- * TradingView-inspired charting library built from scratch.
- * No HTML elements for UI, no CSS styling - everything is canvas-drawn.
+ * TRADING CHART ENGINE v2 — Pixel-Perfect Pure JavaScript Canvas
  *
- * Features:
- *   - Candlestick chart with wicks
- *   - Volume histogram
- *   - Right-side price axis, bottom time axis
- *   - Grid lines (auto-spaced)
- *   - Crosshair with price/time labels
- *   - Pan (drag) and zoom (wheel)
- *   - Auto-scale price to visible range
- *   - Real-time tick simulation
- *   - Indicators: MA, EMA, Bollinger Bands, RSI, MACD, Volume SMA
- *   - Drawing tools: trendline, horizontal line, rectangle, fibonacci
- *   - Toolbar drawn on canvas (symbol, timeframe, indicators, tools)
- *   - Status bar with OHLC legend
- *   - Dark theme matching TradingView
+ * Algorithms ported 1:1 from TradingView Lightweight Charts (v5):
+ *   - optimalCandlestickWidth()  — exact same formula
+ *   - candlestickWidth()         — wick parity adjustment
+ *   - PriceTickSpanCalculator    — same dividers [2, 2.5, 2] rotation
+ *   - PriceTickMarkBuilder       — same min(spans) approach
+ *   - TickMarks.build()          — weight-based mark selection
+ *   - Coordinate transforms      — internalHeight + scaleMargins
+ *   - HiDPI rendering            — bitmap vs media coordinates
+ *
+ * No HTML elements for UI, no CSS styling — everything is canvas-drawn.
  * ============================================================================= */
 
 (function () {
@@ -37,42 +31,377 @@ const THEME = {
   textFade:      '#5d606b',
   bull:          '#26a69a',
   bear:          '#ef5350',
-  bullWick:      '#26a69a',
-  bearWick:      '#ef5350',
-  bullVol:       'rgba(38,166,154,0.55)',
-  bearVol:       'rgba(239,83,80,0.55)',
+  bullVol:       'rgba(38,166,154,0.50)',
+  bearVol:       'rgba(239,83,80,0.50)',
   accent:        '#2962ff',
-  accentDim:     'rgba(41,98,255,0.18)',
   crosshair:     '#787b86',
-  crosshairDot:  '#ffffff',
-  crosshairLabel:'#2a2e39',
+  crosshairLabel:'#363a45',
   ma1:           '#2962ff',
-  ma2:            '#ff9800',
-  ma3:            '#e91e63',
+  ma2:           '#ff9800',
+  ma3:           '#e91e63',
   bollingerMid:  '#ff9800',
-  bollingerBand: 'rgba(156,39,176,0.45)',
+  bollingerBand: 'rgba(156,39,176,0.40)',
   rsi:           '#7e57c2',
   rsiOver:       '#ef5350',
   rsiUnder:      '#26a69a',
   macd:          '#2962ff',
   macdSignal:    '#ff6d00',
-  macdHistBull:  'rgba(38,166,154,0.55)',
-  macdHistBear:  'rgba(239,83,80,0.55)',
+  macdHistBull:  'rgba(38,166,154,0.50)',
+  macdHistBear:  'rgba(239,83,80,0.50)',
   drawing:       '#2962ff',
   drawingActive: '#ffb74d',
-  currentPrice:  '#2962ff',
-  currentPriceBull: '#26a69a',
-  currentPriceBear: '#ef5350',
   buttonBg:      '#1e222d',
   buttonHover:   '#2a2e39',
-  buttonActive:  '#2962ff',
   buttonText:    '#cfd2da',
-  scrollbar:     '#2a2e39',
-  scrollbarThumb:'#3f4350'
+  currentPriceBull: '#26a69a',
+  currentPriceBear: '#ef5350'
 };
+
+/* ============================ LWC-COMPATIBLE ENUMS ========================== */
+// TickMarkType — matches LWC v5 enum
+const TickMarkType = { Year:0, Month:1, DayOfMonth:2, Time:3, TimeWithSeconds:4 };
+
+// TickMarkWeight values used by LWC's weight-based mark selection.
+// Higher = more important (Year > Month > Day > Time > Seconds).
+const TickMarkWeight = {
+  EndOfTime:    0,
+  EndOfGroup:   1,
+  TimeWithSeconds: 5,
+  Time:         10,
+  DayOfMonth:   20,
+  Day:          30,
+  Week:         40,
+  Month:        50,
+  Year:         60,
+  EndOfScale:   100
+};
+
+/* ============================ LWC HELPERS =================================== */
+// From LWC src/helpers/mathex.ts
+const EPS = 1e-14;
+function greaterOrEqual(a, b, eps = EPS) { return a - b >= -eps; }
+function equal(a, b, eps = EPS) { return Math.abs(a - b) < eps; }
+function isBaseDecimal(base) { return base !== 0 && (base & (base - 1)) === 0; }
+function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
+function lerp(a, b, t) { return a + (b - a) * t; }
+
+/* ============================ LWC CANDLESTICK WIDTH ========================= */
+// Ported 1:1 from LWC src/renderers/candlestick-renderer.ts → optimalCandlestickWidth
+function optimalCandlestickWidth(barSpacing, pixelRatio) {
+  const barSpacingSpecialCaseFrom = 2.5;
+  const barSpacingSpecialCaseTo = 4;
+  const barSpacingSpecialCaseCoeff = 3;
+  if (barSpacing >= barSpacingSpecialCaseFrom && barSpacing <= barSpacingSpecialCaseTo) {
+    return Math.floor(barSpacingSpecialCaseCoeff * pixelRatio);
+  }
+  const barSpacingReducingCoeff = 0.2;
+  const coeff = 1 -
+    (barSpacingReducingCoeff *
+      Math.atan(Math.max(barSpacingSpecialCaseTo, barSpacing) - barSpacingSpecialCaseTo)
+    ) / (Math.PI * 0.5);
+  const res = Math.floor(barSpacing * coeff * pixelRatio);
+  const scaledBarSpacing = Math.floor(barSpacing * pixelRatio);
+  const optimal = Math.min(res, scaledBarSpacing);
+  return Math.max(Math.floor(pixelRatio), optimal);
+}
+
+function candlestickWidth(barSpacing, horizontalPixelRatio) {
+  let width = optimalCandlestickWidth(barSpacing, horizontalPixelRatio);
+  if (width >= 2) {
+    const wickWidth = Math.floor(horizontalPixelRatio);
+    if (wickWidth % 2 !== width % 2) width--;
+  }
+  return width;
+}
+
+/* ============================ LWC PRICE TICK SPAN =========================== */
+// Ported 1:1 from LWC src/model/price-tick-span-calculator.ts
+class PriceTickSpanCalculator {
+  constructor(base, integralDividers) {
+    this._base = base;
+    this._integralDividers = integralDividers;
+    if (isBaseDecimal(this._base)) {
+      this._fractionalDividers = [2, 2.5, 2];
+    } else {
+      this._fractionalDividers = [];
+      let baseRest = this._base;
+      while (baseRest !== 1) {
+        if ((baseRest % 2) === 0) {
+          this._fractionalDividers.push(2);
+          baseRest /= 2;
+        } else if ((baseRest % 5) === 0) {
+          this._fractionalDividers.push(2, 2.5);
+          baseRest /= 5;
+        } else {
+          throw new Error('unexpected base');
+        }
+        if (this._fractionalDividers.length > 100) {
+          throw new Error('something wrong with base');
+        }
+      }
+    }
+  }
+  tickSpan(high, low, maxTickSpan) {
+    const minMovement = (this._base === 0) ? 0 : (1 / this._base);
+    let resultTickSpan = Math.pow(10, Math.max(0, Math.ceil(Math.log10(high - low))));
+    let index = 0;
+    let c = this._integralDividers[0];
+    while (true) {
+      const resultTickSpanLargerMinMovement =
+        greaterOrEqual(resultTickSpan, minMovement) && resultTickSpan > (minMovement + EPS);
+      const resultTickSpanLargerMaxTickSpan =
+        greaterOrEqual(resultTickSpan, maxTickSpan * c);
+      const resultTickSpanLarger1 = greaterOrEqual(resultTickSpan, 1);
+      const haveToContinue =
+        resultTickSpanLargerMinMovement && resultTickSpanLargerMaxTickSpan && resultTickSpanLarger1;
+      if (!haveToContinue) break;
+      resultTickSpan /= c;
+      c = this._integralDividers[++index % this._integralDividers.length];
+    }
+    if (resultTickSpan <= (minMovement + EPS)) {
+      resultTickSpan = minMovement;
+    }
+    resultTickSpan = Math.max(1, resultTickSpan);
+    if ((this._fractionalDividers.length > 0) && equal(resultTickSpan, 1)) {
+      index = 0;
+      c = this._fractionalDividers[0];
+      while (greaterOrEqual(resultTickSpan, maxTickSpan * c) &&
+             resultTickSpan > (minMovement + EPS)) {
+        resultTickSpan /= c;
+        c = this._fractionalDividers[++index % this._fractionalDividers.length];
+      }
+    }
+    return resultTickSpan;
+  }
+}
+
+/* ============================ LWC PRICE TICK MARK BUILDER =================== */
+// Ported from LWC src/model/price-tick-mark-builder.ts
+class PriceTickMarkBuilder {
+  constructor(priceScale, base, coordToLogical, logicalToCoord) {
+    this._priceScale = priceScale;
+    this._base = base;
+    this._coordToLogical = coordToLogical;
+    this._logicalToCoord = logicalToCoord;
+    this._marks = [];
+  }
+  tickSpan(high, low) {
+    if (high < low) throw new Error('high < low');
+    const scaleHeight = this._priceScale.height();
+    const markHeight = this._tickMarkHeight();
+    const maxTickSpan = (high - low) * markHeight / scaleHeight;
+    const c1 = new PriceTickSpanCalculator(this._base, [2, 2.5, 2]).tickSpan(high, low, maxTickSpan);
+    const c2 = new PriceTickSpanCalculator(this._base, [2, 2, 2.5]).tickSpan(high, low, maxTickSpan);
+    const c3 = new PriceTickSpanCalculator(this._base, [2.5, 2, 2]).tickSpan(high, low, maxTickSpan);
+    return Math.min(c1, c2, c3);
+  }
+  _tickMarkHeight() {
+    return Math.ceil(this._priceScale.fontSize() * this._priceScale.tickMarkDensity());
+  }
+  rebuild() {
+    const ps = this._priceScale;
+    const firstValue = ps.firstValue();
+    if (firstValue === null) { this._marks = []; return; }
+    const scaleHeight = ps.height();
+    const bottom = this._coordToLogical(scaleHeight - 1, firstValue);
+    const top = this._coordToLogical(0, firstValue);
+    const high = Math.max(bottom, top);
+    const low = Math.min(bottom, top);
+    if (high === low) { this._marks = []; return; }
+    const span = this.tickSpan(high, low);
+    this._updateMarks(firstValue, span, high, low);
+  }
+  _updateMarks(firstValue, span, high, low) {
+    const ps = this._priceScale;
+    const marks = this._marks;
+    let mod = high % span;
+    mod += mod < 0 ? span : 0;
+    let prevCoord = null;
+    let targetIndex = 0;
+    const minTickHeight = this._tickMarkHeight();
+    for (let logical = high - mod; logical > low; logical -= span) {
+      const coord = this._logicalToCoord(logical, firstValue);
+      if (prevCoord !== null && Math.abs(coord - prevCoord) < minTickHeight) continue;
+      if (coord < 0 || coord > ps.height() - 1) continue;
+      if (targetIndex < marks.length) {
+        marks[targetIndex].coord = coord;
+        marks[targetIndex].label = ps.formatLogical(logical);
+        marks[targetIndex].logical = logical;
+      } else {
+        marks.push({coord, label: ps.formatLogical(logical), logical});
+      }
+      targetIndex++;
+      prevCoord = coord;
+    }
+    marks.length = targetIndex;
+  }
+  marks() { return this._marks; }
+}
+
+/* ============================ LWC TIME TICK MARKS =========================== */
+// Ported from LWC src/model/tick-marks.ts
+class TimeTickMarks {
+  constructor() {
+    this._marksByWeight = new Map();
+    this._cache = null;
+  }
+  setPoints(points) {
+    this._marksByWeight.clear();
+    this._cache = null;
+    for (let i = 0; i < points.length; i++) {
+      const p = points[i];
+      let arr = this._marksByWeight.get(p.weight);
+      if (!arr) { arr = []; this._marksByWeight.set(p.weight, arr); }
+      arr.push({index: i, time: p.time, weight: p.weight});
+    }
+  }
+  build(spacing, maxWidth) {
+    const maxIndexesPerMark = Math.ceil(maxWidth / spacing);
+    if (!this._cache || this._cache.maxIndexesPerMark !== maxIndexesPerMark) {
+      this._cache = {
+        maxIndexesPerMark,
+        marks: this._buildImpl(maxIndexesPerMark)
+      };
+    }
+    return this._cache.marks;
+  }
+  _buildImpl(maxIndexesPerMark) {
+    let marks = [];
+    const weights = Array.from(this._marksByWeight.keys()).sort((a, b) => b - a);
+    for (const w of weights) {
+      const currentWeight = this._marksByWeight.get(w);
+      const prevMarks = marks;
+      marks = [];
+      const prevMarksLength = prevMarks.length;
+      let prevMarksPointer = 0;
+      const currentWeightLength = currentWeight.length;
+      let rightIndex = Infinity;
+      let leftIndex = -Infinity;
+      for (let i = 0; i < currentWeightLength; i++) {
+        const mark = currentWeight[i];
+        const currentIndex = mark.index;
+        while (prevMarksPointer < prevMarksLength) {
+          const lastMark = prevMarks[prevMarksPointer];
+          const lastIndex = lastMark.index;
+          if (lastIndex < currentIndex) {
+            prevMarksPointer++;
+            marks.push(lastMark);
+            leftIndex = lastIndex;
+            rightIndex = Infinity;
+          } else {
+            rightIndex = lastIndex;
+            break;
+          }
+        }
+        if (rightIndex - currentIndex >= maxIndexesPerMark &&
+            currentIndex - leftIndex >= maxIndexesPerMark) {
+          marks.push(mark);
+          leftIndex = currentIndex;
+        }
+      }
+      for (; prevMarksPointer < prevMarksLength; prevMarksPointer++) {
+        marks.push(prevMarks[prevMarksPointer]);
+      }
+    }
+    return marks;
+  }
+}
+
+/* ============================ TIME WEIGHT ASSIGNMENT ======================== */
+// Assign TickMarkWeight to each candle based on its time (UTCTimestamp).
+// Matches LWC's fillWeightsForPoints logic for business-day/UTCTimestamp.
+function assignTimeWeight(prevTime, curTime) {
+  if (prevTime === null) return TickMarkWeight.EndOfTime;
+  const prev = new Date(prevTime * 1000);
+  const cur = new Date(curTime * 1000);
+  if (cur.getUTCFullYear() !== prev.getUTCFullYear()) return TickMarkWeight.Year;
+  if (cur.getUTCMonth() !== prev.getUTCMonth()) return TickMarkWeight.Month;
+  if (cur.getUTCDate() !== prev.getUTCDate()) return TickMarkWeight.DayOfMonth;
+  if (cur.getUTCHours() !== prev.getUTCHours()) return TickMarkWeight.Time;
+  if (cur.getUTCMinutes() !== prev.getUTCMinutes()) return TickMarkWeight.Time;
+  return TickMarkWeight.TimeWithSeconds;
+}
+
+/* ============================ PRICE FORMATTER ============================== */
+// Ported from LWC src/formatters/price-formatter.ts
+function numberToStringWithLeadingZero(value, length) {
+  if (!Number.isFinite(value)) return 'n/a';
+  if (length === 0) return value.toString();
+  const dummy = '0000000000000000';
+  return (dummy + value.toString()).slice(-length);
+}
+
+class PriceFormatter {
+  constructor(priceScale = 100, minMove = 1) {
+    this._priceScale = priceScale;
+    this._minMove = minMove;
+    this._fractionalLength = 0;
+    if (priceScale > 0 && minMove > 0) {
+      let base = priceScale;
+      while (base > 1) { base /= 10; this._fractionalLength++; }
+    }
+  }
+  format(price) {
+    const sign = price < 0 ? '\u2212' : '';
+    price = Math.abs(price);
+    return sign + this._formatAsDecimal(price);
+  }
+  _formatAsDecimal(price) {
+    const base = this._priceScale / this._minMove;
+    let intPart = Math.floor(price);
+    let fracString = '';
+    const fracLength = this._fractionalLength;
+    if (base > 1) {
+      let fracPart = +(Math.round(price * base) - intPart * base).toFixed(fracLength);
+      if (fracPart >= base) { fracPart -= base; intPart += 1; }
+      fracString = '.' + numberToStringWithLeadingZero(
+        +fracPart.toFixed(fracLength) * this._minMove, fracLength);
+    } else {
+      intPart = Math.round(intPart * base) / base;
+      if (fracLength > 0) fracString = '.' + numberToStringWithLeadingZero(0, fracLength);
+    }
+    return intPart.toFixed(0) + fracString;
+  }
+}
+
+/* ============================ DATE/TIME FORMATTERS ========================= */
+function pad2(n) { return n < 10 ? '0' + n : '' + n; }
+
+function formatMonthYear(date, locale = 'en-US') {
+  // For year tick marks: short month name + year, e.g. "Jan 2025"
+  return date.toLocaleDateString(locale, {month: 'short', year: 'numeric', timeZone: 'UTC'});
+}
+function formatMonth(date, locale = 'en-US') {
+  return date.toLocaleDateString(locale, {month: 'short', year: '2-digit', timeZone: 'UTC'});
+}
+function formatDay(date) {
+  return date.toLocaleDateString('en-US', {day: '2-digit', month: 'short', timeZone: 'UTC'});
+}
+function formatTime(date) {
+  return pad2(date.getUTCHours()) + ':' + pad2(date.getUTCMinutes());
+}
+function formatTimeWithSeconds(date) {
+  return pad2(date.getUTCHours()) + ':' + pad2(date.getUTCMinutes()) + ':' + pad2(date.getUTCSeconds());
+}
+
+// Format a tick mark based on its weight (LWC-style tickMarkFormatter).
+// Matches LWC's default behavior: shorter labels for higher-density weights.
+function formatTickMark(timeSec, weight, tf) {
+  const date = new Date(timeSec * 1000);
+  switch (weight) {
+    case TickMarkWeight.Year:            return String(date.getUTCFullYear());
+    case TickMarkWeight.Month:          return date.toLocaleDateString('en-US', {month: 'short', timeZone: 'UTC'});
+    case TickMarkWeight.DayOfMonth:
+    case TickMarkWeight.Day:            return String(date.getUTCDate()); // just day number, like LWC
+    case TickMarkWeight.Time:           return formatTime(date);
+    case TickMarkWeight.TimeWithSeconds:return formatTimeWithSeconds(date);
+    default:                            return formatTime(date);
+  }
+}
 
 /* ============================ CONSTANTS ===================================== */
 const TIMEFRAMES = [
+  {label:'1S',  ms:1000},
   {label:'1m',  ms:60*1000},
   {label:'5m',  ms:5*60*1000},
   {label:'15m', ms:15*60*1000},
@@ -83,14 +412,15 @@ const TIMEFRAMES = [
 ];
 
 const SYMBOLS = [
-  {label:'BTCUSD', price:67500, vol:0.025, decimals:2},
-  {label:'ETHUSD', price:3500,  vol:0.030, decimals:2},
-  {label:'SOLUSD', price:175,   vol:0.045, decimals:2},
-  {label:'XAUUSD', price:2380,  vol:0.008, decimals:2},
-  {label:'EURUSD', price:1.085, vol:0.004, decimals:5},
-  {label:'AAPL',   price:225,   vol:0.015, decimals:2},
-  {label:'TSLA',   price:250,   vol:0.035, decimals:2},
-  {label:'NVDA',   price:120,   vol:0.028, decimals:2}
+  {label:'BTCUSD', price:67500,   vol:0.012, decimals:2, priceScale:100},
+  {label:'ETHUSD', price:3500,    vol:0.014, decimals:2, priceScale:100},
+  {label:'SOLUSD', price:175,     vol:0.020, decimals:2, priceScale:100},
+  {label:'XAUUSD', price:2380,    vol:0.004, decimals:2, priceScale:100},
+  {label:'EURUSD', price:1.085,   vol:0.002, decimals:5, priceScale:100000},
+  {label:'GBPUSD', price:1.275,   vol:0.002, decimals:5, priceScale:100000},
+  {label:'AAPL',   price:225,     vol:0.008, decimals:2, priceScale:100},
+  {label:'TSLA',   price:250,     vol:0.018, decimals:2, priceScale:100},
+  {label:'NVDA',   price:120,     vol:0.014, decimals:2, priceScale:100}
 ];
 
 const INDICATOR_LIST = [
@@ -113,62 +443,10 @@ const DRAW_TOOLS = [
   {id:'rect',    label:'Rectangle',       icon:'rect'},
   {id:'fib',     label:'Fib Retracement', icon:'fib'},
   {id:'brush',   label:'Brush',           icon:'brush'},
-  {id:'ruler',   label:'Measure',         icon:'ruler'},
   {id:'eraser',  label:'Delete Drawing',  icon:'eraser'}
 ];
 
-/* ============================ UTILITIES ===================================== */
-const fmt = (n, d = 2) => {
-  if (n === null || n === undefined || isNaN(n)) return '—';
-  return n.toLocaleString('en-US', {minimumFractionDigits: d, maximumFractionDigits: d});
-};
-
-const fmtPrice = (n, decimals = 2) => fmt(n, decimals);
-
-const fmtVolume = (n) => {
-  if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
-  if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
-  if (n >= 1e3) return (n / 1e3).toFixed(2) + 'K';
-  return n.toFixed(0);
-};
-
-const fmtTime = (t, tf) => {
-  const d = new Date(t);
-  const pad = (x) => String(x).padStart(2, '0');
-  if (tf === '1D' || tf === '1W') {
-    return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
-  }
-  return pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
-};
-
-const fmtTimeShort = (t, tf) => {
-  const d = new Date(t);
-  const pad = (x) => String(x).padStart(2, '0');
-  if (tf === '1D' || tf === '1W') {
-    return pad(d.getMonth() + 1) + '-' + pad(d.getDate());
-  }
-  return pad(d.getHours()) + ':' + pad(d.getMinutes());
-};
-
-const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
-const lerp = (a, b, t) => a + (b - a) * t;
-const dist = (x1, y1, x2, y2) => Math.hypot(x2 - x1, y2 - y1);
-const roundRect = (ctx, x, y, w, h, r) => {
-  r = Math.min(r, w / 2, h / 2);
-  ctx.beginPath();
-  ctx.moveTo(x + r, y);
-  ctx.lineTo(x + w - r, y);
-  ctx.quadraticCurveTo(x + w, y, x + w, y + r);
-  ctx.lineTo(x + w, y + h - r);
-  ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
-  ctx.lineTo(x + r, y + h);
-  ctx.quadraticCurveTo(x, y + h, x, y + h - r);
-  ctx.lineTo(x, y + r);
-  ctx.quadraticCurveTo(x, y, x + r, y);
-  ctx.closePath();
-};
-
-/* ============================ INDICATORS ==================================== */
+/* ============================ INDICATOR MATH =============================== */
 const Indicators = {
   sma(values, period) {
     const out = new Array(values.length).fill(null);
@@ -180,7 +458,6 @@ const Indicators = {
     }
     return out;
   },
-
   ema(values, period) {
     const out = new Array(values.length).fill(null);
     const k = 2 / (period + 1);
@@ -188,7 +465,6 @@ const Indicators = {
     for (let i = 0; i < values.length; i++) {
       const v = values[i];
       if (prev === null) {
-        // seed with SMA
         if (i >= period - 1) {
           let s = 0;
           for (let j = i - period + 1; j <= i; j++) s += values[j];
@@ -202,7 +478,6 @@ const Indicators = {
     }
     return out;
   },
-
   bollinger(values, period, mult) {
     const mid = Indicators.sma(values, period);
     const upper = new Array(values.length).fill(null);
@@ -216,7 +491,6 @@ const Indicators = {
     }
     return {mid, upper, lower};
   },
-
   rsi(values, period) {
     const out = new Array(values.length).fill(null);
     let gainAvg = 0, lossAvg = 0;
@@ -242,7 +516,6 @@ const Indicators = {
     }
     return out;
   },
-
   macd(values, fast, slow, signal) {
     const ef = Indicators.ema(values, fast);
     const es = Indicators.ema(values, slow);
@@ -251,25 +524,10 @@ const Indicators = {
     const sig = Indicators.ema(validMacd, signal);
     const hist = macdLine.map((v, i) => (v !== null && sig[i] !== null ? v - sig[i] : null));
     return {macd: macdLine, signal: sig, hist};
-  },
-
-  atr(highs, lows, closes, period) {
-    const tr = [];
-    for (let i = 0; i < highs.length; i++) {
-      if (i === 0) tr.push(highs[i] - lows[i]);
-      else {
-        tr.push(Math.max(
-          highs[i] - lows[i],
-          Math.abs(highs[i] - closes[i - 1]),
-          Math.abs(lows[i] - closes[i - 1])
-        ));
-      }
-    }
-    return Indicators.sma(tr, period);
   }
 };
 
-/* ============================ DATA SIMULATOR ================================ */
+/* ============================ DATA SIMULATOR =============================== */
 class DataSimulator {
   constructor(symbol, timeframe) {
     this.symbol = symbol;
@@ -279,48 +537,34 @@ class DataSimulator {
     this.basePrice = symbol.price;
     this.vol = symbol.vol;
     this.decimals = symbol.decimals;
-    this.lastTick = 0;
     this.generate(800);
   }
-
   generate(count) {
     let price = this.basePrice;
     const now = Date.now();
-    const startTime = now - count * this.tfMs;
+    const startTime = Math.floor(now / this.tfMs) * this.tfMs - count * this.tfMs;
     for (let i = 0; i < count; i++) {
       const t = startTime + i * this.tfMs;
       const open = price;
-      // Volatility clustering via sine + noise
       const volMult = 1 + Math.sin(i * 0.07) * 0.4 + (Math.random() - 0.5) * 0.6;
-      // Signed drift (zero mean) - no compounding bias
       const drift = (Math.random() - 0.5) * this.vol * volMult * 1.6;
-      // Macro trend: deterministic sine waves so it oscillates without runaway
       const macroBias = Math.sin(i * 0.013) * 0.0018
                       + Math.sin(i * 0.005 + 0.7) * 0.0012
                       + Math.sin(i * 0.027 + 1.3) * 0.0008;
-      // Mean reversion to keep price near basePrice
       const meanRevert = (this.basePrice - price) / price * 0.006;
       const close = open * (1 + drift + macroBias + meanRevert);
       const range = this.vol * volMult * price * (0.5 + Math.random() * 0.8);
       const high = Math.max(open, close) + range * Math.random() * 0.7;
       const low = Math.min(open, close) - range * Math.random() * 0.7;
       const volume = Math.abs(close - open) / open * price * 50 + Math.random() * 1000 + 500;
-      this.candles.push({
-        time: t, open, high, low, close, volume
-      });
+      this.candles.push({time: Math.floor(t / 1000), open, high, low, close, volume});
       price = close;
     }
-    this.lastTick = now;
   }
-
-  // Real-time tick: update last candle (or roll a new one)
   tick() {
-    const now = Date.now();
+    const now = Math.floor(Date.now() / this.tfMs) * this.tfMs;
     const last = this.candles[this.candles.length - 1];
-    const lastTfStart = Math.floor(now / this.tfMs) * this.tfMs;
-
-    if (lastTfStart > last.time) {
-      // roll new candle
+    if (now > last.time * 1000) {
       const open = last.close;
       const drift = (Math.random() - 0.5) * this.vol * 2;
       const range = this.vol * open * (0.4 + Math.random() * 0.6);
@@ -328,10 +572,9 @@ class DataSimulator {
       const low = open - Math.abs(drift) * open * 0.6 - range * Math.random();
       const close = low + (high - low) * Math.random();
       const volume = Math.abs(close - open) / open * open * 30 + 500 + Math.random() * 500;
-      this.candles.push({time: lastTfStart, open, high, low, close, volume});
+      this.candles.push({time: Math.floor(now / 1000), open, high, low, close, volume});
       if (this.candles.length > 5000) this.candles.shift();
     } else {
-      // update current candle
       const drift = (Math.random() - 0.5) * this.vol * 0.5;
       const newClose = last.close * (1 + drift);
       last.close = newClose;
@@ -339,11 +582,77 @@ class DataSimulator {
       last.low = Math.min(last.low, newClose);
       last.volume += Math.random() * 50 + 10;
     }
-    this.lastTick = now;
   }
 }
 
-/* ============================ MAIN CHART CLASS ============================== */
+/* ============================ PRICE SCALE (LWC-COMPAT) ===================== */
+// Wraps the price axis state and provides LWC-compatible coordinate transforms.
+class PriceScale {
+  constructor(opts) {
+    this._height = 0;
+    this._priceRange = null; // {min, max}
+    this._opts = opts;
+    this._formatter = null;
+    this._markBuilder = null;
+  }
+  setHeight(h) { this._height = h; }
+  height() { return this._height; }
+  setRange(min, max) { this._priceRange = {min, max}; }
+  priceRange() { return this._priceRange; }
+  isEmpty() { return !this._priceRange || this._priceRange.min === this._priceRange.max; }
+  firstValue() { return this._priceRange ? this._priceRange.min : null; }
+  fontSize() { return 11; }
+  tickMarkDensity() { return 1; }
+  isInverted() { return false; }
+  // scaleMargins: {top, bottom} as fractions. LWC defaults: top 0.2, bottom 0.1
+  scaleMargins() { return this._opts.scaleMargins || {top: 0.2, bottom: 0.1}; }
+  topMarginPx() {
+    const m = this.scaleMargins();
+    return this.isInverted() ? m.bottom * this._height : m.top * this._height;
+  }
+  bottomMarginPx() {
+    const m = this.scaleMargins();
+    return this.isInverted() ? m.top * this._height : m.bottom * this._height;
+  }
+  internalHeight() {
+    return this._height - this.topMarginPx() - this.bottomMarginPx();
+  }
+  // LWC coordinate transform (logical → coordinate)
+  logicalToCoordinate(logical, baseValue) {
+    if (this.isEmpty()) return 0;
+    const range = this._priceRange;
+    const invCoordinate = this.bottomMarginPx() +
+      (this.internalHeight() - 1) * (logical - range.min) / (range.max - range.min);
+    return this.isInverted() ? invCoordinate : (this._height - 1 - invCoordinate);
+  }
+  coordinateToLogical(coordinate, baseValue) {
+    if (this.isEmpty()) return 0;
+    const invCoordinate = this.isInverted() ? coordinate : (this._height - 1 - coordinate);
+    const range = this._priceRange;
+    return range.min + (range.max - range.min) *
+      ((invCoordinate - this.bottomMarginPx()) / (this.internalHeight() - 1));
+  }
+  setFormatter(f) { this._formatter = f; }
+  formatter() { return this._formatter; }
+  formatLogical(logical) {
+    if (this._formatter) return this._formatter.format(logical);
+    return String(logical);
+  }
+  rebuildMarks() {
+    if (!this._markBuilder) {
+      const base = this._opts.base || 100;
+      this._markBuilder = new PriceTickMarkBuilder(
+        this, base,
+        (c, v) => this.coordinateToLogical(c, v),
+        (l, v) => this.logicalToCoordinate(l, v)
+      );
+    }
+    this._markBuilder.rebuild();
+  }
+  marks() { return this._markBuilder ? this._markBuilder.marks() : []; }
+}
+
+/* ============================ MAIN CHART CLASS ============================= */
 class TradingChart {
   constructor(canvas) {
     this.canvas = canvas;
@@ -354,35 +663,42 @@ class TradingChart {
     this.layout = {
       toolbarH: 44,
       statusH: 26,
-      paneTop: 44,
-      paneBottom: 0,    // set on resize
-      priceAxisW: 72,
+      priceAxisW: 64,
       timeAxisH: 28,
-      volumeH: 70,
+      volumeH: 64,
+      paneH: 0,
       gap: 8,
-      paneH: 0,         // RSI/MACD pane height
-      leftPad: 8
+      leftPad: 0
     };
 
     // State
     this.symbol = SYMBOLS[0];
-    this.timeframe = TIMEFRAMES[3]; // 1H
+    this.timeframe = TIMEFRAMES[4]; // 1H
     this.sim = new DataSimulator(this.symbol, this.timeframe);
 
-    // Viewport (indices into candles array)
-    this.viewEnd = this.sim.candles.length;       // exclusive
-    this.candleW = 9;                              // body width in px
-    this.candleGap = 1.5;
-    this.maxCandleW = 32;
-    this.minCandleW = 1.5;
+    // Viewport — barSpacing in media coords (CSS pixels)
+    this.barSpacing = 8;       // LWC default ~6, we use 8 for cleaner initial view
+    this.minBarSpacing = 1.4;  // LWC default minimum
+    this.maxBarSpacing = 1e6;
+    this.rightOffset = 4;      // bars of empty space on the right (LWC default ~4-5)
 
-    // Auto-fit margin
-    this.priceTopPad = 0.10;
-    this.priceBottomPad = 0.10;
+    // Price scales
+    this.priceScale = new PriceScale({
+      scaleMargins: {top: 0.15, bottom: 0.15},
+      base: this.symbol.priceScale
+    });
+    this.priceScale.setFormatter(new PriceFormatter(this.symbol.priceScale, 1));
 
-    // Visible price range (computed in autoScale)
-    this.minPrice = 0;
-    this.maxPrice = 1;
+    this.volScale = new PriceScale({
+      scaleMargins: {top: 0.0, bottom: 0.0},
+      base: 100
+    });
+
+    this.paneScale = null;     // for RSI/MACD — set when needed
+
+    // Time tick marks
+    this.timeTickMarks = new TimeTickMarks();
+    this._timePointsCache = null;
 
     // Crosshair
     this.mouseX = null;
@@ -393,42 +709,35 @@ class TradingChart {
     // Dragging
     this.isDragging = false;
     this.dragStartX = 0;
-    this.dragStartViewEnd = 0;
+    this.dragStartRightOffset = 0;
+    this.dragStartLogicalFrom = 0;
 
-    // Drawing tools
+    // Drawing
     this.activeTool = 'cursor';
     this.drawings = [];
     this.currentDrawing = null;
     this.hoverDrawing = null;
 
-    // Active indicators
+    // Indicators
     this.activeIndicators = new Set(['ma20', 'ma50', 'volsma']);
+    this.indCache = {};
 
-    // UI state
-    this.buttons = [];          // clickable regions, refreshed each frame
+    // UI
+    this.buttons = [];
     this.hoverButton = null;
-    this.dropdown = null;       // {type, items, x, y, w, h}
-    this.toast = null;          // {text, until}
+    this.dropdown = null;
+    this.toast = null;
 
     // Animation
-    this.lastRender = 0;
-    this.tickInterval = 1000;   // 1s simulated tick
+    this.tickInterval = 1000;
     this.lastTickAt = 0;
-    this.rafId = null;
-
-    // Crosshair snap
-    this.snapToCandle = true;
-
-    // Price line
-    this.showCurrentPriceLine = true;
-
-    // Pre-computed indicator cache
-    this.indCache = {};
 
     this.setupHiDPICanvas();
     this.setupEvents();
-    this.fit();
+    this.updateLayout();
+    this.computeTimeWeights();
     this.computeIndicators();
+    this.autoScale();
   }
 
   /* --------------------------- Canvas Setup ------------------------------ */
@@ -444,41 +753,38 @@ class TradingChart {
       this.W = w;
       this.H = h;
       this.updateLayout();
+      this.invalidateTimeMarks();
     };
     resize();
     window.addEventListener('resize', resize);
   }
 
   updateLayout() {
-    this.layout.paneTop = this.layout.toolbarH;
+    const paneTop = this.layout.toolbarH;
     const bottomStart = this.H - this.layout.statusH - this.layout.timeAxisH;
-    this.layout.paneBottom = bottomStart;
-
-    // Determine if any pane indicators are active
     const hasPane = this.activeIndicators.has('rsi') || this.activeIndicators.has('macd');
-    this.layout.paneH = hasPane ? 110 : 0;
+    this.layout.paneH = hasPane ? 100 : 0;
 
-    // Main chart area
     this.chartLeft = this.layout.leftPad;
     this.chartRight = this.W - this.layout.priceAxisW;
-    this.chartTop = this.layout.paneTop + 4;
-    this.chartBottom = this.layout.paneBottom - this.layout.paneH - (this.layout.paneH > 0 ? this.layout.gap : 0);
+    this.chartTop = paneTop + 4;
+    this.chartBottom = bottomStart - this.layout.paneH - (this.layout.paneH > 0 ? this.layout.gap : 0);
 
-    // Volume area is inside main chart area (bottom)
     this.volTop = this.chartBottom - this.layout.volumeH;
     this.volBottom = this.chartBottom - 4;
-
-    // Actual price chart (above volume)
     this.priceTop = this.chartTop;
-    this.priceBottom = this.volTop - 6;
+    this.priceBottom = this.volTop - 4;
 
-    // Pane (RSI/MACD) area
     if (hasPane) {
       this.paneLeft = this.chartLeft;
       this.paneRight = this.chartRight;
-      this.paneTop = this.layout.paneBottom - this.layout.paneH;
-      this.paneBottom = this.layout.paneBottom;
+      this.paneTop = bottomStart - this.layout.paneH;
+      this.paneBottom = bottomStart;
     }
+
+    // Update scale heights
+    this.priceScale.setHeight(this.priceBottom - this.priceTop);
+    this.volScale.setHeight(this.volBottom - this.volTop);
   }
 
   /* --------------------------- Events ------------------------------------ */
@@ -486,8 +792,8 @@ class TradingChart {
     this.canvas.addEventListener('mousemove', (e) => this.onMouseMove(e));
     this.canvas.addEventListener('mousedown', (e) => this.onMouseDown(e));
     this.canvas.addEventListener('mouseup', (e) => this.onMouseUp(e));
-    this.canvas.addEventListener('mouseleave', (e) => this.onMouseLeave(e));
-    this.canvas.addEventListener('mouseenter', (e) => this.onMouseEnter(e));
+    this.canvas.addEventListener('mouseleave', () => this.onMouseLeave());
+    this.canvas.addEventListener('mouseenter', () => this.mouseInside = true);
     this.canvas.addEventListener('wheel', (e) => this.onWheel(e), {passive: false});
     this.canvas.addEventListener('contextmenu', (e) => { e.preventDefault(); this.onRightClick(e); });
     window.addEventListener('keydown', (e) => this.onKeyDown(e));
@@ -500,22 +806,17 @@ class TradingChart {
     this.mouseX = x;
     this.mouseY = y;
     this.mouseInside = true;
-
-    // Hover buttons
     this.hoverButton = this.hitButton(x, y);
 
     if (this.isDragging && this.activeTool === 'cursor') {
       const dx = x - this.dragStartX;
-      const candlesMoved = dx / (this.candleW + this.candleGap);
-      this.viewEnd = this.dragStartViewEnd - candlesMoved;
-      this.constrainView();
+      const barsMoved = dx / this.barSpacing;
+      this.rightOffset = this.dragStartRightOffset - barsMoved;
       this.autoScale();
-      this.computeIndicators();
     } else if (this.currentDrawing) {
       this.updateCurrentDrawing(x, y);
     }
 
-    // Update crosshair snap
     if (this.mouseInside && this.inChartArea(x, y)) {
       const idx = this.xToIndex(x);
       this.crosshairIndex = clamp(idx, 0, this.sim.candles.length - 1);
@@ -528,33 +829,21 @@ class TradingChart {
     const r = this.canvas.getBoundingClientRect();
     const x = e.clientX - r.left;
     const y = e.clientY - r.top;
-
-    // Check buttons first
     const btn = this.hitButton(x, y);
-    if (btn) {
-      this.handleButtonClick(btn);
-      return;
-    }
-
-    // Check dropdown
+    if (btn) { this.handleButtonClick(btn); return; }
     if (this.dropdown) {
       const item = this.hitDropdown(x, y);
-      if (item) {
-        this.handleDropdownSelect(item);
-        this.dropdown = null;
-        return;
-      } else if (x < this.dropdown.x || x > this.dropdown.x + this.dropdown.w ||
-                 y < this.dropdown.y || y > this.dropdown.y + this.dropdown.h) {
-        this.dropdown = null;
-        return;
+      if (item) { this.handleDropdownSelect(item); this.dropdown = null; return; }
+      if (x < this.dropdown.x || x > this.dropdown.x + this.dropdown.w ||
+          y < this.dropdown.y || y > this.dropdown.y + this.dropdown.h) {
+        this.dropdown = null; return;
       }
     }
-
     if (this.activeTool === 'cursor') {
       if (this.inChartArea(x, y)) {
         this.isDragging = true;
         this.dragStartX = x;
-        this.dragStartViewEnd = this.viewEnd;
+        this.dragStartRightOffset = this.rightOffset;
       }
     } else if (this.activeTool === 'eraser') {
       if (this.hoverDrawing) {
@@ -567,57 +856,40 @@ class TradingChart {
     }
   }
 
-  onMouseUp(e) {
-    if (this.isDragging) {
-      this.isDragging = false;
-    }
-    if (this.currentDrawing) {
-      this.finishDrawing();
-    }
+  onMouseUp() {
+    if (this.isDragging) this.isDragging = false;
+    if (this.currentDrawing) this.finishDrawing();
   }
 
-  onMouseLeave(e) {
+  onMouseLeave() {
     this.mouseInside = false;
     this.crosshairIndex = null;
     this.hoverButton = null;
-    if (this.currentDrawing) {
-      this.finishDrawing();
-    }
-  }
-
-  onMouseEnter(e) {
-    this.mouseInside = true;
+    if (this.currentDrawing) this.finishDrawing();
   }
 
   onWheel(e) {
     e.preventDefault();
     const r = this.canvas.getBoundingClientRect();
     const x = e.clientX - r.left;
-    const y = e.clientY - r.top;
-
-    if (!this.inChartArea(x, y) && !this.inPriceAxis(x, y)) return;
-
+    if (!this.inChartArea(x, this.mouseY) && !this.inPriceAxis(x, this.mouseY)) return;
     const dir = e.deltaY < 0 ? 1 : -1;
-    const factor = dir > 0 ? 0.9 : 1.111;
-    const oldStep = this.candleW + this.candleGap;
-    let newW = clamp(this.candleW * factor, this.minCandleW, this.maxCandleW);
-    if (newW === this.candleW) return;
-    this.candleW = newW;
-    const newStep = this.candleW + this.candleGap;
-
-    // Zoom toward cursor: keep candle under cursor stable
+    const factor = dir > 0 ? 1.1 : 1/1.1;
+    const oldSpacing = this.barSpacing;
+    let newSpacing = clamp(oldSpacing * factor, this.minBarSpacing, this.maxBarSpacing);
+    if (newSpacing === oldSpacing) return;
+    // Zoom toward cursor: keep the bar under cursor at same x
     const idxAtCursor = this.xToIndex(x);
-    this.viewEnd = idxAtCursor + (x - this.chartLeft) / newStep + 1;
-    this.constrainView();
+    const fracAtCursor = (x - this.chartLeft) / this.barSpacing;
+    // New rightOffset such that idxAtCursor stays at same x
+    const totalBarsRight = (this.chartRight - x) / newSpacing;
+    this.barSpacing = newSpacing;
+    this.rightOffset = (this.sim.candles.length - 1 - idxAtCursor) + totalBarsRight;
+    this.invalidateTimeMarks();
     this.autoScale();
-    this.computeIndicators();
   }
 
   onRightClick(e) {
-    const r = this.canvas.getBoundingClientRect();
-    const x = e.clientX - r.left;
-    const y = e.clientY - r.top;
-    // If on a drawing, delete it
     if (this.hoverDrawing) {
       this.drawings = this.drawings.filter(d => d !== this.hoverDrawing);
       this.hoverDrawing = null;
@@ -629,9 +901,9 @@ class TradingChart {
   }
 
   onKeyDown(e) {
-    if (e.key === 'r' || e.key === 'R') { this.fit(); this.autoScale(); }
-    if (e.key === '+' || e.key === '=') { this.zoomAtCenter(0.9); }
-    if (e.key === '-' || e.key === '_') { this.zoomAtCenter(1.111); }
+    if (e.key === 'r' || e.key === 'R') { this.resetView(); }
+    if (e.key === '+' || e.key === '=') this.zoomAtCenter(1.1);
+    if (e.key === '-' || e.key === '_') this.zoomAtCenter(1/1.1);
     if (e.key === 'Escape') { this.activeTool = 'cursor'; this.currentDrawing = null; this.dropdown = null; }
     if (e.key === 'Delete' || e.key === 'Backspace') {
       if (this.hoverDrawing) {
@@ -642,109 +914,153 @@ class TradingChart {
   }
 
   zoomAtCenter(factor) {
-    const centerX = (this.chartLeft + this.chartRight) / 2;
-    const oldStep = this.candleW + this.candleGap;
-    let newW = clamp(this.candleW * factor, this.minCandleW, this.maxCandleW);
-    if (newW === this.candleW) return;
-    this.candleW = newW;
-    const newStep = this.candleW + this.candleGap;
-    const idxAtCenter = this.xToIndex(centerX);
-    this.viewEnd = idxAtCenter + (centerX - this.chartLeft) / newStep + 1;
-    this.constrainView();
+    const cx = (this.chartLeft + this.chartRight) / 2;
+    const oldSpacing = this.barSpacing;
+    let newSpacing = clamp(oldSpacing * factor, this.minBarSpacing, this.maxBarSpacing);
+    if (newSpacing === oldSpacing) return;
+    const idxAtCenter = this.xToIndex(cx);
+    const totalBarsRight = (this.chartRight - cx) / newSpacing;
+    this.barSpacing = newSpacing;
+    this.rightOffset = (this.sim.candles.length - 1 - idxAtCenter) + totalBarsRight;
+    this.invalidateTimeMarks();
     this.autoScale();
-    this.computeIndicators();
   }
 
-  /* --------------------------- View Helpers ------------------------------ */
+  resetView() {
+    this.barSpacing = 8;
+    this.rightOffset = 4;
+    this.invalidateTimeMarks();
+    this.autoScale();
+    this.showToast('Reset view');
+  }
+
+  /* --------------------------- Coordinate Helpers ------------------------ */
   inChartArea(x, y) {
-    return x >= this.chartLeft && x <= this.chartRight && y >= this.chartTop && y <= this.chartBottom;
+    return x >= this.chartLeft && x <= this.chartRight &&
+           y >= this.chartTop && y <= this.chartBottom;
   }
   inPriceAxis(x, y) {
-    return x > this.chartRight && x <= this.W && y >= this.chartTop && y <= this.chartBottom;
-  }
-  inTimeAxis(x, y) {
-    return x >= this.chartLeft && x <= this.chartRight && y > this.chartBottom && y <= this.layout.paneBottom;
+    return x > this.chartRight && x <= this.W &&
+           y >= this.chartTop && y <= this.chartBottom;
   }
 
-  fit() {
-    const visibleCount = Math.floor((this.chartRight - this.chartLeft) / (this.candleW + this.candleGap));
-    this.viewEnd = this.sim.candles.length;
-    const start = Math.max(0, this.viewEnd - visibleCount);
-    // We use viewEnd + visible width = how many candles fit; we shift viewEnd
-    // Actually we want last `visibleCount` candles visible
-    // To keep semantics simple, let viewEnd be exclusive end and visibleCount computed from viewEnd - viewStart
-    // We need viewStart = viewEnd - visibleCount
-    // For panning, we move viewEnd (and thus viewStart = viewEnd - visibleCount)
-    // Set viewEnd such that visible window is last `visibleCount`
-    this.viewEnd = this.sim.candles.length + 5; // little overshoot allowed
-    this.constrainView();
-    this.autoScale();
+  // Convert candle index to x (media coords)
+  indexToX(i) {
+    // i can be fractional; rightmost candle = (length - 1); x of its center = chartRight - rightOffset*barSpacing
+    return this.chartRight - (this.sim.candles.length - 1 - i + this.rightOffset) * this.barSpacing;
+  }
+  xToIndex(x) {
+    return (this.sim.candles.length - 1 + this.rightOffset) - (this.chartRight - x) / this.barSpacing;
   }
 
-  constrainView() {
-    const visibleCount = this.getVisibleCount();
-    const minEnd = visibleCount * 0.5;
-    const maxEnd = this.sim.candles.length + 30;
-    this.viewEnd = clamp(this.viewEnd, minEnd, maxEnd);
+  // Price → Y (within price chart area)
+  priceToY(p) {
+    return this.priceTop + this.priceScale.logicalToCoordinate(p, 0);
+  }
+  yToPrice(y) {
+    return this.priceScale.coordinateToLogical(y - this.priceTop, 0);
+  }
+  volToY(v) {
+    return this.volTop + this.volScale.logicalToCoordinate(v, 0);
   }
 
-  getVisibleCount() {
-    return Math.ceil((this.chartRight - this.chartLeft) / (this.candleW + this.candleGap));
+  /* --------------------------- Time Weights ------------------------------ */
+  computeTimeWeights() {
+    // Build time points with weights for time tick mark builder
+    const pts = [];
+    const candles = this.sim.candles;
+    for (let i = 0; i < candles.length; i++) {
+      const prev = i > 0 ? candles[i - 1].time : null;
+      const w = assignTimeWeight(prev, candles[i].time);
+      pts.push({time: candles[i].time, weight: w});
+    }
+    this._timePoints = pts;
+    this.timeTickMarks.setPoints(pts);
+    this.invalidateTimeMarks();
+  }
+  invalidateTimeMarks() { this._timeMarksCache = null; }
+
+  getTimeMarks() {
+    // LWC: maxLabelWidth = pixelsPerCharacter * tickMarkMaxCharacterLength
+    // pixelsPer8Characters = (fontSize + 4) * 5
+    // pixelsPerCharacter = pixelsPer8Characters / defaultTickMarkMaxCharacterLength (8)
+    // => maxLabelWidth = (fontSize + 4) * 5  (since both numerator/denominator use 8)
+    const fontSize = 11;
+    const maxLabelWidth = (fontSize + 4) * 5; // = 75 for fontSize=11
+    if (!this._timeMarksCache) {
+      this._timeMarksCache = this.timeTickMarks.build(this.barSpacing, maxLabelWidth);
+    }
+    return this._timeMarksCache;
   }
 
-  get viewStart() {
-    return this.viewEnd - this.getVisibleCount();
-  }
-
+  /* --------------------------- Auto Scale -------------------------------- */
   autoScale() {
-    const start = Math.max(0, Math.floor(this.viewStart));
-    const end = Math.min(this.sim.candles.length, Math.ceil(this.viewEnd));
-    if (start >= end) return;
+    // Determine visible candle range
+    const firstIdx = Math.max(0, Math.floor(this.xToIndex(this.chartLeft)));
+    const lastIdx = Math.min(this.sim.candles.length - 1, Math.ceil(this.xToIndex(this.chartRight)));
     let min = Infinity, max = -Infinity;
-    for (let i = start; i < end; i++) {
+    let minVol = Infinity, maxVol = -Infinity;
+    for (let i = firstIdx; i <= lastIdx; i++) {
       const c = this.sim.candles[i];
       if (c.low < min) min = c.low;
       if (c.high > max) max = c.high;
+      if (c.volume < minVol) minVol = c.volume;
+      if (c.volume > maxVol) maxVol = c.volume;
     }
-    // Include visible Bollinger / drawings
-    if (this.activeIndicators.has('bb')) {
+    if (this.activeIndicators.has('bb') && this.indCache.bb) {
       const bb = this.indCache.bb;
-      if (bb) {
-        for (let i = start; i < end; i++) {
-          if (bb.upper[i] !== null) { if (bb.upper[i] > max) max = bb.upper[i]; if (bb.lower[i] < min) min = bb.lower[i]; }
+      for (let i = firstIdx; i <= lastIdx; i++) {
+        if (bb.upper[i] !== null) {
+          if (bb.upper[i] > max) max = bb.upper[i];
+          if (bb.lower[i] < min) min = bb.lower[i];
         }
       }
     }
     for (const d of this.drawings) {
-      if (d.type === 'hline' && d.price >= min && d.price <= max) {
-        // already in range
-      } else if (d.type === 'hline') {
-        // include
+      if (d.type === 'hline') {
         if (d.price < min) min = d.price;
         if (d.price > max) max = d.price;
       }
     }
-    const range = max - min;
-    if (range === 0) { min -= 1; max += 1; }
-    this.minPrice = min - range * this.priceBottomPad;
-    this.maxPrice = max + range * this.priceTopPad;
-  }
+    if (!isFinite(min) || !isFinite(max) || min === max) {
+      min = (min || 0) - 1; max = (max || 1) + 1;
+    }
+    this.priceScale.setRange(min, max);
+    this.priceScale.rebuildMarks();
 
-  /* --------------------------- Coordinate Transforms --------------------- */
-  priceToY(p) {
-    const r = this.maxPrice - this.minPrice;
-    if (r === 0) return (this.priceTop + this.priceBottom) / 2;
-    return this.priceTop + (1 - (p - this.minPrice) / r) * (this.priceBottom - this.priceTop);
-  }
-  yToPrice(y) {
-    const r = this.maxPrice - this.minPrice;
-    return this.minPrice + (1 - (y - this.priceTop) / (this.priceBottom - this.priceTop)) * r;
-  }
-  indexToX(i) {
-    return this.chartLeft + (i - this.viewStart + 0.5) * (this.candleW + this.candleGap);
-  }
-  xToIndex(x) {
-    return Math.floor((x - this.chartLeft) / (this.candleW + this.candleGap) + this.viewStart);
+    // Volume scale (0 to maxVol)
+    if (isFinite(maxVol)) {
+      this.volScale.setRange(0, maxVol * 1.1);
+      this.volScale.rebuildMarks();
+    }
+
+    // Pane scale (RSI: 0-100, MACD: auto)
+    if (this.activeIndicators.has('rsi')) {
+      this.paneScale = new PriceScale({scaleMargins: {top: 0.1, bottom: 0.1}, base: 100});
+      this.paneScale.setHeight(this.paneBottom - this.paneTop);
+      this.paneScale.setRange(0, 100);
+      this.paneScale.setFormatter(new PriceFormatter(100, 1));
+      this.paneScale.rebuildMarks();
+    } else if (this.activeIndicators.has('macd')) {
+      // Auto-scale MACD
+      const macd = this.indCache.macd;
+      if (macd) {
+        let mMin = Infinity, mMax = -Infinity;
+        for (let i = firstIdx; i <= lastIdx; i++) {
+          if (macd.macd[i] !== null) {
+            mMin = Math.min(mMin, macd.macd[i], macd.signal[i], macd.hist[i]);
+            mMax = Math.max(mMax, macd.macd[i], macd.signal[i], macd.hist[i]);
+          }
+        }
+        if (!isFinite(mMin)) { mMin = -1; mMax = 1; }
+        const pad = (mMax - mMin) * 0.1;
+        this.paneScale = new PriceScale({scaleMargins: {top: 0.1, bottom: 0.1}, base: 1000});
+        this.paneScale.setHeight(this.paneBottom - this.paneTop);
+        this.paneScale.setRange(mMin - pad, mMax + pad);
+        this.paneScale.setFormatter(new PriceFormatter(1000, 1));
+        this.paneScale.rebuildMarks();
+      }
+    }
   }
 
   /* --------------------------- Indicator Cache --------------------------- */
@@ -768,36 +1084,36 @@ class TradingChart {
     const idx = this.xToIndex(x);
     const price = this.yToPrice(y);
     const tool = this.activeTool;
-    const base = {type: tool, t1: this.candleTime(idx), p1: price, t2: this.candleTime(idx), p2: price};
     if (tool === 'hline') {
       this.drawings.push({type:'hline', price, color: THEME.drawing, id: Date.now()});
-      this.currentDrawing = null;
       this.activeTool = 'cursor';
       this.showToast('Horizontal line added');
+      this.autoScale();
       return;
     }
     if (tool === 'vline') {
-      this.drawings.push({type:'vline', time: this.candleTime(idx), color: THEME.drawing, id: Date.now()});
-      this.currentDrawing = null;
+      this.drawings.push({type:'vline', index: idx, color: THEME.drawing, id: Date.now()});
       this.activeTool = 'cursor';
       this.showToast('Vertical line added');
       return;
     }
-    this.currentDrawing = {...base, color: THEME.drawingActive, id: Date.now(), points: tool === 'brush' ? [{x, y, t: this.candleTime(idx), p: price}] : null};
+    this.currentDrawing = {
+      type: tool, i1: idx, p1: price, i2: idx, p2: price,
+      color: THEME.drawingActive, id: Date.now(),
+      points: tool === 'brush' ? [{i: idx, p: price, x, y}] : null
+    };
   }
-
   updateCurrentDrawing(x, y) {
     if (!this.currentDrawing) return;
     const idx = this.xToIndex(x);
     const price = this.yToPrice(y);
     if (this.currentDrawing.type === 'brush') {
-      this.currentDrawing.points.push({x, y, t: this.candleTime(idx), p: price});
+      this.currentDrawing.points.push({i: idx, p: price, x, y});
     } else {
-      this.currentDrawing.t2 = this.candleTime(idx);
+      this.currentDrawing.i2 = idx;
       this.currentDrawing.p2 = price;
     }
   }
-
   finishDrawing() {
     if (!this.currentDrawing) return;
     this.currentDrawing.color = THEME.drawing;
@@ -807,28 +1123,7 @@ class TradingChart {
     this.showToast('Drawing added');
   }
 
-  candleTime(idx) {
-    if (idx < 0 || idx >= this.sim.candles.length) return null;
-    return this.sim.candles[idx].time;
-  }
-  timeToIndex(t) {
-    // find nearest candle by time
-    let lo = 0, hi = this.sim.candles.length - 1, best = -1;
-    while (lo <= hi) {
-      const mid = (lo + hi) >> 1;
-      if (this.sim.candles[mid].time === t) return mid;
-      if (this.sim.candles[mid].time < t) { best = mid; lo = mid + 1; }
-      else hi = mid - 1;
-    }
-    return best;
-  }
-  timeToX(t) {
-    const i = this.timeToIndex(t);
-    if (i < 0) return null;
-    return this.indexToX(i);
-  }
-
-  /* --------------------------- Button Hit Testing ------------------------ */
+  /* --------------------------- UI Hit Testing ---------------------------- */
   hitButton(x, y) {
     for (const b of this.buttons) {
       if (x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h) return b;
@@ -843,36 +1138,16 @@ class TradingChart {
     }
     return null;
   }
-
   handleButtonClick(btn) {
     switch (btn.action) {
-      case 'symbol':
-        this.openDropdown('symbol', SYMBOLS.map(s => ({label: s.label, value: s.label})), btn);
-        break;
-      case 'timeframe':
-        this.openDropdown('timeframe', TIMEFRAMES.map(t => ({label: t.label, value: t.label})), btn);
-        break;
-      case 'indicator':
-        this.openDropdown('indicator', INDICATOR_LIST.map(i => ({
-          label: i.label, value: i.id, checked: this.activeIndicators.has(i.id)
-        })), btn);
-        break;
-      case 'tool':
-        this.openDropdown('tool', DRAW_TOOLS.map(t => ({label: t.label, value: t.id})), btn);
-        break;
-      case 'reset':
-        this.fit();
-        this.showToast('Reset view');
-        break;
-      case 'settings':
-        this.showToast('Settings: press R to reset, +/- to zoom, Esc to cancel tool');
-        break;
-      case 'snapshot':
-        this.showToast('Snapshot: ' + this.symbol.label + ' ' + this.timeframe.label);
-        break;
+      case 'symbol': this.openDropdown('symbol', SYMBOLS.map(s => ({label: s.label, value: s.label})), btn); break;
+      case 'timeframe': this.openDropdown('timeframe', TIMEFRAMES.map(t => ({label: t.label, value: t.label})), btn); break;
+      case 'indicator': this.openDropdown('indicator', INDICATOR_LIST.map(i => ({label: i.label, value: i.id, checked: this.activeIndicators.has(i.id)})), btn); break;
+      case 'tool': this.openDropdown('tool', DRAW_TOOLS.map(t => ({label: t.label, value: t.id})), btn); break;
+      case 'reset': this.resetView(); break;
+      case 'settings': this.showToast('R reset · +/- zoom · Esc cancel · Del delete'); break;
     }
   }
-
   openDropdown(type, items, anchorBtn) {
     this.dropdown = {
       type, items: [], x: anchorBtn.x, y: anchorBtn.y + anchorBtn.h + 2,
@@ -886,25 +1161,31 @@ class TradingChart {
     }
     this.dropdown.h = y - this.dropdown.y;
   }
-
   handleDropdownSelect(item) {
     if (this.dropdown.type === 'symbol') {
       const sym = SYMBOLS.find(s => s.label === item.value);
       if (sym) {
         this.symbol = sym;
-        this.sim = new DataSimulator(this.symbol, this.timeframe);
-        this.fit();
-        this.computeIndicators();
+        this.sim = new DataSimulator(sym, this.timeframe);
+        this.priceScale = new PriceScale({scaleMargins:{top:0.15,bottom:0.15}, base: sym.priceScale});
+        this.priceScale.setFormatter(new PriceFormatter(sym.priceScale, 1));
+        this.priceScale.setHeight(this.priceBottom - this.priceTop);
+        this.volScale.setHeight(this.volBottom - this.volTop);
         this.drawings = [];
+        this.computeTimeWeights();
+        this.computeIndicators();
+        this.resetView();
         this.showToast('Loaded ' + sym.label);
       }
     } else if (this.dropdown.type === 'timeframe') {
       const tf = TIMEFRAMES.find(t => t.label === item.value);
       if (tf) {
         this.timeframe = tf;
-        this.sim = new DataSimulator(this.symbol, this.timeframe);
-        this.fit();
+        this.sim = new DataSimulator(this.symbol, tf);
+        this.drawings = [];
+        this.computeTimeWeights();
         this.computeIndicators();
+        this.resetView();
         this.showToast('Timeframe: ' + tf.label);
       }
     } else if (this.dropdown.type === 'indicator') {
@@ -922,32 +1203,26 @@ class TradingChart {
       this.activeTool = item.value;
       this.showToast('Tool: ' + item.label);
     }
-    this.dropdown = null;
   }
+  showToast(text) { this.toast = {text, until: performance.now() + 2200}; }
 
-  showToast(text) {
-    this.toast = {text, until: performance.now() + 2200};
-  }
-
-  /* --------------------------- Main Render ------------------------------- */
+  /* --------------------------- MAIN RENDER LOOP -------------------------- */
   render(now) {
     if (!now) now = performance.now();
-    // Tick simulation
     if (now - this.lastTickAt > this.tickInterval) {
       this.sim.tick();
       this.lastTickAt = now;
+      this.computeTimeWeights();
       this.computeIndicators();
-      // If user is at the right edge, follow the price
-      if (this.viewEnd >= this.sim.candles.length + 5) {
-        this.viewEnd = this.sim.candles.length + 5;
+      // If user is at the right edge (realtime), follow the price
+      if (this.rightOffset <= 4.5) {
+        this.rightOffset = Math.max(0, this.rightOffset);
       }
       this.autoScale();
     }
-
     const ctx = this.ctx;
     ctx.clearRect(0, 0, this.W, this.H);
     this.buttons = [];
-
     this.drawBackground();
     this.drawGrid();
     this.drawCandles();
@@ -964,26 +1239,19 @@ class TradingChart {
     this.drawStatusBar();
     this.drawDropdown();
     this.drawToast(now);
-
-    // Hover detection for drawings (only if not dragging)
     if (!this.isDragging && this.activeTool === 'eraser') {
       this.hoverDrawing = this.findDrawingAt(this.mouseX, this.mouseY);
-    } else {
-      this.hoverDrawing = null;
-    }
+    } else this.hoverDrawing = null;
   }
 
+  /* --------------------------- Background -------------------------------- */
   drawBackground() {
     const ctx = this.ctx;
     ctx.fillStyle = THEME.bg;
     ctx.fillRect(0, 0, this.W, this.H);
-    // Toolbar area
     ctx.fillStyle = THEME.toolbarBg;
     ctx.fillRect(0, 0, this.W, this.layout.toolbarH);
-    // Status bar area
-    ctx.fillStyle = THEME.toolbarBg;
     ctx.fillRect(0, this.H - this.layout.statusH, this.W, this.layout.statusH);
-    // Borders
     ctx.strokeStyle = THEME.toolbarBorder;
     ctx.lineWidth = 1;
     ctx.beginPath();
@@ -994,54 +1262,32 @@ class TradingChart {
     ctx.stroke();
   }
 
-  /* --------------------------- Grid -------------------------------------- */
+  /* --------------------------- Grid (price marks) ------------------------ */
   drawGrid() {
     const ctx = this.ctx;
     ctx.strokeStyle = THEME.grid;
     ctx.lineWidth = 1;
-    ctx.font = '11px -apple-system, Segoe UI, Roboto, sans-serif';
-    ctx.fillStyle = THEME.textDim;
-    ctx.textBaseline = 'middle';
-
-    // Horizontal price grid lines - auto-spacing
-    const range = this.maxPrice - this.minPrice;
-    const targetLines = 8;
-    const rawStep = range / targetLines;
-    const mag = Math.pow(10, Math.floor(Math.log10(rawStep)));
-    const norm = rawStep / mag;
-    let step;
-    if (norm < 1.5) step = 1 * mag;
-    else if (norm < 3) step = 2 * mag;
-    else if (norm < 7) step = 5 * mag;
-    else step = 10 * mag;
-    const decimals = this.symbol.decimals;
-
-    const startP = Math.ceil(this.minPrice / step) * step;
-    for (let p = startP; p <= this.maxPrice; p += step) {
-      const y = this.priceToY(p);
+    // Use price tick marks for horizontal grid lines
+    const marks = this.priceScale.marks();
+    for (const m of marks) {
+      const y = this.priceTop + m.coord;
       if (y < this.priceTop - 1 || y > this.priceBottom + 1) continue;
       ctx.beginPath();
       ctx.moveTo(this.chartLeft, Math.floor(y) + 0.5);
       ctx.lineTo(this.chartRight, Math.floor(y) + 0.5);
       ctx.stroke();
     }
-
-    // Vertical time grid lines
-    const stepIdx = this.calcTimeStep();
-    const startIdx = Math.max(0, Math.floor(this.viewStart));
-    const endIdx = Math.min(this.sim.candles.length, Math.ceil(this.viewEnd));
-    ctx.strokeStyle = THEME.grid;
-    for (let i = startIdx; i < endIdx; i++) {
-      if (i % stepIdx === 0) {
-        const x = this.indexToX(i);
-        if (x < this.chartLeft || x > this.chartRight) continue;
-        ctx.beginPath();
-        ctx.moveTo(Math.floor(x) + 0.5, this.chartTop);
-        ctx.lineTo(Math.floor(x) + 0.5, this.layout.paneBottom);
-        ctx.stroke();
-      }
+    // Time tick marks for vertical grid lines
+    const timeMarks = this.getTimeMarks();
+    for (const m of timeMarks) {
+      if (m.index < 0 || m.index >= this.sim.candles.length) continue;
+      const x = this.indexToX(m.index);
+      if (x < this.chartLeft || x > this.chartRight) continue;
+      ctx.beginPath();
+      ctx.moveTo(Math.floor(x) + 0.5, this.chartTop);
+      ctx.lineTo(Math.floor(x) + 0.5, this.chartBottom);
+      ctx.stroke();
     }
-
     // Pane separator
     if (this.layout.paneH > 0) {
       ctx.strokeStyle = THEME.toolbarBorder;
@@ -1052,30 +1298,26 @@ class TradingChart {
     }
   }
 
-  calcTimeStep() {
-    const visible = this.getVisibleCount();
-    if (visible < 10) return 1;
-    if (visible < 25) return 5;
-    if (visible < 60) return 10;
-    if (visible < 150) return 30;
-    if (visible < 400) return 60;
-    return 120;
-  }
-
-  /* --------------------------- Candles ----------------------------------- */
+  /* --------------------------- Candles (LWC-correct widths) -------------- */
   drawCandles() {
     const ctx = this.ctx;
-    const start = Math.max(0, Math.floor(this.viewStart));
-    const end = Math.min(this.sim.candles.length, Math.ceil(this.viewEnd));
-    const bodyW = Math.max(1, this.candleW);
-    const wickW = Math.max(1, this.candleW * 0.12);
-    const decimals = this.symbol.decimals;
+    const candles = this.sim.candles;
+    const dpr = this.dpr;
+    // Determine visible range
+    const firstIdx = Math.max(0, Math.floor(this.xToIndex(this.chartLeft)) - 1);
+    const lastIdx = Math.min(candles.length - 1, Math.ceil(this.xToIndex(this.chartRight)) + 1);
 
-    for (let i = start; i < end; i++) {
-      const c = this.sim.candles[i];
+    // LWC-correct candle width in bitmap pixels
+    const bodyWidthBmp = candlestickWidth(this.barSpacing, dpr);
+    const wickWidthBmp = Math.max(1, Math.floor(dpr));
+    // Convert to media coords for drawing (since ctx is setTransform(dpr,...))
+    const bodyWidth = bodyWidthBmp / dpr;
+    const wickWidth = wickWidthBmp / dpr;
+
+    for (let i = firstIdx; i <= lastIdx; i++) {
+      const c = candles[i];
       const x = this.indexToX(i);
-      if (x < this.chartLeft - bodyW || x > this.chartRight + bodyW) continue;
-
+      if (x < this.chartLeft - bodyWidth || x > this.chartRight + bodyWidth) continue;
       const isBull = c.close >= c.open;
       const color = isBull ? THEME.bull : THEME.bear;
       const yOpen = this.priceToY(c.open);
@@ -1083,118 +1325,120 @@ class TradingChart {
       const yHigh = this.priceToY(c.high);
       const yLow = this.priceToY(c.low);
 
-      // Wick
-      ctx.strokeStyle = color;
-      ctx.lineWidth = wickW;
-      ctx.beginPath();
-      ctx.moveTo(Math.floor(x) + 0.5, yHigh);
-      ctx.lineTo(Math.floor(x) + 0.5, yLow);
-      ctx.stroke();
+      // Snap center to integer bitmap pixel for crisp wick
+      const wickXBmp = Math.round(x * dpr);
+      const wickX = wickXBmp / dpr;
+      const wickLeft = wickX - wickWidth / 2;
 
-      // Body
+      // Draw wick as a filled rectangle (LWC-style) for pixel-perfect crispness
       ctx.fillStyle = color;
-      const bodyTop = Math.min(yOpen, yClose);
-      const bodyH = Math.max(1, Math.abs(yClose - yOpen));
-      ctx.fillRect(Math.floor(x - bodyW / 2), Math.floor(bodyTop), Math.ceil(bodyW), Math.ceil(bodyH));
+      const wickTop = Math.floor(yHigh * dpr) / dpr;
+      const wickBottom = Math.ceil(yLow * dpr) / dpr;
+      const wickH = Math.max(1 / dpr, wickBottom - wickTop);
+      ctx.fillRect(wickLeft, wickTop, wickWidth, wickH);
+
+      // Body — pixel-perfect rectangle
+      const bodyLeftBmp = wickXBmp - Math.floor(bodyWidthBmp / 2);
+      const bodyLeft = bodyLeftBmp / dpr;
+      const bodyTop = Math.round(Math.min(yOpen, yClose) * dpr) / dpr;
+      const bodyBottom = Math.round(Math.max(yOpen, yClose) * dpr) / dpr;
+      const bodyH = Math.max(1 / dpr, bodyBottom - bodyTop);
+      ctx.fillRect(bodyLeft, bodyTop, bodyWidth, bodyH);
     }
   }
 
   /* --------------------------- Volume ------------------------------------ */
   drawVolume() {
     const ctx = this.ctx;
-    const start = Math.max(0, Math.floor(this.viewStart));
-    const end = Math.min(this.sim.candles.length, Math.ceil(this.viewEnd));
-    if (start >= end) return;
+    const candles = this.sim.candles;
+    const firstIdx = Math.max(0, Math.floor(this.xToIndex(this.chartLeft)) - 1);
+    const lastIdx = Math.min(candles.length - 1, Math.ceil(this.xToIndex(this.chartRight)) + 1);
+    if (firstIdx > lastIdx) return;
 
-    let maxVol = 0;
-    for (let i = start; i < end; i++) {
-      if (this.sim.candles[i].volume > maxVol) maxVol = this.sim.candles[i].volume;
-    }
-    if (maxVol === 0) return;
+    // Use LWC-style column width (slightly less than barSpacing)
+    const bodyWidthBmp = optimalCandlestickWidth(this.barSpacing, this.dpr);
+    const bodyWidth = bodyWidthBmp / this.dpr;
 
-    const bodyW = Math.max(1, this.candleW);
-    const volTop = this.volTop;
-    const volBot = this.volBottom;
-    const h = volBot - volTop;
-
-    for (let i = start; i < end; i++) {
-      const c = this.sim.candles[i];
+    for (let i = firstIdx; i <= lastIdx; i++) {
+      const c = candles[i];
       const x = this.indexToX(i);
-      if (x < this.chartLeft - bodyW || x > this.chartRight + bodyW) continue;
+      if (x < this.chartLeft - bodyWidth || x > this.chartRight + bodyWidth) continue;
       const isBull = c.close >= c.open;
-      const barH = (c.volume / maxVol) * h;
+      const yTop = this.volToY(c.volume);
+      const yBot = this.volBottom;
       ctx.fillStyle = isBull ? THEME.bullVol : THEME.bearVol;
-      ctx.fillRect(Math.floor(x - bodyW / 2), Math.floor(volBot - barH), Math.ceil(bodyW), Math.ceil(barH));
+      const left = Math.round((x - bodyWidth / 2) * this.dpr) / this.dpr;
+      const top = Math.round(yTop * this.dpr) / this.dpr;
+      const h = Math.max(1 / this.dpr, yBot - yTop);
+      ctx.fillRect(left, top, bodyWidth, h);
     }
 
-    // Volume SMA
+    // Vol SMA
     if (this.activeIndicators.has('volsma') && this.indCache.volsma) {
       const sma = this.indCache.volsma;
       ctx.strokeStyle = THEME.ma2;
       ctx.lineWidth = 1.4;
       ctx.beginPath();
       let started = false;
-      for (let i = start; i < end; i++) {
-        if (sma[i] === null) continue;
+      for (let i = firstIdx; i <= lastIdx; i++) {
+        if (sma[i] === null) { started = false; continue; }
         const x = this.indexToX(i);
-        const y = volBot - (sma[i] / maxVol) * h;
-        if (!started) { ctx.moveTo(x, y); started = true; }
-        else ctx.lineTo(x, y);
+        const y = this.volToY(sma[i]);
+        if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
       }
       ctx.stroke();
     }
-
-    // Volume label
+    // Vol label
     ctx.font = '10px -apple-system, Segoe UI, Roboto, sans-serif';
     ctx.fillStyle = THEME.textDim;
     ctx.textBaseline = 'top';
     ctx.textAlign = 'left';
-    const lastVol = this.sim.candles[end - 1].volume;
-    ctx.fillText('Vol ' + fmtVolume(lastVol), this.chartLeft + 6, volTop + 2);
+    const lastVol = candles[Math.min(candles.length - 1, lastIdx)].volume;
+    ctx.fillText('Vol ' + this._fmtVol(lastVol), this.chartLeft + 6, this.volTop + 2);
+  }
+  _fmtVol(n) {
+    if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
+    if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+    if (n >= 1e3) return (n / 1e3).toFixed(2) + 'K';
+    return n.toFixed(0);
   }
 
   /* --------------------------- Indicators -------------------------------- */
   drawIndicators() {
     const ctx = this.ctx;
-    const start = Math.max(0, Math.floor(this.viewStart));
-    const end = Math.min(this.sim.candles.length, Math.ceil(this.viewEnd));
-
+    const firstIdx = Math.max(0, Math.floor(this.xToIndex(this.chartLeft)));
+    const lastIdx = Math.min(this.sim.candles.length - 1, Math.ceil(this.xToIndex(this.chartRight)));
     const drawLine = (arr, color, lw = 1.4) => {
       if (!arr) return;
       ctx.strokeStyle = color;
       ctx.lineWidth = lw;
       ctx.beginPath();
       let started = false;
-      for (let i = start; i < end; i++) {
-        if (arr[i] === null || arr[i] === undefined) { started = false; continue; }
+      for (let i = firstIdx; i <= lastIdx; i++) {
+        if (arr[i] === null) { started = false; continue; }
         const x = this.indexToX(i);
         const y = this.priceToY(arr[i]);
-        if (!started) { ctx.moveTo(x, y); started = true; }
-        else ctx.lineTo(x, y);
+        if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
       }
       ctx.stroke();
     };
-
     if (this.activeIndicators.has('ma20'))  drawLine(this.indCache.ma20,  THEME.ma1);
     if (this.activeIndicators.has('ma50'))  drawLine(this.indCache.ma50,  THEME.ma2);
     if (this.activeIndicators.has('ma200')) drawLine(this.indCache.ma200, THEME.ma3);
     if (this.activeIndicators.has('ema20')) drawLine(this.indCache.ema20, THEME.ma1, 1.6);
     if (this.activeIndicators.has('ema50')) drawLine(this.indCache.ema50, THEME.ma2, 1.6);
-
     if (this.activeIndicators.has('bb') && this.indCache.bb) {
       const bb = this.indCache.bb;
-      // Fill between upper and lower
       ctx.fillStyle = THEME.bollingerBand;
       ctx.beginPath();
       let started = false;
-      for (let i = start; i < end; i++) {
+      for (let i = firstIdx; i <= lastIdx; i++) {
         if (bb.upper[i] === null) { started = false; continue; }
         const x = this.indexToX(i);
         const y = this.priceToY(bb.upper[i]);
-        if (!started) { ctx.moveTo(x, y); started = true; }
-        else ctx.lineTo(x, y);
+        if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
       }
-      for (let i = end - 1; i >= start; i--) {
+      for (let i = lastIdx; i >= firstIdx; i--) {
         if (bb.lower[i] === null) continue;
         const x = this.indexToX(i);
         const y = this.priceToY(bb.lower[i]);
@@ -1210,121 +1454,107 @@ class TradingChart {
 
   /* --------------------------- Pane (RSI/MACD) --------------------------- */
   drawPane() {
-    if (this.layout.paneH === 0) return;
+    if (this.layout.paneH === 0 || !this.paneScale) return;
     const ctx = this.ctx;
-    const top = this.paneTop;
-    const bot = this.paneBottom;
-    const left = this.paneLeft;
-    const right = this.paneRight;
+    const top = this.paneTop, bot = this.paneBottom, left = this.paneLeft, right = this.paneRight;
+    const firstIdx = Math.max(0, Math.floor(this.xToIndex(this.chartLeft)));
+    const lastIdx = Math.min(this.sim.candles.length - 1, Math.ceil(this.xToIndex(this.chartRight)));
 
-    if (this.activeIndicators.has('rsi')) {
+    // Grid (use pane scale marks)
+    ctx.strokeStyle = THEME.grid;
+    ctx.lineWidth = 1;
+    const pmarks = this.paneScale.marks();
+    for (const m of pmarks) {
+      const y = top + m.coord;
+      if (y < top - 1 || y > bot + 1) continue;
+      ctx.beginPath();
+      ctx.moveTo(left, Math.floor(y) + 0.5);
+      ctx.lineTo(right, Math.floor(y) + 0.5);
+      ctx.stroke();
+    }
+
+    if (this.activeIndicators.has('rsi') && this.indCache.rsi) {
       const rsi = this.indCache.rsi;
-      if (!rsi) return;
-      // Background grid for 30/50/70
-      ctx.strokeStyle = THEME.grid;
-      ctx.lineWidth = 1;
-      [30, 50, 70].forEach(level => {
-        const y = top + (1 - level / 100) * (bot - top);
-        ctx.beginPath();
-        ctx.moveTo(left, y + 0.5);
-        ctx.lineTo(right, y + 0.5);
-        ctx.stroke();
-      });
-      // Overbought/oversold lines
-      ctx.strokeStyle = THEME.rsiOver;
+      // 30/70 dashed lines
       ctx.setLineDash([3, 3]);
-      let y70 = top + (1 - 70 / 100) * (bot - top);
-      ctx.beginPath(); ctx.moveTo(left, y70); ctx.lineTo(right, y70); ctx.stroke();
+      ctx.lineWidth = 1;
+      const y70 = top + this.paneScale.logicalToCoordinate(70, 0);
+      const y30 = top + this.paneScale.logicalToCoordinate(30, 0);
+      ctx.strokeStyle = THEME.rsiOver;
+      ctx.beginPath(); ctx.moveTo(left, Math.floor(y70) + 0.5); ctx.lineTo(right, Math.floor(y70) + 0.5); ctx.stroke();
       ctx.strokeStyle = THEME.rsiUnder;
-      let y30 = top + (1 - 30 / 100) * (bot - top);
-      ctx.beginPath(); ctx.moveTo(left, y30); ctx.lineTo(right, y30); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(left, Math.floor(y30) + 0.5); ctx.lineTo(right, Math.floor(y30) + 0.5); ctx.stroke();
       ctx.setLineDash([]);
 
-      // RSI line
-      const start = Math.max(0, Math.floor(this.viewStart));
-      const end = Math.min(rsi.length, Math.ceil(this.viewEnd));
       ctx.strokeStyle = THEME.rsi;
       ctx.lineWidth = 1.5;
       ctx.beginPath();
       let started = false;
-      for (let i = start; i < end; i++) {
+      for (let i = firstIdx; i <= lastIdx; i++) {
         if (rsi[i] === null) { started = false; continue; }
         const x = this.indexToX(i);
-        const y = top + (1 - rsi[i] / 100) * (bot - top);
-        if (!started) { ctx.moveTo(x, y); started = true; }
-        else ctx.lineTo(x, y);
+        const y = top + this.paneScale.logicalToCoordinate(rsi[i], 0);
+        if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
       }
       ctx.stroke();
 
-      // Label
       ctx.font = '10px -apple-system, Segoe UI, Roboto, sans-serif';
       ctx.fillStyle = THEME.rsi;
-      ctx.textAlign = 'left';
-      ctx.textBaseline = 'top';
+      ctx.textAlign = 'left'; ctx.textBaseline = 'top';
       const last = rsi[rsi.length - 1];
       ctx.fillText('RSI 14: ' + (last !== null ? last.toFixed(2) : '—'), left + 6, top + 4);
-
       // Right axis labels
-      ctx.fillStyle = THEME.textDim;
-      ctx.textAlign = 'left';
-      [70, 50, 30].forEach(level => {
-        const y = top + (1 - level / 100) * (bot - top);
-        ctx.fillText(String(level), right + 4, y - 5);
-      });
-    } else if (this.activeIndicators.has('macd')) {
+      ctx.fillStyle = THEME.textDim; ctx.textAlign = 'left';
+      for (const m of pmarks) ctx.fillText(m.label, right + 4, top + m.coord - 5);
+
+    } else if (this.activeIndicators.has('macd') && this.indCache.macd) {
       const macd = this.indCache.macd;
-      if (!macd) return;
-      const start = Math.max(0, Math.floor(this.viewStart));
-      const end = Math.min(macd.macd.length, Math.ceil(this.viewEnd));
-      // Find max abs value
-      let maxAbs = 0;
-      for (let i = start; i < end; i++) {
-        if (macd.hist[i] !== null) maxAbs = Math.max(maxAbs, Math.abs(macd.hist[i]), Math.abs(macd.macd[i] || 0), Math.abs(macd.signal[i] || 0));
-      }
-      if (maxAbs === 0) maxAbs = 1;
       const midY = (top + bot) / 2;
-      const halfH = (bot - top) / 2 - 4;
       // Zero line
       ctx.strokeStyle = THEME.gridStrong;
       ctx.beginPath();
-      ctx.moveTo(left, midY + 0.5);
-      ctx.lineTo(right, midY + 0.5);
+      ctx.moveTo(left, Math.floor(midY) + 0.5);
+      ctx.lineTo(right, Math.floor(midY) + 0.5);
       ctx.stroke();
-      // Histogram
-      const bodyW = Math.max(1, this.candleW);
-      for (let i = start; i < end; i++) {
+
+      // Histogram (use LWC-style column width)
+      const bodyWidthBmp = optimalCandlestickWidth(this.barSpacing, this.dpr);
+      const bodyWidth = bodyWidthBmp / this.dpr;
+      for (let i = firstIdx; i <= lastIdx; i++) {
         if (macd.hist[i] === null) continue;
         const x = this.indexToX(i);
-        const h = (macd.hist[i] / maxAbs) * halfH;
+        const y = top + this.paneScale.logicalToCoordinate(macd.hist[i], 0);
+        const h = Math.abs(y - midY);
         ctx.fillStyle = macd.hist[i] >= 0 ? THEME.macdHistBull : THEME.macdHistBear;
-        if (h >= 0) ctx.fillRect(Math.floor(x - bodyW / 2), Math.floor(midY - h), Math.ceil(bodyW), Math.ceil(h));
-        else ctx.fillRect(Math.floor(x - bodyW / 2), Math.floor(midY), Math.ceil(bodyW), Math.ceil(-h));
+        const left2 = Math.round((x - bodyWidth / 2) * this.dpr) / this.dpr;
+        if (macd.hist[i] >= 0) ctx.fillRect(left2, Math.floor(y), bodyWidth, Math.ceil(h));
+        else ctx.fillRect(left2, Math.floor(midY), bodyWidth, Math.ceil(h));
       }
-      // MACD line
-      const drawMacdLine = (arr, color) => {
-        ctx.strokeStyle = color;
-        ctx.lineWidth = 1.4;
+
+      // MACD and signal lines
+      const drawML = (arr, color) => {
+        ctx.strokeStyle = color; ctx.lineWidth = 1.4;
         ctx.beginPath();
         let started = false;
-        for (let i = start; i < end; i++) {
+        for (let i = firstIdx; i <= lastIdx; i++) {
           if (arr[i] === null) { started = false; continue; }
           const x = this.indexToX(i);
-          const y = midY - (arr[i] / maxAbs) * halfH;
-          if (!started) { ctx.moveTo(x, y); started = true; }
-          else ctx.lineTo(x, y);
+          const y = top + this.paneScale.logicalToCoordinate(arr[i], 0);
+          if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
         }
         ctx.stroke();
       };
-      drawMacdLine(macd.macd, THEME.macd);
-      drawMacdLine(macd.signal, THEME.macdSignal);
+      drawML(macd.macd, THEME.macd);
+      drawML(macd.signal, THEME.macdSignal);
 
-      // Label
       ctx.font = '10px -apple-system, Segoe UI, Roboto, sans-serif';
       ctx.fillStyle = THEME.macd;
-      ctx.textAlign = 'left';
-      ctx.textBaseline = 'top';
-      const lastMacd = macd.macd[macd.macd.length - 1];
-      ctx.fillText('MACD 12,26,9: ' + (lastMacd !== null ? lastMacd.toFixed(3) : '—'), left + 6, top + 4);
+      ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+      const lm = macd.macd[macd.macd.length - 1];
+      ctx.fillText('MACD 12,26,9: ' + (lm !== null ? lm.toFixed(3) : '—'), left + 6, top + 4);
+      // Right axis labels
+      ctx.fillStyle = THEME.textDim; ctx.textAlign = 'left';
+      for (const m of pmarks) ctx.fillText(m.label, right + 4, top + m.coord - 5);
     }
   }
 
@@ -1341,16 +1571,14 @@ class TradingChart {
 
       switch (d.type) {
         case 'trend': {
-          const x1 = this.timeToX(d.t1);
-          const x2 = this.timeToX(d.t2);
-          if (x1 === null || x2 === null) return;
+          const x1 = this.indexToX(d.i1);
+          const x2 = this.indexToX(d.i2);
           const y1 = this.priceToY(d.p1);
           const y2 = this.priceToY(d.p2);
           ctx.beginPath();
           ctx.moveTo(x1, y1);
           ctx.lineTo(x2, y2);
           ctx.stroke();
-          // Endpoint dots
           ctx.beginPath(); ctx.arc(x1, y1, 3, 0, Math.PI * 2); ctx.fill();
           ctx.beginPath(); ctx.arc(x2, y2, 3, 0, Math.PI * 2); ctx.fill();
           break;
@@ -1359,37 +1587,33 @@ class TradingChart {
           const y = this.priceToY(d.price);
           ctx.setLineDash([4, 4]);
           ctx.beginPath();
-          ctx.moveTo(this.chartLeft, y);
-          ctx.lineTo(this.chartRight, y);
+          ctx.moveTo(this.chartLeft, Math.floor(y) + 0.5);
+          ctx.lineTo(this.chartRight, Math.floor(y) + 0.5);
           ctx.stroke();
           ctx.setLineDash([]);
-          // Label on right
+          const txt = this.priceScale.formatLogical(d.price);
           ctx.font = '10px -apple-system, Segoe UI, Roboto, sans-serif';
-          const txt = fmtPrice(d.price, this.symbol.decimals);
           const tw = ctx.measureText(txt).width + 8;
           ctx.fillStyle = color;
-          ctx.fillRect(this.chartRight + 1, y - 7, tw, 14);
+          ctx.fillRect(this.chartRight + 1, Math.floor(y) - 7, tw, 14);
           ctx.fillStyle = THEME.bg;
-          ctx.textAlign = 'left';
-          ctx.textBaseline = 'middle';
-          ctx.fillText(txt, this.chartRight + 5, y);
+          ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+          ctx.fillText(txt, this.chartRight + 5, Math.floor(y));
           break;
         }
         case 'vline': {
-          const x = this.timeToX(d.time);
-          if (x === null) return;
+          const x = this.indexToX(d.index);
           ctx.setLineDash([4, 4]);
           ctx.beginPath();
-          ctx.moveTo(x, this.chartTop);
-          ctx.lineTo(x, this.layout.paneBottom);
+          ctx.moveTo(Math.floor(x) + 0.5, this.chartTop);
+          ctx.lineTo(Math.floor(x) + 0.5, this.layout.paneBottom || this.chartBottom);
           ctx.stroke();
           ctx.setLineDash([]);
           break;
         }
         case 'rect': {
-          const x1 = this.timeToX(d.t1);
-          const x2 = this.timeToX(d.t2);
-          if (x1 === null || x2 === null) return;
+          const x1 = this.indexToX(d.i1);
+          const x2 = this.indexToX(d.i2);
           const y1 = this.priceToY(d.p1);
           const y2 = this.priceToY(d.p2);
           const rx = Math.min(x1, x2), ry = Math.min(y1, y2);
@@ -1400,122 +1624,97 @@ class TradingChart {
           break;
         }
         case 'fib': {
-          const x1 = this.timeToX(d.t1);
-          const x2 = this.timeToX(d.t2);
-          if (x1 === null || x2 === null) return;
+          const x1 = this.indexToX(d.i1);
+          const x2 = this.indexToX(d.i2);
           const y1 = this.priceToY(d.p1);
           const y2 = this.priceToY(d.p2);
           const xL = Math.min(x1, x2), xR = Math.max(x1, x2);
           const levels = [0, 0.236, 0.382, 0.5, 0.618, 0.786, 1, 1.618];
           const colors = ['#787b86','#ef5350','#ff9800','#26a69a','#2962ff','#9c27b0','#ef5350','#26a69a'];
           ctx.font = '10px -apple-system, Segoe UI, Roboto, sans-serif';
-          ctx.textBaseline = 'middle';
-          ctx.textAlign = 'left';
+          ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
           for (let i = 0; i < levels.length; i++) {
             const y = y1 + (y2 - y1) * levels[i];
-            ctx.strokeStyle = colors[i];
-            ctx.lineWidth = 1;
+            ctx.strokeStyle = colors[i]; ctx.lineWidth = 1;
             ctx.setLineDash([2, 2]);
             ctx.beginPath();
-            ctx.moveTo(xL, y);
-            ctx.lineTo(xR, y);
+            ctx.moveTo(xL, Math.floor(y) + 0.5);
+            ctx.lineTo(xR, Math.floor(y) + 0.5);
             ctx.stroke();
             ctx.setLineDash([]);
             const p = d.p1 + (d.p2 - d.p1) * levels[i];
-            const txt = (levels[i] * 100).toFixed(1) + '% ' + fmtPrice(p, this.symbol.decimals);
+            const txt = (levels[i] * 100).toFixed(1) + '% ' + this.priceScale.formatLogical(p);
             const tw = ctx.measureText(txt).width + 6;
             ctx.fillStyle = colors[i];
-            ctx.fillRect(xR + 1, y - 7, tw, 14);
+            ctx.fillRect(xR + 1, Math.floor(y) - 7, tw, 14);
             ctx.fillStyle = THEME.bg;
-            ctx.fillText(txt, xR + 4, y);
+            ctx.fillText(txt, xR + 4, Math.floor(y));
           }
           break;
         }
         case 'brush': {
           if (!d.points || d.points.length === 0) return;
+          ctx.lineWidth = 2; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
           ctx.beginPath();
-          // Use stored absolute coords - but those are stale after pan.
-          // Better: re-project from t/p
-          ctx.lineWidth = 2;
-          ctx.lineCap = 'round';
-          ctx.lineJoin = 'round';
           for (let i = 0; i < d.points.length; i++) {
             const p = d.points[i];
-            const x = p.t !== null ? (this.timeToX(p.t) !== null ? this.timeToX(p.t) : p.x) : p.x;
+            const x = this.indexToX(p.i);
             const y = this.priceToY(p.p);
-            if (i === 0) ctx.moveTo(x, y);
-            else ctx.lineTo(x, y);
+            if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
           }
           ctx.stroke();
           break;
         }
       }
     };
-
     for (const d of this.drawings) drawOne(d);
     if (this.currentDrawing) drawOne(this.currentDrawing, true);
   }
 
   findDrawingAt(x, y) {
-    // Reverse so top drawings are hit first
     for (let i = this.drawings.length - 1; i >= 0; i--) {
-      const d = this.drawings[i];
-      if (this.hitTestDrawing(d, x, y)) return d;
+      if (this.hitTestDrawing(this.drawings[i], x, y)) return this.drawings[i];
     }
     return null;
   }
-
   hitTestDrawing(d, x, y) {
     const tol = 6;
     switch (d.type) {
       case 'trend': {
-        const x1 = this.timeToX(d.t1);
-        const x2 = this.timeToX(d.t2);
-        if (x1 === null || x2 === null) return false;
-        const y1 = this.priceToY(d.p1);
-        const y2 = this.priceToY(d.p2);
-        return this.distToSegment(x, y, x1, y1, x2, y2) < tol;
+        const x1 = this.indexToX(d.i1), x2 = this.indexToX(d.i2);
+        const y1 = this.priceToY(d.p1), y2 = this.priceToY(d.p2);
+        return this._distToSeg(x, y, x1, y1, x2, y2) < tol;
       }
       case 'hline': {
         const yy = this.priceToY(d.price);
         return Math.abs(y - yy) < tol && x >= this.chartLeft && x <= this.chartRight;
       }
       case 'vline': {
-        const xx = this.timeToX(d.time);
-        if (xx === null) return false;
-        return Math.abs(x - xx) < tol && y >= this.chartTop && y <= this.layout.paneBottom;
+        const xx = this.indexToX(d.index);
+        return Math.abs(x - xx) < tol && y >= this.chartTop && y <= this.chartBottom;
       }
       case 'rect': {
-        const x1 = this.timeToX(d.t1);
-        const x2 = this.timeToX(d.t2);
-        if (x1 === null || x2 === null) return false;
-        const y1 = this.priceToY(d.p1);
-        const y2 = this.priceToY(d.p2);
+        const x1 = this.indexToX(d.i1), x2 = this.indexToX(d.i2);
+        const y1 = this.priceToY(d.p1), y2 = this.priceToY(d.p2);
         const rx = Math.min(x1, x2), ry = Math.min(y1, y2);
         const rw = Math.abs(x2 - x1), rh = Math.abs(y2 - y1);
-        // Edge hit
-        const onTop    = Math.abs(y - ry) < tol && x >= rx && x <= rx + rw;
-        const onBot    = Math.abs(y - (ry + rh)) < tol && x >= rx && x <= rx + rw;
-        const onLeft   = Math.abs(x - rx) < tol && y >= ry && y <= ry + rh;
-        const onRight  = Math.abs(x - (rx + rw)) < tol && y >= ry && y <= ry + rh;
-        return onTop || onBot || onLeft || onRight;
+        return (Math.abs(y - ry) < tol || Math.abs(y - (ry + rh)) < tol) && x >= rx && x <= rx + rw
+            || (Math.abs(x - rx) < tol || Math.abs(x - (rx + rw)) < tol) && y >= ry && y <= ry + rh;
       }
     }
     return false;
   }
-
-  distToSegment(px, py, x1, y1, x2, y2) {
+  _distToSeg(px, py, x1, y1, x2, y2) {
     const dx = x2 - x1, dy = y2 - y1;
     const len2 = dx * dx + dy * dy;
-    if (len2 === 0) return dist(px, py, x1, y1);
+    if (len2 === 0) return Math.hypot(px - x1, py - y1);
     let t = ((px - x1) * dx + (py - y1) * dy) / len2;
     t = clamp(t, 0, 1);
-    return dist(px, py, x1 + t * dx, y1 + t * dy);
+    return Math.hypot(px - (x1 + t * dx), py - (y1 + t * dy));
   }
 
   /* --------------------------- Current Price Line ------------------------ */
   drawCurrentPriceLine() {
-    if (!this.showCurrentPriceLine) return;
     const ctx = this.ctx;
     const last = this.sim.candles[this.sim.candles.length - 1];
     if (!last) return;
@@ -1526,109 +1725,101 @@ class TradingChart {
     ctx.lineWidth = 1;
     ctx.setLineDash([2, 3]);
     ctx.beginPath();
-    ctx.moveTo(this.chartLeft, y);
-    ctx.lineTo(this.chartRight, y);
+    ctx.moveTo(this.chartLeft, Math.floor(y) + 0.5);
+    ctx.lineTo(this.chartRight, Math.floor(y) + 0.5);
     ctx.stroke();
     ctx.setLineDash([]);
-    // Label on price axis
-    const txt = fmtPrice(last.close, this.symbol.decimals);
+    const txt = this.priceScale.formatLogical(last.close);
     ctx.font = 'bold 11px -apple-system, Segoe UI, Roboto, sans-serif';
     const tw = ctx.measureText(txt).width + 10;
     ctx.fillStyle = color;
-    roundRect(ctx, this.chartRight + 1, y - 9, tw, 18, 2);
-    ctx.fill();
+    ctx.fillRect(this.chartRight + 1, Math.floor(y) - 9, tw, 18);
     ctx.fillStyle = THEME.textBright;
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillText(txt, this.chartRight + 1 + tw / 2, y);
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(txt, this.chartRight + 1 + tw / 2, Math.floor(y));
   }
 
   /* --------------------------- Price Axis -------------------------------- */
   drawPriceAxis() {
     const ctx = this.ctx;
-    ctx.font = '11px -apple-system, Segoe UI, Roboto, sans-serif';
-    ctx.fillStyle = THEME.textDim;
-    ctx.textBaseline = 'middle';
-    ctx.textAlign = 'left';
-
-    const range = this.maxPrice - this.minPrice;
-    const targetLines = 8;
-    const rawStep = range / targetLines;
-    const mag = Math.pow(10, Math.floor(Math.log10(rawStep)));
-    const norm = rawStep / mag;
-    let step;
-    if (norm < 1.5) step = 1 * mag;
-    else if (norm < 3) step = 2 * mag;
-    else if (norm < 7) step = 5 * mag;
-    else step = 10 * mag;
-    const decimals = this.symbol.decimals;
-    const startP = Math.ceil(this.minPrice / step) * step;
     ctx.fillStyle = THEME.panelBg;
     ctx.fillRect(this.chartRight + 1, this.chartTop, this.W - this.chartRight - 1, this.chartBottom - this.chartTop);
-    ctx.fillStyle = THEME.textDim;
-    for (let p = startP; p <= this.maxPrice; p += step) {
-      const y = this.priceToY(p);
-      if (y < this.priceTop - 1 || y > this.priceBottom + 1) continue;
-      ctx.fillText(fmtPrice(p, decimals), this.chartRight + 6, y);
-    }
-    // Border between chart and price axis
     ctx.strokeStyle = THEME.toolbarBorder;
     ctx.beginPath();
     ctx.moveTo(this.chartRight + 0.5, this.chartTop);
     ctx.lineTo(this.chartRight + 0.5, this.chartBottom);
     ctx.stroke();
+
+    ctx.font = '11px -apple-system, Segoe UI, Roboto, sans-serif';
+    ctx.fillStyle = THEME.textDim;
+    ctx.textBaseline = 'middle';
+    ctx.textAlign = 'left';
+    const marks = this.priceScale.marks();
+    for (const m of marks) {
+      const y = this.priceTop + m.coord;
+      if (y < this.priceTop - 1 || y > this.priceBottom + 1) continue;
+      ctx.fillText(m.label, this.chartRight + 6, Math.floor(y));
+    }
   }
 
   /* --------------------------- Time Axis --------------------------------- */
   drawTimeAxis() {
     const ctx = this.ctx;
+    const axisTop = this.layout.paneBottom || this.chartBottom;
     ctx.fillStyle = THEME.panelBg;
-    ctx.fillRect(0, this.layout.paneBottom, this.chartRight + 1, this.layout.timeAxisH);
+    ctx.fillRect(0, axisTop, this.chartRight + 1, this.layout.timeAxisH);
+    ctx.strokeStyle = THEME.toolbarBorder;
+    ctx.beginPath();
+    ctx.moveTo(0, axisTop + 0.5);
+    ctx.lineTo(this.chartRight, axisTop + 0.5);
+    ctx.stroke();
+
     ctx.font = '11px -apple-system, Segoe UI, Roboto, sans-serif';
     ctx.fillStyle = THEME.textDim;
     ctx.textBaseline = 'middle';
     ctx.textAlign = 'center';
-
-    const stepIdx = this.calcTimeStep();
-    const startIdx = Math.max(0, Math.floor(this.viewStart));
-    const endIdx = Math.min(this.sim.candles.length, Math.ceil(this.viewEnd));
-    for (let i = startIdx; i < endIdx; i++) {
-      if (i % stepIdx !== 0) continue;
-      const x = this.indexToX(i);
-      if (x < this.chartLeft + 20 || x > this.chartRight - 20) continue;
-      const t = this.sim.candles[i].time;
-      ctx.fillText(fmtTimeShort(t, this.timeframe.label), x, this.layout.paneBottom + this.layout.timeAxisH / 2);
+    const marks = this.getTimeMarks();
+    // LWC-style collision detection: skip labels that would overlap previous one.
+    // Use estimated label width + small gap.
+    let prevRightEdge = -Infinity;
+    for (const m of marks) {
+      if (m.index < 0 || m.index >= this.sim.candles.length) continue;
+      const x = this.indexToX(m.index);
+      if (x < this.chartLeft || x > this.chartRight) continue;
+      const label = formatTickMark(this.sim.candles[m.index].time, m.weight, this.timeframe.label);
+      // Approximate width: each char ~6px at 11px font
+      const labelW = label.length * 6 + 8;
+      const leftEdge = x - labelW / 2;
+      const rightEdge = x + labelW / 2;
+      // Skip if would overlap previous label or go off-chart
+      if (leftEdge < prevRightEdge + 4) continue;
+      if (leftEdge < this.chartLeft + 4 || rightEdge > this.chartRight - 4) continue;
+      ctx.fillText(label, Math.floor(x), axisTop + this.layout.timeAxisH / 2);
+      prevRightEdge = rightEdge;
     }
-    // Border
-    ctx.strokeStyle = THEME.toolbarBorder;
-    ctx.beginPath();
-    ctx.moveTo(0, this.layout.paneBottom + 0.5);
-    ctx.lineTo(this.chartRight, this.layout.paneBottom + 0.5);
-    ctx.stroke();
   }
 
   /* --------------------------- Crosshair --------------------------------- */
   drawCrosshair() {
     if (!this.mouseInside || this.crosshairIndex === null) return;
     if (this.activeTool !== 'cursor') return;
+    if (!this.inChartArea(this.mouseX, this.mouseY) &&
+        !this.inPriceAxis(this.mouseX, this.mouseY)) return;
     const ctx = this.ctx;
-    const idx = this.crosshairIndex;
+    const idx = Math.round(this.crosshairIndex);
     if (idx < 0 || idx >= this.sim.candles.length) return;
     const x = this.indexToX(idx);
     const y = this.mouseY;
-    if (!this.inChartArea(this.mouseX, this.mouseY) && !this.inPriceAxis(this.mouseX, this.mouseY) && !this.inTimeAxis(this.mouseX, this.mouseY)) return;
 
     ctx.strokeStyle = THEME.crosshair;
     ctx.lineWidth = 1;
     ctx.setLineDash([3, 3]);
-    // Vertical line
-    if (this.mouseY < this.layout.paneBottom) {
+    if (this.mouseY < (this.layout.paneBottom || this.chartBottom)) {
       ctx.beginPath();
       ctx.moveTo(Math.floor(x) + 0.5, this.chartTop);
-      ctx.lineTo(Math.floor(x) + 0.5, this.layout.paneBottom);
+      ctx.lineTo(Math.floor(x) + 0.5, this.layout.paneBottom || this.chartBottom);
       ctx.stroke();
     }
-    // Horizontal line
     if (this.mouseX < this.chartRight) {
       ctx.beginPath();
       ctx.moveTo(this.chartLeft, Math.floor(y) + 0.5);
@@ -1639,185 +1830,158 @@ class TradingChart {
 
     // Time label on axis
     const t = this.sim.candles[idx].time;
-    const timeStr = fmtTime(t, this.timeframe.label);
+    const date = new Date(t * 1000);
+    const pad2 = (n) => n < 10 ? '0' + n : '' + n;
+    let timeStr;
+    if (this.timeframe.label === '1D' || this.timeframe.label === '1W') {
+      timeStr = date.getUTCFullYear() + '-' + pad2(date.getUTCMonth() + 1) + '-' + pad2(date.getUTCDate());
+    } else if (this.timeframe.label === '1S') {
+      timeStr = pad2(date.getUTCHours()) + ':' + pad2(date.getUTCMinutes()) + ':' + pad2(date.getUTCSeconds());
+    } else {
+      timeStr = pad2(date.getUTCMonth() + 1) + '-' + pad2(date.getUTCDate()) + ' ' + pad2(date.getUTCHours()) + ':' + pad2(date.getUTCMinutes());
+    }
     ctx.font = '11px -apple-system, Segoe UI, Roboto, sans-serif';
     const tw = ctx.measureText(timeStr).width + 14;
     ctx.fillStyle = THEME.crosshairLabel;
-    roundRect(ctx, x - tw / 2, this.layout.paneBottom + 2, tw, this.layout.timeAxisH - 4, 3);
-    ctx.fill();
+    ctx.fillRect(x - tw / 2, (this.layout.paneBottom || this.chartBottom) + 2, tw, this.layout.timeAxisH - 4);
     ctx.fillStyle = THEME.textBright;
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillText(timeStr, x, this.layout.paneBottom + this.layout.timeAxisH / 2);
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(timeStr, x, (this.layout.paneBottom || this.chartBottom) + this.layout.timeAxisH / 2);
 
     // Price label on axis
     if (this.mouseX < this.chartRight && this.mouseY >= this.chartTop && this.mouseY <= this.chartBottom) {
       const price = this.yToPrice(y);
-      const priceStr = fmtPrice(price, this.symbol.decimals);
+      const priceStr = this.priceScale.formatLogical(price);
       const pw = ctx.measureText(priceStr).width + 14;
       ctx.fillStyle = THEME.crosshairLabel;
-      roundRect(ctx, this.chartRight + 1, y - 9, pw, 18, 3);
-      ctx.fill();
+      ctx.fillRect(this.chartRight + 1, Math.floor(y) - 9, pw, 18);
       ctx.fillStyle = THEME.textBright;
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText(priceStr, this.chartRight + 1 + pw / 2, y);
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(priceStr, this.chartRight + 1 + pw / 2, Math.floor(y));
     }
   }
 
   /* --------------------------- Legend ------------------------------------ */
   drawLegend() {
     const ctx = this.ctx;
-    const last = this.sim.candles[this.sim.candles.length - 1];
-    if (!last) return;
-    const idx = this.crosshairIndex !== null ? this.crosshairIndex : this.sim.candles.length - 1;
+    const idx = this.crosshairIndex !== null ?
+      clamp(Math.round(this.crosshairIndex), 0, this.sim.candles.length - 1) :
+      this.sim.candles.length - 1;
     const c = this.sim.candles[idx];
-    const decimals = this.symbol.decimals;
-
-    // OHLC legend top-left of chart
     ctx.font = '12px -apple-system, Segoe UI, Roboto, sans-serif';
-    ctx.textBaseline = 'top';
-    ctx.textAlign = 'left';
-
-    let xCursor = this.chartLeft + 6;
-    const yCursor = this.chartTop + 6;
-
-    // Symbol + TF
+    ctx.textBaseline = 'top'; ctx.textAlign = 'left';
+    let x = this.chartLeft + 6;
+    const y = this.chartTop + 6;
     ctx.fillStyle = THEME.textBright;
     ctx.font = 'bold 12px -apple-system, Segoe UI, Roboto, sans-serif';
     const symTxt = this.symbol.label + ' · ' + this.timeframe.label;
-    ctx.fillText(symTxt, xCursor, yCursor);
-    xCursor += ctx.measureText(symTxt).width + 12;
-
-    // OHLC values
+    ctx.fillText(symTxt, x, y);
+    x += ctx.measureText(symTxt).width + 12;
     ctx.font = '12px -apple-system, Segoe UI, Roboto, sans-serif';
     const isBull = c.close >= c.open;
     const parts = [
-      {label:'O', value: fmtPrice(c.open, decimals)},
-      {label:'H', value: fmtPrice(c.high, decimals)},
-      {label:'L', value: fmtPrice(c.low, decimals)},
-      {label:'C', value: fmtPrice(c.close, decimals)},
-      {label:'Vol', value: fmtVolume(c.volume)}
+      {label:'O', value: this.priceScale.formatLogical(c.open)},
+      {label:'H', value: this.priceScale.formatLogical(c.high)},
+      {label:'L', value: this.priceScale.formatLogical(c.low)},
+      {label:'C', value: this.priceScale.formatLogical(c.close)},
+      {label:'Vol', value: this._fmtVol(c.volume)}
     ];
     for (const p of parts) {
       ctx.fillStyle = THEME.textDim;
-      ctx.fillText(p.label, xCursor, yCursor);
-      xCursor += ctx.measureText(p.label).width + 4;
+      ctx.fillText(p.label, x, y);
+      x += ctx.measureText(p.label).width + 4;
       ctx.fillStyle = isBull ? THEME.bull : THEME.bear;
-      ctx.fillText(p.value, xCursor, yCursor);
-      xCursor += ctx.measureText(p.value).width + 12;
+      ctx.fillText(p.value, x, y);
+      x += ctx.measureText(p.value).width + 12;
     }
-    // Change
     const change = c.close - c.open;
     const changePct = (change / c.open) * 100;
-    const changeTxt = (change >= 0 ? '+' : '') + fmtPrice(change, decimals) + ' (' + (change >= 0 ? '+' : '') + changePct.toFixed(2) + '%)';
+    const changeTxt = (change >= 0 ? '+' : '') + this.priceScale.formatLogical(Math.abs(change)) +
+                      ' (' + (change >= 0 ? '+' : '') + changePct.toFixed(2) + '%)';
     ctx.fillStyle = isBull ? THEME.bull : THEME.bear;
-    ctx.fillText(changeTxt, xCursor, yCursor);
+    ctx.fillText(changeTxt, x, y);
 
-    // Indicator values next line
-    let yLine2 = yCursor + 18;
-    let xLine2 = this.chartLeft + 6;
-    const drawIndVal = (label, val, color) => {
+    // Indicator values second line
+    let x2 = this.chartLeft + 6, y2 = y + 18;
+    const drawInd = (label, val, color) => {
       ctx.fillStyle = color;
-      ctx.fillText(label, xLine2, yLine2);
-      xLine2 += ctx.measureText(label).width + 4;
+      ctx.fillText(label, x2, y2);
+      x2 += ctx.measureText(label).width + 4;
       ctx.fillStyle = THEME.text;
-      ctx.fillText(val, xLine2, yLine2);
-      xLine2 += ctx.measureText(val).width + 14;
+      ctx.fillText(val, x2, y2);
+      x2 += ctx.measureText(val).width + 14;
     };
-    if (this.activeIndicators.has('ma20') && this.indCache.ma20 && this.indCache.ma20[idx] !== null) drawIndVal('MA20:', fmtPrice(this.indCache.ma20[idx], decimals), THEME.ma1);
-    if (this.activeIndicators.has('ma50') && this.indCache.ma50 && this.indCache.ma50[idx] !== null) drawIndVal('MA50:', fmtPrice(this.indCache.ma50[idx], decimals), THEME.ma2);
-    if (this.activeIndicators.has('ma200') && this.indCache.ma200 && this.indCache.ma200[idx] !== null) drawIndVal('MA200:', fmtPrice(this.indCache.ma200[idx], decimals), THEME.ma3);
-    if (this.activeIndicators.has('ema20') && this.indCache.ema20 && this.indCache.ema20[idx] !== null) drawIndVal('EMA20:', fmtPrice(this.indCache.ema20[idx], decimals), THEME.ma1);
-    if (this.activeIndicators.has('ema50') && this.indCache.ema50 && this.indCache.ema50[idx] !== null) drawIndVal('EMA50:', fmtPrice(this.indCache.ema50[idx], decimals), THEME.ma2);
+    if (this.activeIndicators.has('ma20') && this.indCache.ma20 && this.indCache.ma20[idx] !== null)
+      drawInd('MA20:', this.priceScale.formatLogical(this.indCache.ma20[idx]), THEME.ma1);
+    if (this.activeIndicators.has('ma50') && this.indCache.ma50 && this.indCache.ma50[idx] !== null)
+      drawInd('MA50:', this.priceScale.formatLogical(this.indCache.ma50[idx]), THEME.ma2);
+    if (this.activeIndicators.has('ma200') && this.indCache.ma200 && this.indCache.ma200[idx] !== null)
+      drawInd('MA200:', this.priceScale.formatLogical(this.indCache.ma200[idx]), THEME.ma3);
+    if (this.activeIndicators.has('ema20') && this.indCache.ema20 && this.indCache.ema20[idx] !== null)
+      drawInd('EMA20:', this.priceScale.formatLogical(this.indCache.ema20[idx]), THEME.ma1);
+    if (this.activeIndicators.has('ema50') && this.indCache.ema50 && this.indCache.ema50[idx] !== null)
+      drawInd('EMA50:', this.priceScale.formatLogical(this.indCache.ema50[idx]), THEME.ma2);
     if (this.activeIndicators.has('bb') && this.indCache.bb && this.indCache.bb.mid[idx] !== null) {
-      drawIndVal('BB(20,2):', fmtPrice(this.indCache.bb.mid[idx], decimals), THEME.bollingerMid);
-      drawIndVal('U:', fmtPrice(this.indCache.bb.upper[idx], decimals), THEME.ma3);
-      drawIndVal('L:', fmtPrice(this.indCache.bb.lower[idx], decimals), THEME.ma3);
+      drawInd('BB(20,2):', this.priceScale.formatLogical(this.indCache.bb.mid[idx]), THEME.bollingerMid);
+      drawInd('U:', this.priceScale.formatLogical(this.indCache.bb.upper[idx]), THEME.ma3);
+      drawInd('L:', this.priceScale.formatLogical(this.indCache.bb.lower[idx]), THEME.ma3);
     }
   }
 
   /* --------------------------- Toolbar ----------------------------------- */
   drawToolbar() {
     const ctx = this.ctx;
-    let x = 8;
-    const y = 7;
-    const h = 30;
-
-    // Symbol button
-    x = this.drawButton({id:'symbol', action:'symbol', x, y, w: 100, h, label: this.symbol.label, icon:'caret'});
+    let x = 8, y = 7, h = 30;
+    x = this.drawButton({id:'symbol', action:'symbol', x, y, w:100, h, label:this.symbol.label, icon:'caret'});
     x += 6;
-    // Timeframe button
-    x = this.drawButton({id:'tf', action:'timeframe', x, y, w: 50, h, label: this.timeframe.label, icon:'caret'});
+    x = this.drawButton({id:'tf', action:'timeframe', x, y, w:50, h, label:this.timeframe.label, icon:'caret'});
     x += 6;
-    // Indicators button
-    x = this.drawButton({id:'ind', action:'indicator', x, y, w: 110, h, label:'Indicators', icon:'plus'});
+    x = this.drawButton({id:'ind', action:'indicator', x, y, w:110, h, label:'Indicators', icon:'plus'});
     x += 6;
-    // Drawing tools button
     const toolLabel = DRAW_TOOLS.find(t => t.id === this.activeTool).label;
-    x = this.drawButton({id:'tool', action:'tool', x, y, w: 130, h, label: toolLabel, icon:'caret'});
+    x = this.drawButton({id:'tool', action:'tool', x, y, w:130, h, label:toolLabel, icon:'caret'});
     x += 6;
-    // Reset
-    x = this.drawButton({id:'reset', action:'reset', x, y, w: 60, h, label:'Reset', icon:null});
+    x = this.drawButton({id:'reset', action:'reset', x, y, w:60, h, label:'Reset', icon:null});
     x += 6;
-    // Settings
-    x = this.drawButton({id:'settings', action:'settings', x, y, w: 70, h, label:'Settings', icon:null});
+    x = this.drawButton({id:'settings', action:'settings', x, y, w:70, h, label:'Settings', icon:null});
 
-    // Right side: live indicator
+    // Right side: LIVE + clock
     const rightX = this.W - 8;
     ctx.font = '11px -apple-system, Segoe UI, Roboto, sans-serif';
-    ctx.fillStyle = THEME.textDim;
-    ctx.textBaseline = 'middle';
-    ctx.textAlign = 'right';
-    const liveTxt = '● LIVE';
     ctx.fillStyle = THEME.bull;
-    ctx.fillText(liveTxt, rightX, y + h / 2);
-    // Clock
+    ctx.textBaseline = 'middle'; ctx.textAlign = 'right';
+    ctx.fillText('● LIVE', rightX, y + h / 2);
     const now = new Date();
-    const pad = (v) => String(v).padStart(2, '0');
-    const timeTxt = pad(now.getUTCHours()) + ':' + pad(now.getUTCMinutes()) + ':' + pad(now.getUTCSeconds()) + ' UTC';
+    const pad2 = (n) => n < 10 ? '0' + n : '' + n;
+    const timeTxt = pad2(now.getUTCHours()) + ':' + pad2(now.getUTCMinutes()) + ':' + pad2(now.getUTCSeconds()) + ' UTC';
     ctx.fillStyle = THEME.textDim;
     ctx.fillText(timeTxt, rightX - 60, y + h / 2);
   }
-
   drawButton(btn) {
     const ctx = this.ctx;
     const isHover = this.hoverButton && this.hoverButton.id === btn.id;
-    let bg = THEME.buttonBg;
-    if (isHover) bg = THEME.buttonHover;
-    if (btn.active) bg = THEME.buttonActive;
-    ctx.fillStyle = bg;
-    roundRect(ctx, btn.x, btn.y, btn.w, btn.h, 4);
-    ctx.fill();
-    // Border
-    ctx.strokeStyle = THEME.toolbarBorder;
-    ctx.lineWidth = 1;
-    roundRect(ctx, btn.x + 0.5, btn.y + 0.5, btn.w - 1, btn.h - 1, 4);
-    ctx.stroke();
-    // Label
+    ctx.fillStyle = isHover ? THEME.buttonHover : THEME.buttonBg;
+    this._roundRect(btn.x, btn.y, btn.w, btn.h, 4); ctx.fill();
+    ctx.strokeStyle = THEME.toolbarBorder; ctx.lineWidth = 1;
+    this._roundRect(btn.x + 0.5, btn.y + 0.5, btn.w - 1, btn.h - 1, 4); ctx.stroke();
     ctx.font = '12px -apple-system, Segoe UI, Roboto, sans-serif';
-    ctx.fillStyle = btn.active ? THEME.textBright : THEME.buttonText;
-    ctx.textBaseline = 'middle';
-    ctx.textAlign = 'center';
-    const cx = btn.x + btn.w / 2;
-    const cy = btn.y + btn.h / 2;
-    let textW = ctx.measureText(btn.label).width;
+    ctx.fillStyle = THEME.buttonText;
+    ctx.textBaseline = 'middle'; ctx.textAlign = 'center';
+    const cx = btn.x + btn.w / 2, cy = btn.y + btn.h / 2;
+    const textW = ctx.measureText(btn.label).width;
     let labelX = cx;
     if (btn.icon === 'caret') labelX = cx - 6;
     if (btn.icon === 'plus') labelX = cx - 6;
     ctx.fillText(btn.label, labelX, cy);
-    // Icon
     if (btn.icon === 'caret') {
       ctx.fillStyle = THEME.textDim;
       ctx.beginPath();
       ctx.moveTo(cx + textW / 2 + 4, cy - 3);
       ctx.lineTo(cx + textW / 2 + 9, cy);
       ctx.lineTo(cx + textW / 2 + 4, cy + 3);
-      ctx.closePath();
-      ctx.fill();
+      ctx.closePath(); ctx.fill();
     } else if (btn.icon === 'plus') {
-      ctx.strokeStyle = THEME.textDim;
-      ctx.lineWidth = 1.2;
+      ctx.strokeStyle = THEME.textDim; ctx.lineWidth = 1.2;
       ctx.beginPath();
       ctx.moveTo(cx + textW / 2 + 4, cy - 3);
       ctx.lineTo(cx + textW / 2 + 9, cy + 2);
@@ -1828,6 +1992,21 @@ class TradingChart {
     this.buttons.push(btn);
     return btn.x + btn.w;
   }
+  _roundRect(x, y, w, h, r) {
+    const ctx = this.ctx;
+    r = Math.min(r, w / 2, h / 2);
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.lineTo(x + w - r, y);
+    ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+    ctx.lineTo(x + w, y + h - r);
+    ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+    ctx.lineTo(x + r, y + h);
+    ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+    ctx.lineTo(x, y + r);
+    ctx.quadraticCurveTo(x, y, x + r, y);
+    ctx.closePath();
+  }
 
   /* --------------------------- Status Bar -------------------------------- */
   drawStatusBar() {
@@ -1835,11 +2014,8 @@ class TradingChart {
     const y = this.H - this.layout.statusH;
     const last = this.sim.candles[this.sim.candles.length - 1];
     if (!last) return;
-
     ctx.font = '11px -apple-system, Segoe UI, Roboto, sans-serif';
-    ctx.textBaseline = 'middle';
-    ctx.textAlign = 'left';
-
+    ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
     let x = 10;
     const draw = (label, value, color) => {
       ctx.fillStyle = THEME.textDim;
@@ -1849,15 +2025,13 @@ class TradingChart {
       ctx.fillText(value, x, y + this.layout.statusH / 2);
       x += ctx.measureText(value).width + 16;
     };
-
-    draw('Bid', fmtPrice(last.close - 0.5, this.symbol.decimals), THEME.bear);
-    draw('Ask', fmtPrice(last.close + 0.5, this.symbol.decimals), THEME.bull);
-    draw('Spread', fmt(0.5 * 2, this.symbol.decimals));
-    draw('24h High', fmtPrice(this.sim.candles.slice(-24).reduce((m, c) => Math.max(m, c.high), 0), this.symbol.decimals));
-    draw('24h Low', fmtPrice(this.sim.candles.slice(-24).reduce((m, c) => Math.min(m, c.low), Infinity), this.symbol.decimals));
-    draw('24h Vol', fmtVolume(this.sim.candles.slice(-24).reduce((s, c) => s + c.volume, 0)));
-
-    // Right side: tool indicator
+    draw('Bid', this.priceScale.formatLogical(last.close - 0.5), THEME.bear);
+    draw('Ask', this.priceScale.formatLogical(last.close + 0.5), THEME.bull);
+    draw('Spread', this.priceScale.formatLogical(0.5 * 2));
+    const last24 = this.sim.candles.slice(-24);
+    draw('24h High', this.priceScale.formatLogical(last24.reduce((m, c) => Math.max(m, c.high), 0)));
+    draw('24h Low', this.priceScale.formatLogical(last24.reduce((m, c) => Math.min(m, c.low), Infinity)));
+    draw('24h Vol', this._fmtVol(last24.reduce((s, c) => s + c.volume, 0)));
     ctx.textAlign = 'right';
     ctx.fillStyle = THEME.textDim;
     const toolTxt = 'Tool: ' + DRAW_TOOLS.find(t => t.id === this.activeTool).label;
@@ -1873,43 +2047,35 @@ class TradingChart {
     if (!this.dropdown) return;
     const ctx = this.ctx;
     const d = this.dropdown;
-    // Backdrop shadow
     ctx.fillStyle = THEME.panelBg;
-    roundRect(ctx, d.x, d.y, d.w, d.h, 4);
-    ctx.fill();
-    ctx.strokeStyle = THEME.toolbarBorder;
-    ctx.lineWidth = 1;
-    roundRect(ctx, d.x + 0.5, d.y + 0.5, d.w - 1, d.h - 1, 4);
-    ctx.stroke();
-
+    this._roundRect(d.x, d.y, d.w, d.h, 4); ctx.fill();
+    ctx.strokeStyle = THEME.toolbarBorder; ctx.lineWidth = 1;
+    this._roundRect(d.x + 0.5, d.y + 0.5, d.w - 1, d.h - 1, 4); ctx.stroke();
     ctx.font = '12px -apple-system, Segoe UI, Roboto, sans-serif';
-    ctx.textBaseline = 'middle';
-    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
     const mouseItem = this.mouseInside ? this.hitDropdown(this.mouseX, this.mouseY) : null;
     for (const it of d.items) {
-      const isHover = (it === mouseItem);
-      if (isHover) {
+      if (it === mouseItem) {
         ctx.fillStyle = THEME.buttonHover;
         ctx.fillRect(d.x + 1, it.y, d.w - 2, it.h);
       }
-      let xCursor = d.x + 12;
-      // Checkbox for indicators
+      let xc = d.x + 12;
       if (it.checked !== undefined) {
         ctx.strokeStyle = it.checked ? THEME.accent : THEME.textDim;
         ctx.lineWidth = 1.2;
-        ctx.strokeRect(xCursor, it.y + it.h / 2 - 6, 12, 12);
+        ctx.strokeRect(xc, it.y + it.h / 2 - 6, 12, 12);
         if (it.checked) {
           ctx.strokeStyle = THEME.accent;
           ctx.beginPath();
-          ctx.moveTo(xCursor + 2, it.y + it.h / 2);
-          ctx.lineTo(xCursor + 5, it.y + it.h / 2 + 3);
-          ctx.lineTo(xCursor + 10, it.y + it.h / 2 - 3);
+          ctx.moveTo(xc + 2, it.y + it.h / 2);
+          ctx.lineTo(xc + 5, it.y + it.h / 2 + 3);
+          ctx.lineTo(xc + 10, it.y + it.h / 2 - 3);
           ctx.stroke();
         }
-        xCursor += 18;
+        xc += 18;
       }
       ctx.fillStyle = it.checked ? THEME.textBright : THEME.text;
-      ctx.fillText(it.label, xCursor, it.y + it.h / 2);
+      ctx.fillText(it.label, xc, it.y + it.h / 2);
     }
   }
 
@@ -1924,11 +2090,9 @@ class TradingChart {
     const x = this.W - tw - 12;
     const y = this.layout.toolbarH + 8;
     ctx.fillStyle = 'rgba(41,98,255,0.95)';
-    roundRect(ctx, x, y, tw, th, 4);
-    ctx.fill();
+    this._roundRect(x, y, tw, th, 4); ctx.fill();
     ctx.fillStyle = THEME.textBright;
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
     ctx.fillText(this.toast.text, x + tw / 2, y + th / 2);
   }
 
@@ -1944,20 +2108,15 @@ class TradingChart {
 
 /* ============================ BOOTSTRAP ==================================== */
 window.addEventListener('DOMContentLoaded', () => {
-  // Minimal body styling (no CSS file, just JS to remove default margin)
   document.body.style.margin = '0';
   document.body.style.background = THEME.bg;
   document.body.style.overflow = 'hidden';
   document.body.style.fontFamily = '-apple-system, Segoe UI, Roboto, sans-serif';
-
   const canvas = document.getElementById('chart');
   canvas.style.display = 'block';
   canvas.style.cursor = 'crosshair';
-
   const chart = new TradingChart(canvas);
   chart.start();
-
-  // Expose for debugging
   window.__chart = chart;
 });
 
