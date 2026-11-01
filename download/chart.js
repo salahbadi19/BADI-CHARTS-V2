@@ -763,10 +763,28 @@ class TradingChart {
   }
 
   updateLayout() {
+    // Responsive layout: smaller dimensions on mobile (width < 600px)
+    const isMobile = this.W < 600;
+    if (isMobile) {
+      this.layout.toolbarH = 40;
+      this.layout.statusH = 22;
+      this.layout.priceAxisW = 56;
+      this.layout.timeAxisH = 24;
+      this.layout.volumeH = 50;
+      this.layout.gap = 4;
+    } else {
+      this.layout.toolbarH = 44;
+      this.layout.statusH = 26;
+      this.layout.priceAxisW = 64;
+      this.layout.timeAxisH = 28;
+      this.layout.volumeH = 64;
+      this.layout.gap = 8;
+    }
+
     const paneTop = this.layout.toolbarH;
     const bottomStart = this.H - this.layout.statusH - this.layout.timeAxisH;
     const hasPane = this.activeIndicators.has('rsi') || this.activeIndicators.has('macd');
-    this.layout.paneH = hasPane ? 100 : 0;
+    this.layout.paneH = hasPane ? (isMobile ? 80 : 100) : 0;
 
     this.chartLeft = this.layout.leftPad;
     this.chartRight = this.W - this.layout.priceAxisW;
@@ -792,6 +810,7 @@ class TradingChart {
 
   /* --------------------------- Events ------------------------------------ */
   setupEvents() {
+    // Mouse events (desktop)
     this.canvas.addEventListener('mousemove', (e) => this.onMouseMove(e));
     this.canvas.addEventListener('mousedown', (e) => this.onMouseDown(e));
     this.canvas.addEventListener('mouseup', (e) => this.onMouseUp(e));
@@ -800,6 +819,125 @@ class TradingChart {
     this.canvas.addEventListener('wheel', (e) => this.onWheel(e), {passive: false});
     this.canvas.addEventListener('contextmenu', (e) => { e.preventDefault(); this.onRightClick(e); });
     window.addEventListener('keydown', (e) => this.onKeyDown(e));
+
+    // Touch events (mobile)
+    this.canvas.addEventListener('touchstart', (e) => this.onTouchStart(e), {passive: false});
+    this.canvas.addEventListener('touchmove', (e) => this.onTouchMove(e), {passive: false});
+    this.canvas.addEventListener('touchend', (e) => this.onTouchEnd(e), {passive: false});
+    this.canvas.addEventListener('touchcancel', (e) => this.onTouchEnd(e), {passive: false});
+  }
+
+  /* --------------------------- Touch Handlers ---------------------------- */
+  onTouchStart(e) {
+    e.preventDefault();
+    const r = this.canvas.getBoundingClientRect();
+    const touches = e.touches;
+    if (touches.length === 1) {
+      // Single touch = pan (like drag)
+      const t = touches[0];
+      this.touchStartX = t.clientX - r.left;
+      this.touchStartY = t.clientY - r.top;
+      this.touchStartRightOffset = this.rightOffset;
+      this.isDragging = true;
+      this.mouseX = this.touchStartX;
+      this.mouseY = this.touchStartY;
+      this.mouseInside = true;
+      // Check buttons
+      const btn = this.hitButton(this.touchStartX, this.touchStartY);
+      if (btn) { this.handleButtonClick(btn); this.isDragging = false; return; }
+      if (this.dropdown) {
+        const item = this.hitDropdown(this.touchStartX, this.touchStartY);
+        if (item) { this.handleDropdownSelect(item); this.dropdown = null; this.isDragging = false; return; }
+        if (this.touchStartX < this.dropdown.x || this.touchStartX > this.dropdown.x + this.dropdown.w ||
+            this.touchStartY < this.dropdown.y || this.touchStartY > this.dropdown.y + this.dropdown.h) {
+          this.dropdown = null; this.isDragging = false; return;
+        }
+      }
+      if (this.activeTool !== 'cursor') {
+        this.isDragging = false;
+        if (this.inChartArea(this.touchStartX, this.touchStartY)) {
+          this.startDrawing(this.touchStartX, this.touchStartY);
+        }
+      }
+      // Update crosshair
+      if (this.inChartArea(this.touchStartX, this.touchStartY)) {
+        const idx = this.xToIndex(this.touchStartX);
+        this.crosshairIndex = clamp(idx, 0, this.sim.candles.length - 1);
+      }
+    } else if (touches.length === 2) {
+      // Two-finger pinch = zoom
+      this.isDragging = false;
+      this.isPinching = true;
+      const t1 = touches[0], t2 = touches[1];
+      this.pinchStartDist = Math.hypot(t2.clientX - t1.clientX, t2.clientY - t1.clientY);
+      this.pinchStartBarSpacing = this.barSpacing;
+      this.pinchCenterX = ((t1.clientX + t2.clientX) / 2) - r.left;
+      this.pinchCenterY = ((t1.clientY + t2.clientY) / 2) - r.top;
+    }
+  }
+
+  onTouchMove(e) {
+    e.preventDefault();
+    const r = this.canvas.getBoundingClientRect();
+    const touches = e.touches;
+    if (this.isPinching && touches.length === 2) {
+      const t1 = touches[0], t2 = touches[1];
+      const dist = Math.hypot(t2.clientX - t1.clientX, t2.clientY - t1.clientY);
+      if (this.pinchStartDist > 0) {
+        const factor = dist / this.pinchStartDist;
+        const oldSpacing = this.pinchStartBarSpacing;
+        let newSpacing = clamp(oldSpacing * factor, this.minBarSpacing, this.maxBarSpacing);
+        if (newSpacing !== this.barSpacing) {
+          // Zoom toward pinch center
+          const x = this.pinchCenterX;
+          const N = this.sim.candles.length;
+          const idx = this.xToIndex(x);
+          const distFromRight = this.chartRight - x;
+          this.barSpacing = newSpacing;
+          this.rightOffset = distFromRight / newSpacing - (N - 1 - idx);
+          this.constrainRightOffset();
+          this.invalidateTimeMarks();
+          this.autoScale();
+        }
+      }
+    } else if (this.isDragging && touches.length === 1) {
+      const t = touches[0];
+      const x = t.clientX - r.left;
+      const y = t.clientY - r.top;
+      this.mouseX = x;
+      this.mouseY = y;
+      const dx = x - this.touchStartX;
+      const barsMoved = dx / this.barSpacing;
+      this.rightOffset = this.touchStartRightOffset - barsMoved;
+      this.constrainRightOffset();
+      this.autoScale();
+      if (this.inChartArea(x, y)) {
+        const idx = this.xToIndex(x);
+        this.crosshairIndex = clamp(idx, 0, this.sim.candles.length - 1);
+      }
+    } else if (this.currentDrawing && touches.length === 1) {
+      const t = touches[0];
+      const x = t.clientX - r.left;
+      const y = t.clientY - r.top;
+      this.updateCurrentDrawing(x, y);
+    }
+  }
+
+  onTouchEnd(e) {
+    e.preventDefault();
+    if (this.isPinching) {
+      this.isPinching = false;
+    }
+    if (this.isDragging) {
+      this.isDragging = false;
+    }
+    if (this.currentDrawing) {
+      this.finishDrawing();
+    }
+    // Hide crosshair after a delay on mobile
+    setTimeout(() => {
+      if (!this.mouseInside) this.crosshairIndex = null;
+    }, 2000);
   }
 
   onMouseMove(e) {
@@ -1271,9 +1409,9 @@ class TradingChart {
     this.drawIndicators();
     this.drawPane();
     this.drawDrawings();
-    this.drawCurrentPriceLine();
     this.drawPriceAxis();
     this.drawTimeAxis();
+    this.drawCurrentPriceLine();  // After axes so the price label sits ON TOP
     this.drawCrosshair();
     this.drawLegend();
     this.drawToolbar();
@@ -1806,8 +1944,11 @@ class TradingChart {
     const last = this.sim.candles[this.sim.candles.length - 1];
     if (!last) return;
     const y = this.priceToY(last.close);
+    // Only draw if the price line is within the visible price area
+    if (y < this.priceTop - 2 || y > this.priceBottom + 2) return;
     const isBull = last.close >= last.open;
     const color = isBull ? THEME.currentPriceBull : THEME.currentPriceBear;
+    // Dashed line across the chart
     ctx.strokeStyle = color;
     ctx.lineWidth = 1;
     ctx.setLineDash([2, 3]);
@@ -1816,14 +1957,21 @@ class TradingChart {
     ctx.lineTo(this.chartRight, Math.floor(y) + 0.5);
     ctx.stroke();
     ctx.setLineDash([]);
+    // Price label on the price axis (drawn ON TOP of axis labels, like LWC)
     const txt = this.priceScale.formatLogical(last.close);
     ctx.font = 'bold 11px -apple-system, Segoe UI, Roboto, sans-serif';
     const tw = ctx.measureText(txt).width + 10;
+    const labelX = this.chartRight + 1;
+    const labelY = Math.floor(y) - 9;
+    // Clamp label Y so it stays within the price axis area
+    const minY = this.chartTop;
+    const maxY = (this.layout.paneBottom || this.chartBottom) - 18;
+    const clampedY = clamp(labelY, minY, maxY);
     ctx.fillStyle = color;
-    ctx.fillRect(this.chartRight + 1, Math.floor(y) - 9, tw, 18);
+    ctx.fillRect(labelX, clampedY, tw, 18);
     ctx.fillStyle = THEME.textBright;
     ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-    ctx.fillText(txt, this.chartRight + 1 + tw / 2, Math.floor(y));
+    ctx.fillText(txt, labelX + tw / 2, clampedY + 9);
   }
 
   /* --------------------------- Price Axis -------------------------------- */
@@ -1955,35 +2103,40 @@ class TradingChart {
   /* --------------------------- Legend ------------------------------------ */
   drawLegend() {
     const ctx = this.ctx;
+    const isMobile = this.W < 600;
     const idx = this.crosshairIndex !== null ?
       clamp(Math.round(this.crosshairIndex), 0, this.sim.candles.length - 1) :
       this.sim.candles.length - 1;
     const c = this.sim.candles[idx];
-    ctx.font = '12px -apple-system, Segoe UI, Roboto, sans-serif';
+    ctx.font = (isMobile ? '11px' : '12px') + ' -apple-system, Segoe UI, Roboto, sans-serif';
     ctx.textBaseline = 'top'; ctx.textAlign = 'left';
     let x = this.chartLeft + 6;
     const y = this.chartTop + 6;
     ctx.fillStyle = THEME.textBright;
-    ctx.font = 'bold 12px -apple-system, Segoe UI, Roboto, sans-serif';
+    ctx.font = 'bold ' + (isMobile ? '11px' : '12px') + ' -apple-system, Segoe UI, Roboto, sans-serif';
     const symTxt = this.symbol.label + ' · ' + this.timeframe.label;
     ctx.fillText(symTxt, x, y);
-    x += ctx.measureText(symTxt).width + 12;
-    ctx.font = '12px -apple-system, Segoe UI, Roboto, sans-serif';
+    x += ctx.measureText(symTxt).width + (isMobile ? 8 : 12);
+    ctx.font = (isMobile ? '11px' : '12px') + ' -apple-system, Segoe UI, Roboto, sans-serif';
     const isBull = c.close >= c.open;
-    const parts = [
+    // On mobile: show only Close + Change. On desktop: full OHLC.
+    const parts = isMobile ? [
+      {label:'C', value: this.priceScale.formatLogical(c.close)}
+    ] : [
       {label:'O', value: this.priceScale.formatLogical(c.open)},
       {label:'H', value: this.priceScale.formatLogical(c.high)},
       {label:'L', value: this.priceScale.formatLogical(c.low)},
       {label:'C', value: this.priceScale.formatLogical(c.close)},
       {label:'Vol', value: this._fmtVol(c.volume)}
     ];
+    const gap = isMobile ? 8 : 12;
     for (const p of parts) {
       ctx.fillStyle = THEME.textDim;
       ctx.fillText(p.label, x, y);
       x += ctx.measureText(p.label).width + 4;
       ctx.fillStyle = isBull ? THEME.bull : THEME.bear;
       ctx.fillText(p.value, x, y);
-      x += ctx.measureText(p.value).width + 12;
+      x += ctx.measureText(p.value).width + gap;
     }
     const change = c.close - c.open;
     const changePct = (change / c.open) * 100;
@@ -1992,7 +2145,8 @@ class TradingChart {
     ctx.fillStyle = isBull ? THEME.bull : THEME.bear;
     ctx.fillText(changeTxt, x, y);
 
-    // Indicator values second line
+    // Indicator values second line (desktop only)
+    if (isMobile) return;
     let x2 = this.chartLeft + 6, y2 = y + 18;
     const drawInd = (label, val, color) => {
       ctx.fillStyle = color;
@@ -2022,31 +2176,58 @@ class TradingChart {
   /* --------------------------- Toolbar ----------------------------------- */
   drawToolbar() {
     const ctx = this.ctx;
-    let x = 8, y = 7, h = 30;
-    x = this.drawButton({id:'symbol', action:'symbol', x, y, w:100, h, label:this.symbol.label, icon:'caret'});
-    x += 6;
-    x = this.drawButton({id:'tf', action:'timeframe', x, y, w:50, h, label:this.timeframe.label, icon:'caret'});
-    x += 6;
-    x = this.drawButton({id:'ind', action:'indicator', x, y, w:110, h, label:'Indicators', icon:'plus'});
-    x += 6;
-    const toolLabel = DRAW_TOOLS.find(t => t.id === this.activeTool).label;
-    x = this.drawButton({id:'tool', action:'tool', x, y, w:130, h, label:toolLabel, icon:'caret'});
-    x += 6;
-    x = this.drawButton({id:'reset', action:'reset', x, y, w:60, h, label:'Reset', icon:null});
-    x += 6;
-    x = this.drawButton({id:'settings', action:'settings', x, y, w:70, h, label:'Settings', icon:null});
+    const isMobile = this.W < 600;
+    let x = isMobile ? 4 : 8;
+    const y = isMobile ? 5 : 7;
+    const h = isMobile ? 30 : 30;
+    const gap = isMobile ? 3 : 6;
 
-    // Right side: LIVE + clock
-    const rightX = this.W - 8;
-    ctx.font = '11px -apple-system, Segoe UI, Roboto, sans-serif';
-    ctx.fillStyle = THEME.bull;
-    ctx.textBaseline = 'middle'; ctx.textAlign = 'right';
-    ctx.fillText('● LIVE', rightX, y + h / 2);
-    const now = new Date();
-    const pad2 = (n) => n < 10 ? '0' + n : '' + n;
-    const timeTxt = pad2(now.getUTCHours()) + ':' + pad2(now.getUTCMinutes()) + ':' + pad2(now.getUTCSeconds()) + ' UTC';
-    ctx.fillStyle = THEME.textDim;
-    ctx.fillText(timeTxt, rightX - 60, y + h / 2);
+    if (isMobile) {
+      // Compact toolbar for mobile: shorter labels, fewer buttons
+      x = this.drawButton({id:'symbol', action:'symbol', x, y, w:70, h, label:this.symbol.label, icon:'caret'});
+      x += gap;
+      x = this.drawButton({id:'tf', action:'timeframe', x, y, w:38, h, label:this.timeframe.label, icon:'caret'});
+      x += gap;
+      x = this.drawButton({id:'ind', action:'indicator', x, y, w:36, h, label:'Ind', icon:'plus'});
+      x += gap;
+      const toolShort = {cursor:'↖', trend:'╱', hline:'─', vline:'│', rect:'▭', fib:'Fib', brush:'~', eraser:'✕'}[this.activeTool] || '↖';
+      x = this.drawButton({id:'tool', action:'tool', x, y, w:38, h, label:toolShort, icon:'caret'});
+      x += gap;
+      x = this.drawButton({id:'reset', action:'reset', x, y, w:36, h, label:'Rst', icon:null});
+
+      // Right side: LIVE only (no clock on mobile to save space)
+      const rightX = this.W - 4;
+      ctx.font = '10px -apple-system, Segoe UI, Roboto, sans-serif';
+      ctx.fillStyle = THEME.bull;
+      ctx.textBaseline = 'middle'; ctx.textAlign = 'right';
+      ctx.fillText('● LIVE', rightX, y + h / 2);
+    } else {
+      // Full toolbar for desktop
+      x = this.drawButton({id:'symbol', action:'symbol', x, y, w:100, h, label:this.symbol.label, icon:'caret'});
+      x += gap;
+      x = this.drawButton({id:'tf', action:'timeframe', x, y, w:50, h, label:this.timeframe.label, icon:'caret'});
+      x += gap;
+      x = this.drawButton({id:'ind', action:'indicator', x, y, w:110, h, label:'Indicators', icon:'plus'});
+      x += gap;
+      const toolLabel = DRAW_TOOLS.find(t => t.id === this.activeTool).label;
+      x = this.drawButton({id:'tool', action:'tool', x, y, w:130, h, label:toolLabel, icon:'caret'});
+      x += gap;
+      x = this.drawButton({id:'reset', action:'reset', x, y, w:60, h, label:'Reset', icon:null});
+      x += gap;
+      x = this.drawButton({id:'settings', action:'settings', x, y, w:70, h, label:'Settings', icon:null});
+
+      // Right side: LIVE + clock
+      const rightX = this.W - 8;
+      ctx.font = '11px -apple-system, Segoe UI, Roboto, sans-serif';
+      ctx.fillStyle = THEME.bull;
+      ctx.textBaseline = 'middle'; ctx.textAlign = 'right';
+      ctx.fillText('● LIVE', rightX, y + h / 2);
+      const now = new Date();
+      const pad2 = (n) => n < 10 ? '0' + n : '' + n;
+      const timeTxt = pad2(now.getUTCHours()) + ':' + pad2(now.getUTCMinutes()) + ':' + pad2(now.getUTCSeconds()) + ' UTC';
+      ctx.fillStyle = THEME.textDim;
+      ctx.fillText(timeTxt, rightX - 60, y + h / 2);
+    }
   }
   drawButton(btn) {
     const ctx = this.ctx;
@@ -2102,34 +2283,49 @@ class TradingChart {
   /* --------------------------- Status Bar -------------------------------- */
   drawStatusBar() {
     const ctx = this.ctx;
+    const isMobile = this.W < 600;
     const y = this.H - this.layout.statusH;
     const last = this.sim.candles[this.sim.candles.length - 1];
     if (!last) return;
-    ctx.font = '11px -apple-system, Segoe UI, Roboto, sans-serif';
+    ctx.font = (isMobile ? '10px' : '11px') + ' -apple-system, Segoe UI, Roboto, sans-serif';
     ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
-    let x = 10;
+    let x = isMobile ? 6 : 10;
+    const gap = isMobile ? 10 : 16;
     const draw = (label, value, color) => {
       ctx.fillStyle = THEME.textDim;
       ctx.fillText(label, x, y + this.layout.statusH / 2);
       x += ctx.measureText(label).width + 4;
       ctx.fillStyle = color || THEME.text;
       ctx.fillText(value, x, y + this.layout.statusH / 2);
-      x += ctx.measureText(value).width + 16;
+      x += ctx.measureText(value).width + gap;
     };
-    draw('Bid', this.priceScale.formatLogical(last.close - 0.5), THEME.bear);
-    draw('Ask', this.priceScale.formatLogical(last.close + 0.5), THEME.bull);
-    draw('Spread', this.priceScale.formatLogical(0.5 * 2));
-    const last24 = this.sim.candles.slice(-24);
-    draw('24h High', this.priceScale.formatLogical(last24.reduce((m, c) => Math.max(m, c.high), 0)));
-    draw('24h Low', this.priceScale.formatLogical(last24.reduce((m, c) => Math.min(m, c.low), Infinity)));
-    draw('24h Vol', this._fmtVol(last24.reduce((s, c) => s + c.volume, 0)));
+    if (isMobile) {
+      // Compact status bar: only Bid, 24h High, 24h Vol
+      draw('B', this.priceScale.formatLogical(last.close), THEME.bear);
+      const last24 = this.sim.candles.slice(-24);
+      draw('H', this.priceScale.formatLogical(last24.reduce((m, c) => Math.max(m, c.high), 0)));
+      draw('Vol', this._fmtVol(last24.reduce((s, c) => s + c.volume, 0)));
+    } else {
+      draw('Bid', this.priceScale.formatLogical(last.close - 0.5), THEME.bear);
+      draw('Ask', this.priceScale.formatLogical(last.close + 0.5), THEME.bull);
+      draw('Spread', this.priceScale.formatLogical(0.5 * 2));
+      const last24 = this.sim.candles.slice(-24);
+      draw('24h High', this.priceScale.formatLogical(last24.reduce((m, c) => Math.max(m, c.high), 0)));
+      draw('24h Low', this.priceScale.formatLogical(last24.reduce((m, c) => Math.min(m, c.low), Infinity)));
+      draw('24h Vol', this._fmtVol(last24.reduce((s, c) => s + c.volume, 0)));
+    }
     ctx.textAlign = 'right';
     ctx.fillStyle = THEME.textDim;
-    const toolTxt = 'Tool: ' + DRAW_TOOLS.find(t => t.id === this.activeTool).label;
-    ctx.fillText(toolTxt, this.W - 10, y + this.layout.statusH / 2);
-    if (this.drawings.length > 0) {
-      ctx.fillStyle = THEME.accent;
-      ctx.fillText(this.drawings.length + ' drawings', this.W - 10 - ctx.measureText(toolTxt).width - 16, y + this.layout.statusH / 2);
+    if (isMobile) {
+      const toolShort = {cursor:'↖', trend:'╱', hline:'─', vline:'│', rect:'▭', fib:'Fib', brush:'~', eraser:'✕'}[this.activeTool] || '↖';
+      ctx.fillText(toolShort, this.W - 6, y + this.layout.statusH / 2);
+    } else {
+      const toolTxt = 'Tool: ' + DRAW_TOOLS.find(t => t.id === this.activeTool).label;
+      ctx.fillText(toolTxt, this.W - 10, y + this.layout.statusH / 2);
+      if (this.drawings.length > 0) {
+        ctx.fillStyle = THEME.accent;
+        ctx.fillText(this.drawings.length + ' drawings', this.W - 10 - ctx.measureText(toolTxt).width - 16, y + this.layout.statusH / 2);
+      }
     }
   }
 
