@@ -1258,10 +1258,7 @@ class TradingChart {
       this.lastTickAt = now;
       this.computeTimeWeights();
       this.computeIndicators();
-      // If user is at the right edge (realtime), follow the price
-      if (this.rightOffset <= 4.5) {
-        this.rightOffset = Math.max(0, this.rightOffset);
-      }
+      // Do NOT auto-follow price. User controls the view via pan/zoom only.
       this.autoScale();
     }
     const ctx = this.ctx;
@@ -1358,6 +1355,12 @@ class TradingChart {
     const bodyWidth = bodyWidthBmp / dpr;
     const wickWidth = wickWidthBmp / dpr;
 
+    // Clip to price chart area so candles never overflow into toolbar/volume/axis
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(this.chartLeft, this.priceTop, this.chartRight - this.chartLeft, this.priceBottom - this.priceTop);
+    ctx.clip();
+
     for (let i = firstIdx; i <= lastIdx; i++) {
       const c = candles[i];
       const x = this.indexToX(i);
@@ -1389,6 +1392,7 @@ class TradingChart {
       const bodyH = Math.max(1 / dpr, bodyBottom - bodyTop);
       ctx.fillRect(bodyLeft, bodyTop, bodyWidth, bodyH);
     }
+    ctx.restore();
   }
 
   /* --------------------------- Volume ------------------------------------ */
@@ -1398,6 +1402,12 @@ class TradingChart {
     const firstIdx = Math.max(0, Math.floor(this.xToIndex(this.chartLeft)) - 1);
     const lastIdx = Math.min(candles.length - 1, Math.ceil(this.xToIndex(this.chartRight)) + 1);
     if (firstIdx > lastIdx) return;
+
+    // Clip to volume area
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(this.chartLeft, this.volTop, this.chartRight - this.chartLeft, this.volBottom - this.volTop);
+    ctx.clip();
 
     // Use LWC-style column width (slightly less than barSpacing)
     const bodyWidthBmp = optimalCandlestickWidth(this.barSpacing, this.dpr);
@@ -1432,7 +1442,9 @@ class TradingChart {
       }
       ctx.stroke();
     }
-    // Vol label
+    ctx.restore();
+
+    // Vol label (drawn after restore so not clipped)
     ctx.font = '10px -apple-system, Segoe UI, Roboto, sans-serif';
     ctx.fillStyle = THEME.textDim;
     ctx.textBaseline = 'top';
@@ -1452,6 +1464,13 @@ class TradingChart {
     const ctx = this.ctx;
     const firstIdx = Math.max(0, Math.floor(this.xToIndex(this.chartLeft)));
     const lastIdx = Math.min(this.sim.candles.length - 1, Math.ceil(this.xToIndex(this.chartRight)));
+
+    // Clip to price chart area so indicator lines stay inside the chart
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(this.chartLeft, this.priceTop, this.chartRight - this.chartLeft, this.priceBottom - this.priceTop);
+    ctx.clip();
+
     const drawLine = (arr, color, lw = 1.4) => {
       if (!arr) return;
       ctx.strokeStyle = color;
@@ -1494,6 +1513,7 @@ class TradingChart {
       drawLine(bb.lower, THEME.ma3, 1);
       drawLine(bb.mid,   THEME.bollingerMid, 1);
     }
+    ctx.restore();
   }
 
   /* --------------------------- Pane (RSI/MACD) --------------------------- */
@@ -1504,7 +1524,7 @@ class TradingChart {
     const firstIdx = Math.max(0, Math.floor(this.xToIndex(this.chartLeft)));
     const lastIdx = Math.min(this.sim.candles.length - 1, Math.ceil(this.xToIndex(this.chartRight)));
 
-    // Grid (use pane scale marks)
+    // Grid (use pane scale marks) — drawn without clip so grid extends full width
     ctx.strokeStyle = THEME.grid;
     ctx.lineWidth = 1;
     const pmarks = this.paneScale.marks();
@@ -1516,6 +1536,12 @@ class TradingChart {
       ctx.lineTo(right, Math.floor(y) + 0.5);
       ctx.stroke();
     }
+
+    // Clip to pane area for indicator drawings (lines/histograms)
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(left, top, right - left, bot - top);
+    ctx.clip();
 
     if (this.activeIndicators.has('rsi') && this.indCache.rsi) {
       const rsi = this.indCache.rsi;
@@ -1541,16 +1567,6 @@ class TradingChart {
         if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
       }
       ctx.stroke();
-
-      ctx.font = '10px -apple-system, Segoe UI, Roboto, sans-serif';
-      ctx.fillStyle = THEME.rsi;
-      ctx.textAlign = 'left'; ctx.textBaseline = 'top';
-      const last = rsi[rsi.length - 1];
-      ctx.fillText('RSI 14: ' + (last !== null ? last.toFixed(2) : '—'), left + 6, top + 4);
-      // Right axis labels
-      ctx.fillStyle = THEME.textDim; ctx.textAlign = 'left';
-      for (const m of pmarks) ctx.fillText(m.label, right + 4, top + m.coord - 5);
-
     } else if (this.activeIndicators.has('macd') && this.indCache.macd) {
       const macd = this.indCache.macd;
       const midY = (top + bot) / 2;
@@ -1590,13 +1606,26 @@ class TradingChart {
       };
       drawML(macd.macd, THEME.macd);
       drawML(macd.signal, THEME.macdSignal);
+    }
+    ctx.restore();
 
-      ctx.font = '10px -apple-system, Segoe UI, Roboto, sans-serif';
-      ctx.fillStyle = THEME.macd;
-      ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+    // Labels (drawn after restore so not clipped)
+    ctx.font = '10px -apple-system, Segoe UI, Roboto, sans-serif';
+    ctx.textBaseline = 'top';
+    if (this.activeIndicators.has('rsi') && this.indCache.rsi) {
+      const rsi = this.indCache.rsi;
+      const last = rsi[rsi.length - 1];
+      ctx.fillStyle = THEME.rsi;
+      ctx.textAlign = 'left';
+      ctx.fillText('RSI 14: ' + (last !== null ? last.toFixed(2) : '—'), left + 6, top + 4);
+      ctx.fillStyle = THEME.textDim; ctx.textAlign = 'left';
+      for (const m of pmarks) ctx.fillText(m.label, right + 4, top + m.coord - 5);
+    } else if (this.activeIndicators.has('macd') && this.indCache.macd) {
+      const macd = this.indCache.macd;
       const lm = macd.macd[macd.macd.length - 1];
+      ctx.fillStyle = THEME.macd;
+      ctx.textAlign = 'left';
       ctx.fillText('MACD 12,26,9: ' + (lm !== null ? lm.toFixed(3) : '—'), left + 6, top + 4);
-      // Right axis labels
       ctx.fillStyle = THEME.textDim; ctx.textAlign = 'left';
       for (const m of pmarks) ctx.fillText(m.label, right + 4, top + m.coord - 5);
     }
@@ -1612,6 +1641,19 @@ class TradingChart {
       ctx.lineWidth = 1.5;
       const isHover = (d === this.hoverDrawing);
       if (isHover) { ctx.lineWidth = 2.5; ctx.strokeStyle = THEME.drawingActive; }
+
+      // For drawings that stay inside the chart area, apply clip.
+      // hline and fib draw labels on the price axis, so they need special handling.
+      const needsClip = d.type !== 'hline' && d.type !== 'fib';
+      if (needsClip) {
+        ctx.save();
+        ctx.beginPath();
+        // Clip to entire chart vertical range (price + volume + pane if present)
+        const clipTop = this.chartTop;
+        const clipBottom = this.layout.paneBottom || this.chartBottom;
+        ctx.rect(this.chartLeft, clipTop, this.chartRight - this.chartLeft, clipBottom - clipTop);
+        ctx.clip();
+      }
 
       switch (d.type) {
         case 'trend': {
@@ -1697,7 +1739,7 @@ class TradingChart {
           break;
         }
         case 'brush': {
-          if (!d.points || d.points.length === 0) return;
+          if (!d.points || d.points.length === 0) break;
           ctx.lineWidth = 2; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
           ctx.beginPath();
           for (let i = 0; i < d.points.length; i++) {
@@ -1710,6 +1752,7 @@ class TradingChart {
           break;
         }
       }
+      if (needsClip) ctx.restore();
     };
     for (const d of this.drawings) drawOne(d);
     if (this.currentDrawing) drawOne(this.currentDrawing, true);
@@ -1786,8 +1829,12 @@ class TradingChart {
   /* --------------------------- Price Axis -------------------------------- */
   drawPriceAxis() {
     const ctx = this.ctx;
+    // Fill the entire right column (price axis + corner with time axis) with panelBg
+    // so there's no empty gap at the bottom-right corner.
+    const axisTop = this.chartTop;
+    const axisBottom = (this.layout.paneBottom || this.chartBottom) + this.layout.timeAxisH;
     ctx.fillStyle = THEME.panelBg;
-    ctx.fillRect(this.chartRight + 1, this.chartTop, this.W - this.chartRight - 1, this.chartBottom - this.chartTop);
+    ctx.fillRect(this.chartRight + 1, axisTop, this.W - this.chartRight - 1, axisBottom - axisTop);
     ctx.strokeStyle = THEME.toolbarBorder;
     ctx.beginPath();
     ctx.moveTo(this.chartRight + 0.5, this.chartTop);
