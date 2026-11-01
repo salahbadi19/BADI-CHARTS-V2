@@ -612,7 +612,10 @@ class PriceScale {
   isEmpty() { return !this._priceRange || this._priceRange.min === this._priceRange.max; }
   firstValue() { return this._priceRange ? this._priceRange.min : null; }
   fontSize() { return 11; }
-  tickMarkDensity() { return 1; }
+  // LWC default: tickMarkDensity = 2.5 (NOT 1).
+  // tickMarkHeight = ceil(fontSize * tickMarkDensity) = ceil(11 * 2.5) = 28px
+  // This is the MINIMUM spacing between price labels, so they don't overlap.
+  tickMarkDensity() { return 2.5; }
   isInverted() { return false; }
   // scaleMargins: {top, bottom} as fractions. LWC defaults: top 0.2, bottom 0.1
   scaleMargins() { return this._opts.scaleMargins || {top: 0.2, bottom: 0.1}; }
@@ -822,6 +825,7 @@ class TradingChart {
       const dx = x - this.dragStartX;
       const barsMoved = dx / this.barSpacing;
       this.rightOffset = this.dragStartRightOffset - barsMoved;
+      this.constrainRightOffset();
       this.autoScale();
     } else if (this.currentDrawing) {
       this.updateCurrentDrawing(x, y);
@@ -888,13 +892,22 @@ class TradingChart {
     const oldSpacing = this.barSpacing;
     let newSpacing = clamp(oldSpacing * factor, this.minBarSpacing, this.maxBarSpacing);
     if (newSpacing === oldSpacing) return;
-    // Zoom toward cursor: keep the bar under cursor at same x
-    const idxAtCursor = this.xToIndex(x);
-    const fracAtCursor = (x - this.chartLeft) / this.barSpacing;
-    // New rightOffset such that idxAtCursor stays at same x
-    const totalBarsRight = (this.chartRight - x) / newSpacing;
+
+    // ZOOM TOWARD CURSOR — keep the candle under the cursor at the same x.
+    // Derivation:
+    //   x_at_index(i) = chartRight - (N-1 - i + rightOffset) * barSpacing
+    // For idx under cursor to stay at same x after barSpacing changes:
+    //   (N-1 - idx + rightOffset_new) * newSpacing = (N-1 - idx + rightOffset_old) * oldSpacing
+    // where N = candles.length, idx = xToIndex(x) computed with OLD spacing.
+    const N = this.sim.candles.length;
+    const idx = this.xToIndex(x);  // fractional index under cursor (using old spacing)
+    const distFromRightOld = this.chartRight - x;  // pixels from cursor to right edge
+    // (N-1 - idx + rightOffset_old) * oldSpacing = distFromRightOld
+    // => (N-1 - idx + rightOffset_new) * newSpacing = distFromRightOld
+    // => rightOffset_new = distFromRightOld / newSpacing - (N-1 - idx)
     this.barSpacing = newSpacing;
-    this.rightOffset = (this.sim.candles.length - 1 - idxAtCursor) + totalBarsRight;
+    this.rightOffset = distFromRightOld / newSpacing - (N - 1 - idx);
+    this.constrainRightOffset();
     this.invalidateTimeMarks();
     this.autoScale();
   }
@@ -924,14 +937,17 @@ class TradingChart {
   }
 
   zoomAtCenter(factor) {
+    // Same derivation as onWheel, but anchor at chart center
     const cx = (this.chartLeft + this.chartRight) / 2;
     const oldSpacing = this.barSpacing;
     let newSpacing = clamp(oldSpacing * factor, this.minBarSpacing, this.maxBarSpacing);
     if (newSpacing === oldSpacing) return;
-    const idxAtCenter = this.xToIndex(cx);
-    const totalBarsRight = (this.chartRight - cx) / newSpacing;
+    const N = this.sim.candles.length;
+    const idx = this.xToIndex(cx);
+    const distFromRight = this.chartRight - cx;
     this.barSpacing = newSpacing;
-    this.rightOffset = (this.sim.candles.length - 1 - idxAtCenter) + totalBarsRight;
+    this.rightOffset = distFromRight / newSpacing - (N - 1 - idx);
+    this.constrainRightOffset();
     this.invalidateTimeMarks();
     this.autoScale();
   }
@@ -939,9 +955,37 @@ class TradingChart {
   resetView() {
     this.barSpacing = 8;
     this.rightOffset = 4;
+    this.constrainRightOffset();
     this.invalidateTimeMarks();
     this.autoScale();
     this.showToast('Reset view');
+  }
+
+  // Constrain rightOffset so the chart cannot be scrolled too far away from data.
+  // - Maximum rightOffset: allows up to ~50% of visible width as empty space on right
+  // - Minimum rightOffset: keeps at least ~50% of visible width showing actual data
+  constrainRightOffset() {
+    const visibleBars = (this.chartRight - this.chartLeft) / this.barSpacing;
+    const N = this.sim.candles.length;
+    // Don't allow scrolling more than half the visible width past the last candle
+    const maxRight = visibleBars * 0.5;
+    // Don't allow scrolling more than (N + half visible) past — prevents leaving chart blank
+    const minRight = -(N - 1) - visibleBars * 0.5 + (N - 1); // = -visibleBars * 0.5
+    // Actually: we need at least the last candle visible-ish OR first candle visible
+    // Simpler: ensure the rightmost visible index is at least 0 (some data on screen)
+    // idx_at_chartRight = N - 1 + rightOffset
+    // require: idx_at_chartLeft >= -visibleBars * 0.5  (allow some empty space on left)
+    //          idx_at_chartRight <= N - 1 + visibleBars * 0.5  (allow some empty on right)
+    const idxAtRight = (N - 1) + this.rightOffset;
+    const idxAtLeft = idxAtRight - visibleBars;
+    const minIdxLeft = -visibleBars * 0.3;
+    const maxIdxRight = (N - 1) + visibleBars * 0.3;
+    if (idxAtLeft < minIdxLeft) {
+      this.rightOffset = minIdxLeft + visibleBars - (N - 1);
+    }
+    if (idxAtRight > maxIdxRight) {
+      this.rightOffset = maxIdxRight - (N - 1);
+    }
   }
 
   /* --------------------------- Coordinate Helpers ------------------------ */
