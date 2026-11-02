@@ -1778,6 +1778,7 @@ class TradingChart {
     const ctx = this.ctx;
     ctx.clearRect(0, 0, this.W, this.H);
     this.buttons = [];
+    this._iconHits = [];  // Reset icon hit registry once per frame (used by drawPane + drawLegend)
     this.drawBackground();
     this.drawGrid();
     this.drawCandles();
@@ -2203,26 +2204,39 @@ class TradingChart {
     }
     ctx.restore();
 
-    // Labels (drawn after restore so not clipped)
-    ctx.font = '10px -apple-system, Segoe UI, Roboto, sans-serif';
+    // Indicator cards for the pane (TradingView-style, with icons)
+    // Reuse the same _drawIndicatorCard system as the main legend.
+    ctx.font = '11px -apple-system, Segoe UI, Roboto, sans-serif';
     ctx.textBaseline = 'top';
-    if (this.activeIndicators.has('rsi') && this.indCache.rsi) {
-      const rsi = this.indCache.rsi;
-      const last = rsi[rsi.length - 1];
-      ctx.fillStyle = THEME.rsi;
-      ctx.textAlign = 'left';
-      ctx.fillText('RSI 14: ' + (last !== null ? last.toFixed(2) : '—'), left + 6, top + 4);
-      ctx.fillStyle = THEME.textDim; ctx.textAlign = 'left';
-      for (const m of pmarks) ctx.fillText(m.label, right + 4, top + m.coord - 5);
-    } else if (this.activeIndicators.has('macd') && this.indCache.macd) {
-      const macd = this.indCache.macd;
-      const lm = macd.macd[macd.macd.length - 1];
-      ctx.fillStyle = THEME.macd;
-      ctx.textAlign = 'left';
-      ctx.fillText('MACD 12,26,9: ' + (lm !== null ? lm.toFixed(3) : '—'), left + 6, top + 4);
-      ctx.fillStyle = THEME.textDim; ctx.textAlign = 'left';
-      for (const m of pmarks) ctx.fillText(m.label, right + 4, top + m.coord - 5);
+    const paneIdx = this.crosshairIndex !== null ?
+      clamp(Math.round(this.crosshairIndex), 0, this.sim.candles.length - 1) :
+      this.sim.candles.length - 1;
+    let pcx = left + 6;
+    const pcy = top + 4;
+    // RSI card
+    if (this.activeIndicators.has('rsi')) {
+      const state = this.indicatorStates.get('rsi') || {visible: true, settings: {}, icons: ['hide','edit','settings','delete'], customIcons: []};
+      const meta = INDICATOR_LIST.find(i => i.id === 'rsi');
+      if (meta) {
+        const val = this._getIndicatorValueAt('rsi', paneIdx);
+        const cardW = this._drawIndicatorCard(pcx, pcy, 'rsi', meta, state, val);
+        pcx += cardW + 8;
+      }
     }
+    // MACD card
+    if (this.activeIndicators.has('macd')) {
+      const state = this.indicatorStates.get('macd') || {visible: true, settings: {}, icons: ['hide','edit','settings','delete'], customIcons: []};
+      const meta = INDICATOR_LIST.find(i => i.id === 'macd');
+      if (meta) {
+        const val = this._getIndicatorValueAt('macd', paneIdx);
+        const cardW = this._drawIndicatorCard(pcx, pcy, 'macd', meta, state, val);
+        pcx += cardW + 8;
+      }
+    }
+    // Right axis labels (price scale of the pane)
+    ctx.font = '10px -apple-system, Segoe UI, Roboto, sans-serif';
+    ctx.fillStyle = THEME.textDim; ctx.textAlign = 'left';
+    for (const m of pmarks) ctx.fillText(m.label, right + 4, top + m.coord - 5);
   }
 
   /* --------------------------- Drawings ---------------------------------- */
@@ -2784,10 +2798,13 @@ class TradingChart {
 
     // Indicator cards (second line) — TradingView-style with icons
     if (isMobile) return;
-    this._iconHits = []; // reset icon hit registry
+    // NOTE: _iconHits is reset once per frame in render(), not here,
+    // so pane cards (drawn in drawPane) are preserved.
     let cx = this.chartLeft + 6;
     const cy = y + 18;
-    const activeIds = Array.from(this.activeIndicators);
+    // Only show overlay/volume indicators in the main legend.
+    // Pane indicators (rsi, macd) are shown in their own pane via drawPane().
+    const activeIds = Array.from(this.activeIndicators).filter(id => id !== 'rsi' && id !== 'macd');
     for (const id of activeIds) {
       const state = this.indicatorStates.get(id) || {visible: true, settings: {}, icons: ['hide','edit','settings','delete'], customIcons: []};
       const meta = INDICATOR_LIST.find(i => i.id === id);
