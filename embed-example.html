@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Embed BADI-CHARTS-V2 in Any Page</title>
+<style>
+  body { margin: 0; font-family: Arial; background: #f0f0f0; padding: 20px; }
+  h1 { color: #333; }
+  .chart-container {
+    width: 100%;
+    height: 500px;
+    background: #0e1015;
+    border-radius: 8px;
+    overflow: hidden;
+  }
+</style>
+</head>
+<body>
+  <h1>My Page with BADI-CHARTS-V2</h1>
+  <p>Embed the chart anywhere on your page:</p>
+
+  <!-- Chart container -->
+  <div class="chart-container">
+    <canvas id="myChart"></canvas>
+  </div>
+
+  <!-- Load BADI-CHARTS-V2 from CDN -->
+  <script src="https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@main/chart.js"></script>
+  <script>
+    // Create an EMPTY chart (no indicators, no data)
+    const chart = new BadiCharts(document.getElementById('myChart'), {
+      symbol: { label: 'BTCUSDT', priceScale: 100, decimals: 2 },
+      timeframe: { label: '1H', ms: 3600000 },
+      indicators: []  // empty — add later via chart.addIndicator('ma20')
+    });
+    chart.start();
+
+    // Feed your data:
+    // chart.setData([{time, open, high, low, close, volume}, ...]);
+    // chart.update(latestCandle);  // real-time
+  </script>
+</body>
+</html>
