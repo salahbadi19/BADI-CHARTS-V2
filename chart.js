@@ -1395,7 +1395,12 @@ class TradingChart {
     const x = e.clientX - r.left;
     if (!this.inChartArea(x, this.mouseY) && !this.inPriceAxis(x, this.mouseY)) return;
     const dir = e.deltaY < 0 ? 1 : -1;
-    const factor = dir > 0 ? 1.1 : 1/1.1;
+    // Adaptive zoom factor: faster zoom at large spacings, slower at small.
+    // This allows reaching very large candle sizes quickly.
+    // Base factor 1.15 (15% per tick), but scale up when barSpacing is already large.
+    const baseFactor = 1.15;
+    const accel = this.barSpacing > 50 ? 1.05 : 1.0; // accelerate when already zoomed in
+    const factor = dir > 0 ? baseFactor * accel : 1 / (baseFactor * accel);
     const oldSpacing = this.barSpacing;
     let newSpacing = clamp(oldSpacing * factor, this.minBarSpacing, this.maxBarSpacing);
     if (newSpacing === oldSpacing) return;
@@ -1432,8 +1437,8 @@ class TradingChart {
 
   onKeyDown(e) {
     if (e.key === 'r' || e.key === 'R') { this.resetView(); }
-    if (e.key === '+' || e.key === '=') this.zoomAtCenter(1.1);
-    if (e.key === '-' || e.key === '_') this.zoomAtCenter(1/1.1);
+    if (e.key === '+' || e.key === '=') this.zoomAtCenter(1.25);
+    if (e.key === '-' || e.key === '_') this.zoomAtCenter(1/1.25);
     if (e.key === 'Escape') { this.activeTool = 'cursor'; this.currentDrawing = null; this.dropdown = null; }
     if (e.key === 'Delete' || e.key === 'Backspace') {
       if (this.hoverDrawing) {
