@@ -1,69 +1,190 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Embed BADI-CHARTS-V2 in Any Page</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BADI-CHARTS-V2 — Embed Example</title>
 <style>
-  body { margin: 0; font-family: Arial, sans-serif; background: #f0f0f0; padding: 20px; }
-  h1 { color: #333; margin-bottom: 8px; }
-  p { color: #666; margin-bottom: 16px; }
-  .chart-container {
-    width: 100%;
-    height: 500px;
-    background: #0e1015;
-    border-radius: 8px;
-    overflow: hidden;
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, 'Segoe UI', Roboto, sans-serif;
+    background: linear-gradient(135deg, #0f1419 0%, #1a1e2a 100%);
+    color: #cfd2da;
+    min-height: 100vh;
+    padding: 24px;
   }
+  .header {
+    max-width: 1400px;
+    margin: 0 auto 24px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 16px;
+  }
+  .header h1 {
+    font-size: 28px;
+    font-weight: 700;
+    color: #f0f3fa;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .header h1 .badge {
+    background: #2962ff;
+    color: #fff;
+    font-size: 12px;
+    padding: 4px 10px;
+    border-radius: 12px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+  }
+  .header .subtitle {
+    color: #787b86;
+    font-size: 14px;
+    margin-top: 4px;
+  }
+  .controls {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .btn {
+    background: #1e222d;
+    color: #cfd2da;
+    border: 1px solid #2a2e39;
+    padding: 8px 16px;
+    border-radius: 6px;
+    font-size: 13px;
+    cursor: pointer;
+    transition: all 0.2s;
+    font-family: inherit;
+  }
+  .btn:hover { background: #2a2e39; border-color: #363a45; }
+  .btn.active { background: #2962ff; border-color: #2962ff; color: #fff; }
+  .chart-container {
+    max-width: 1400px;
+    margin: 0 auto;
+    height: calc(100vh - 140px);
+    min-height: 500px;
+    background: #0e1015;
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.4), 0 0 0 1px #2a2e39;
+  }
+  #chart { display: block; width: 100%; height: 100%; cursor: crosshair; }
+  .footer {
+    max-width: 1400px;
+    margin: 16px auto 0;
+    text-align: center;
+    color: #5d606b;
+    font-size: 12px;
+  }
+  .footer a { color: #2962ff; text-decoration: none; }
+  .footer a:hover { text-decoration: underline; }
 </style>
 </head>
 <body>
-  <h1>My Page with BADI-CHARTS-V2</h1>
-  <p>Embed the chart anywhere on your page — live BTC/USDT data from Binance:</p>
 
-  <!-- Chart container -->
-  <div class="chart-container">
-    <canvas id="myChart"></canvas>
+<div class="header">
+  <div>
+    <h1>BADI-CHARTS-V2 <span class="badge">v1.0</span></h1>
+    <div class="subtitle">Pure JavaScript trading chart library — live BTC/USDT data from Binance</div>
   </div>
+  <div class="controls">
+    <button class="btn active" onclick="loadSymbol('BTCUSDT', 100, 2)">BTC/USDT</button>
+    <button class="btn" onclick="loadSymbol('ETHUSDT', 100, 2)">ETH/USDT</button>
+    <button class="btn" onclick="toggleIndicator('rsi')">RSI</button>
+    <button class="btn" onclick="toggleIndicator('macd')">MACD</button>
+    <button class="btn" onclick="toggleIndicator('bb')">Bollinger</button>
+    <button class="btn" onclick="chart.resetView()">Reset</button>
+  </div>
+</div>
 
-  <!-- Load BADI-CHARTS-V2 from CDN -->
-  <script src="https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@main/chart.js"></script>
-  <script>
-    // Create the chart with MA20 + MA50 indicators
-    const chart = new BadiCharts(document.getElementById('myChart'), {
-      symbol: { label: 'BTCUSDT', priceScale: 100, decimals: 2 },
-      timeframe: { label: '1H', ms: 3600000 },
-      indicators: ['ma20', 'ma50', 'volsma']
+<div class="chart-container">
+  <canvas id="chart"></canvas>
+</div>
+
+<div class="footer">
+  Powered by <a href="https://github.com/salahbadi19/BADI-CHARTS-V2" target="_blank">BADI-CHARTS-V2</a> ·
+  Data from <a href="https://binance.com" target="_blank">Binance API</a>
+</div>
+
+<!-- Load BADI-CHARTS-V2 from CDN -->
+<script src="https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@main/chart.js"></script>
+
+<script>
+let currentSymbol = 'BTCUSDT';
+const chart = new BadiCharts(document.getElementById('chart'), {
+  symbol: { label: 'BTCUSDT', priceScale: 100, decimals: 2 },
+  timeframe: { label: '1H', ms: 3600000 },
+  indicators: ['volume', 'ma20', 'ma50', 'volsma']
+});
+
+async function loadData(symbol) {
+  const res = await fetch('https://api.binance.com/api/v3/klines?symbol=' + symbol + '&interval=1h&limit=500');
+  const raw = await res.json();
+  return raw.map(k => ({
+    time: Math.floor(k[0] / 1000),
+    open: +k[1], high: +k[2], low: +k[3], close: +k[4], volume: +k[5]
+  }));
+}
+
+loadData('BTCUSDT')
+  .then(candles => {
+    chart.setData(candles);
+    chart.start();
+  })
+  .catch(err => { console.error(err); chart.start(); });
+
+// Live WebSocket updates
+const ws = new WebSocket('wss://stream.binance.com:9443/ws/btcusdt@kline_1h');
+ws.onmessage = (ev) => {
+  const k = JSON.parse(ev.data).k;
+  if (!k) return;
+  chart.update({
+    time: Math.floor(k.t / 1000),
+    open: +k.o, high: +k.h, low: +k.l, close: +k.c, volume: +k.v
+  });
+};
+
+// Control functions
+async function loadSymbol(symbol, priceScale, decimals) {
+  currentSymbol = symbol;
+  // Update button states
+  document.querySelectorAll('.controls .btn').forEach(b => {
+    if (b.textContent.includes('/')) b.classList.remove('active');
+  });
+  event.target.classList.add('active');
+  // Close old WS, open new
+  ws.close();
+  const newWs = new WebSocket('wss://stream.binance.com:9443/ws/' + symbol.toLowerCase() + '@kline_1h');
+  newWs.onmessage = (ev) => {
+    const k = JSON.parse(ev.data).k;
+    if (!k) return;
+    chart.update({
+      time: Math.floor(k.t / 1000),
+      open: +k.o, high: +k.h, low: +k.l, close: +k.c, volume: +k.v
     });
+  };
+  // Set symbol config
+  chart.setSymbol({ label: symbol, priceScale: priceScale, decimals: decimals });
+  // Load data
+  const candles = await loadData(symbol);
+  chart.setData(candles);
+}
 
-    // Fetch REAL candles from Binance public API (no key needed)
-    fetch('https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=500')
-      .then(r => r.json())
-      .then(raw => raw.map(k => ({
-        time: Math.floor(k[0] / 1000),
-        open: +k[1], high: +k[2], low: +k[3], close: +k[4], volume: +k[5]
-      })))
-      .then(candles => {
-        chart.setData(candles);
-        chart.start();
-        console.log('Loaded ' + candles.length + ' candles');
-      })
-      .catch(err => {
-        console.error('Failed to load:', err);
-        chart.start();
-      });
+function toggleIndicator(id) {
+  const btn = event.target;
+  if (chart.activeIndicators.has(id)) {
+    chart.removeIndicator(id);
+    btn.classList.remove('active');
+  } else {
+    chart.addIndicator(id);
+    btn.classList.add('active');
+  }
+}
+</script>
 
-    // Optional: live updates via WebSocket
-    /*
-    const ws = new WebSocket('wss://stream.binance.com:9443/ws/btcusdt@kline_1h');
-    ws.onmessage = (ev) => {
-      const k = JSON.parse(ev.data).k;
-      if (!k) return;
-      chart.update({
-        time: Math.floor(k.t / 1000),
-        open: +k.o, high: +k.h, low: +k.l, close: +k.c, volume: +k.v
-      });
-    };
-    */
-  </script>
 </body>
 </html>

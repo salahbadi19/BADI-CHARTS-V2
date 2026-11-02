@@ -31,6 +31,7 @@
 
 /* ============================ VERSION ====================================== */
 const VERSION = '1.0.0';
+const BADI_DEBUG = false; // Set to true to enable debug logging
 
 /* ============================ THEME ========================================= */
 const THEME = {
@@ -420,6 +421,7 @@ function formatTickMark(timeSec, weight, tf) {
 // The chart library itself is data-source-agnostic.
 
 const INDICATOR_LIST = [
+  {id:'volume', label:'Volume',       type:'volume',   color:THEME.ma1},
   {id:'ma20',   label:'MA 20',       type:'overlay',  color:THEME.ma1},
   {id:'ma50',   label:'MA 50',       type:'overlay',  color:THEME.ma2},
   {id:'ma200',  label:'MA 200',      type:'overlay',  color:THEME.ma3},
@@ -768,8 +770,12 @@ class TradingChart {
     this.currentDrawing = null;
     this.hoverDrawing = null;
 
-    // Indicators — empty by default, user adds via addIndicator()
-    this.activeIndicators = new Set(opts.indicators || []);
+    // Indicators — default includes volume so the volume pane always has a card.
+    // User can remove via removeIndicator('volume') if desired.
+    const defaultIndicators = opts.indicators && opts.indicators.length > 0
+      ? opts.indicators
+      : ['volume'];
+    this.activeIndicators = new Set(defaultIndicators);
     this.indCache = {};
     // Per-indicator state: { visible, settings, customIcons, onSettings, onEdit }
     // Each active indicator gets a state entry on addIndicator().
@@ -852,6 +858,7 @@ class TradingChart {
   _defaultIndicatorState(id) {
     const meta = INDICATOR_LIST.find(i => i.id === id);
     const defaults = {
+      volume:{color: THEME.ma1},
       ma20:  {period: 20,  color: THEME.ma1},
       ma50:  {period: 50,  color: THEME.ma2},
       ma200: {period: 200, color: THEME.ma3},
@@ -1939,18 +1946,22 @@ class TradingChart {
     const bodyWidthBmp = optimalCandlestickWidth(this.barSpacing, this.dpr);
     const bodyWidth = bodyWidthBmp / this.dpr;
 
-    for (let i = firstIdx; i <= lastIdx; i++) {
-      const c = candles[i];
-      const x = this.indexToX(i);
-      if (x < this.chartLeft - bodyWidth || x > this.chartRight + bodyWidth) continue;
-      const isBull = c.close >= c.open;
-      const yTop = this.volToY(c.volume);
-      const yBot = this.volBottom;
-      ctx.fillStyle = isBull ? THEME.bullVol : THEME.bearVol;
-      const left = Math.round((x - bodyWidth / 2) * this.dpr) / this.dpr;
-      const top = Math.round(yTop * this.dpr) / this.dpr;
-      const h = Math.max(1 / this.dpr, yBot - yTop);
-      ctx.fillRect(left, top, bodyWidth, h);
+    // Only draw volume bars if 'volume' indicator is visible
+    const volVisible = this.isIndicatorVisible('volume');
+    if (volVisible) {
+      for (let i = firstIdx; i <= lastIdx; i++) {
+        const c = candles[i];
+        const x = this.indexToX(i);
+        if (x < this.chartLeft - bodyWidth || x > this.chartRight + bodyWidth) continue;
+        const isBull = c.close >= c.open;
+        const yTop = this.volToY(c.volume);
+        const yBot = this.volBottom;
+        ctx.fillStyle = isBull ? THEME.bullVol : THEME.bearVol;
+        const left = Math.round((x - bodyWidth / 2) * this.dpr) / this.dpr;
+        const top = Math.round(yTop * this.dpr) / this.dpr;
+        const h = Math.max(1 / this.dpr, yBot - yTop);
+        ctx.fillRect(left, top, bodyWidth, h);
+      }
     }
 
     // Vol SMA
@@ -1970,13 +1981,27 @@ class TradingChart {
     }
     ctx.restore();
 
-    // Vol label (drawn after restore so not clipped)
-    ctx.font = '10px -apple-system, Segoe UI, Roboto, sans-serif';
-    ctx.fillStyle = THEME.textDim;
-    ctx.textBaseline = 'top';
-    ctx.textAlign = 'left';
-    const lastVol = candles[Math.min(candles.length - 1, lastIdx)].volume;
-    ctx.fillText('Vol ' + this._fmtVol(lastVol), this.chartLeft + 6, this.volTop + 2);
+    // Volume indicator card (TradingView-style, with icons) — drawn in the volume area
+    // Only draw if 'volume' indicator is active
+    if (this.activeIndicators.has('volume')) {
+      const volIdx = this.crosshairIndex !== null ?
+        clamp(Math.round(this.crosshairIndex), 0, this.sim.candles.length - 1) :
+        this.sim.candles.length - 1;
+      const volState = this.indicatorStates.get('volume') || {visible: true, settings: {color: THEME.ma1}, icons: ['hide','edit','settings','delete'], customIcons: []};
+      const volMeta = INDICATOR_LIST.find(i => i.id === 'volume');
+      const volVal = this._getIndicatorValueAt('volume', volIdx);
+      if (volMeta) {
+        this._drawIndicatorLine(this.chartLeft + 6, this.volTop + 2, 'volume', volMeta, volState, volVal);
+      }
+    } else {
+      // Fallback: simple Vol label if volume indicator not active
+      ctx.font = '10px -apple-system, Segoe UI, Roboto, sans-serif';
+      ctx.fillStyle = THEME.textDim;
+      ctx.textBaseline = 'top';
+      ctx.textAlign = 'left';
+      const lastVol = candles[Math.min(candles.length - 1, lastIdx)].volume;
+      ctx.fillText('Vol ' + this._fmtVol(lastVol), this.chartLeft + 6, this.volTop + 2);
+    }
   }
   _fmtVol(n) {
     if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
@@ -2806,8 +2831,9 @@ class TradingChart {
     // Lines 2+: Indicator labels stacked VERTICALLY (TradingView-style)
     // Each indicator on its own line, with icons shown when active (clicked).
     if (isMobile) return;
-    // Get overlay/volume indicators (pane indicators rsi/macd are drawn in drawPane)
-    const overlayIds = Array.from(this.activeIndicators).filter(id => id !== 'rsi' && id !== 'macd');
+    // Get overlay/volume indicators (pane indicators rsi/macd are drawn in drawPane,
+    // volume is drawn in drawVolume — exclude both from the main legend)
+    const overlayIds = Array.from(this.activeIndicators).filter(id => id !== 'rsi' && id !== 'macd' && id !== 'volume');
     if (overlayIds.length === 0) return;
     // If collapsed, draw only the expand arrow (downward) and return
     let lineY = y + 18;
@@ -2912,6 +2938,11 @@ class TradingChart {
 
   // Get formatted value for an indicator at a given candle index
   _getIndicatorValueAt(id, idx) {
+    if (id === 'volume') {
+      const c = this.sim.candles[idx];
+      if (c) return this._fmtVol(c.volume);
+      return '—';
+    }
     if (id === 'ma20' && this.indCache.ma20 && this.indCache.ma20[idx] !== null)
       return this.priceScale.formatLogical(this.indCache.ma20[idx]);
     if (id === 'ma50' && this.indCache.ma50 && this.indCache.ma50[idx] !== null)
