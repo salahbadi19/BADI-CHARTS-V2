@@ -1020,13 +1020,16 @@ class TradingChart {
     const hasPane = this.activeIndicators.has('rsi') || this.activeIndicators.has('macd');
     // Increased pane height so the indicator card + line are both clearly visible
     this.layout.paneH = hasPane ? (isMobile ? 110 : 140) : 0;
+    // Volume area: only show if 'volume' indicator is active (or volsma)
+    const hasVolume = this.activeIndicators.has('volume') || this.activeIndicators.has('volsma');
+    const volH = hasVolume ? this.layout.volumeH : 0;
 
     this.chartLeft = this.layout.leftPad;
     this.chartRight = this.W - this.layout.priceAxisW;
     this.chartTop = paneTop + 4;
     this.chartBottom = bottomStart - this.layout.paneH - (this.layout.paneH > 0 ? this.layout.gap : 0);
 
-    this.volTop = this.chartBottom - this.layout.volumeH;
+    this.volTop = this.chartBottom - volH;
     this.volBottom = this.chartBottom - 4;
     this.priceTop = this.chartTop;
     this.priceBottom = this.volTop - 4;
@@ -1946,8 +1949,8 @@ class TradingChart {
     const bodyWidthBmp = optimalCandlestickWidth(this.barSpacing, this.dpr);
     const bodyWidth = bodyWidthBmp / this.dpr;
 
-    // Only draw volume bars if 'volume' indicator is visible
-    const volVisible = this.isIndicatorVisible('volume');
+    // Only draw volume bars if 'volume' indicator is active AND visible
+    const volVisible = this.activeIndicators.has('volume') && this.isIndicatorVisible('volume');
     if (volVisible) {
       for (let i = firstIdx; i <= lastIdx; i++) {
         const c = candles[i];
@@ -1993,15 +1996,9 @@ class TradingChart {
       if (volMeta) {
         this._drawIndicatorLine(this.chartLeft + 6, this.volTop + 2, 'volume', volMeta, volState, volVal);
       }
-    } else {
-      // Fallback: simple Vol label if volume indicator not active
-      ctx.font = '10px -apple-system, Segoe UI, Roboto, sans-serif';
-      ctx.fillStyle = THEME.textDim;
-      ctx.textBaseline = 'top';
-      ctx.textAlign = 'left';
-      const lastVol = candles[Math.min(candles.length - 1, lastIdx)].volume;
-      ctx.fillText('Vol ' + this._fmtVol(lastVol), this.chartLeft + 6, this.volTop + 2);
     }
+    // No fallback label — if volume indicator is removed, nothing shows in the volume area
+    // (volume bars are also hidden via the volVisible check above)
   }
   _fmtVol(n) {
     if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
@@ -2836,8 +2833,8 @@ class TradingChart {
     const overlayIds = Array.from(this.activeIndicators).filter(id => id !== 'rsi' && id !== 'macd' && id !== 'volume');
     if (overlayIds.length === 0) return;
     // If collapsed, draw only the expand arrow (downward) and return
-    let lineY = y + 18;
-    const lineH = 16;
+    let lineY = y + 20;
+    const lineH = 22;  // matches cardH in _drawIndicatorLine
     if (this.indicatorsCollapsed) {
       // Draw a small downward arrow to expand
       this._drawCollapseArrow(this.chartLeft + 8, lineY, false);
@@ -2864,46 +2861,48 @@ class TradingChart {
     const isVisible = state.visible !== false;
     const color = meta.color;
     ctx.font = '11px -apple-system, Segoe UI, Roboto, sans-serif';
-    ctx.textBaseline = 'top'; ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
     const labelTxt = meta.label + ':';
     const labelW = ctx.measureText(labelTxt).width;
     const valTxt = val || '';
     const valW = ctx.measureText(valTxt).width;
     // Background when active (subtle highlight)
     const allIcons = state.icons.concat(state.customIcons.map(c => c.id));
-    const iconSize = 13;
-    const iconGap = 2;
-    const padX = 4;
+    const iconSize = 16;   // bigger icons for easier clicking
+    const iconGap = 4;
+    const padX = 6;
+    const cardH = 22;      // taller card for better readability
+    const centerY = y + cardH / 2;
     let iconsW = 0;
     if (isActive) iconsW = allIcons.length * (iconSize + iconGap);
-    const lineW = labelW + 4 + valW + (isActive ? iconsW + 6 : 0);
+    const lineW = padX + labelW + 6 + valW + (isActive ? iconsW + 8 : 0) + padX;
     // Highlight background when active
     if (isActive) {
-      ctx.fillStyle = 'rgba(42,46,57,0.6)';
-      this._roundRect(x - 2, y - 1, lineW + 4, 16, 2);
+      ctx.fillStyle = 'rgba(42,46,57,0.85)';
+      this._roundRect(x - 2, y, lineW, cardH, 3);
       ctx.fill();
     }
     // Label (colored dot + name)
     ctx.fillStyle = isVisible ? color : THEME.textDim;
     // Small colored dot before the label
     ctx.beginPath();
-    ctx.arc(x + 3, y + 6, 3, 0, Math.PI * 2);
+    ctx.arc(x + padX + 3, centerY, 3.5, 0, Math.PI * 2);
     ctx.fill();
-    ctx.fillText(labelTxt, x + 10, y);
+    ctx.fillText(labelTxt, x + padX + 10, centerY);
     // Value
     ctx.fillStyle = isVisible ? THEME.text : THEME.textDim;
-    ctx.fillText(valTxt, x + 10 + labelW + 4, y);
+    ctx.fillText(valTxt, x + padX + 10 + labelW + 6, centerY);
     // Icons (only when active)
     if (isActive) {
-      let ix = x + 10 + labelW + 4 + valW + 6;
+      let ix = x + padX + 10 + labelW + 6 + valW + 8;
       for (const iconId of allIcons) {
         const isCustom = state.customIcons.find(c => c.id === iconId);
-        this._drawIndicatorIcon(ix, y, iconId, iconSize, id, isCustom);
+        this._drawIndicatorIcon(ix, y + (cardH - iconSize) / 2, iconId, iconSize, id, isCustom);
         ix += iconSize + iconGap;
       }
     } else {
       // Register the line area for hit-test (click to activate)
-      this._iconHits.push({type: 'card', id: id, x: x - 2, y: y - 1, w: lineW + 4, h: 16});
+      this._iconHits.push({type: 'card', id: id, x: x - 2, y: y, w: lineW, h: cardH});
     }
   }
 
