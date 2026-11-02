@@ -432,19 +432,33 @@ const INDICATOR_LIST = [
   {id:'bb',     label:'Bollinger',   type:'overlay',  color:THEME.bollingerMid},
   {id:'volsma', label:'Vol SMA 20',  type:'volume',   color:THEME.ma2},
   {id:'rsi',    label:'RSI 14',      type:'pane',     color:THEME.rsi},
-  {id:'macd',   label:'MACD',        type:'pane',     color:THEME.macd}
+  {id:'macd',   label:'MACD',        type:'pane',     color:THEME.macd},
+  {id:'vprof',  label:'Volume Profile', type:'overlay', color:THEME.ma1}
 ];
 
 const DRAW_TOOLS = [
-  {id:'cursor',  label:'Cursor',          icon:'cursor'},
-  {id:'trend',   label:'Trend Line',      icon:'trend'},
-  {id:'hline',   label:'Horizontal Line', icon:'hline'},
-  {id:'vline',   label:'Vertical Line',   icon:'vline'},
-  {id:'rect',    label:'Rectangle',       icon:'rect'},
-  {id:'fib',     label:'Fib Retracement', icon:'fib'},
-  {id:'brush',   label:'Brush',           icon:'brush'},
-  {id:'eraser',  label:'Delete Drawing',  icon:'eraser'}
+  {id:'cursor',   label:'Cursor',           icon:'cursor'},
+  {id:'trend',    label:'Trend Line',       icon:'trend'},
+  {id:'channel',  label:'Parallel Channel', icon:'channel'},
+  {id:'hline',    label:'Horizontal Line',  icon:'hline'},
+  {id:'vline',    label:'Vertical Line',    icon:'vline'},
+  {id:'band',     label:'Band / Zone',      icon:'band'},
+  {id:'rect',     label:'Rectangle',        icon:'rect'},
+  {id:'arrow',    label:'Arrow',            icon:'arrow'},
+  {id:'fib',      label:'Fib Retracement',  icon:'fib'},
+  {id:'brush',    label:'Brush',            icon:'brush'},
+  {id:'poly',     label:'Polygon',          icon:'poly'},
+  {id:'text',     label:'Text',             icon:'text'},
+  {id:'ray',      label:'Ray',              icon:'ray'},
+  {id:'eraser',   label:'Delete Drawing',   icon:'eraser'}
 ];
+
+// Symbol shortcuts for mobile toolbar
+const TOOL_SHORTCUTS = {
+  cursor:'↖', trend:'╱', channel:'╫', hline:'─', vline:'│',
+  band:'▓', rect:'▭', arrow:'→', fib:'Fib', brush:'~',
+  poly:'⬠', text:'T', ray:'→│', eraser:'✕'
+};
 
 /* ============================ INDICATOR MATH =============================== */
 const Indicators = {
@@ -524,6 +538,60 @@ const Indicators = {
     const sig = Indicators.ema(validMacd, signal);
     const hist = macdLine.map((v, i) => (v !== null && sig[i] !== null ? v - sig[i] : null));
     return {macd: macdLine, signal: sig, hist};
+  },
+  // Volume Profile: builds histogram of volume by price level over visible range.
+  // Returns {bins: [{priceLow, priceHigh, volume, isUp}], maxVol, vwap, pocPrice}
+  volumeProfile(candles, firstIdx, lastIdx, numBins = 24) {
+    if (firstIdx >= lastIdx || lastIdx <= 0) return null;
+    let minP = Infinity, maxP = -Infinity;
+    let totalVol = 0, totalPV = 0;
+    for (let i = firstIdx; i <= lastIdx; i++) {
+      const c = candles[i];
+      if (c.low < minP) minP = c.low;
+      if (c.high > maxP) maxP = c.high;
+      const typical = (c.high + c.low + c.close) / 3;
+      totalVol += c.volume;
+      totalPV += typical * c.volume;
+    }
+    if (minP === Infinity || maxP === minP) return null;
+    const range = maxP - minP;
+    const binSize = range / numBins;
+    const bins = new Array(numBins).fill(0).map((_, i) => ({
+      priceLow: minP + i * binSize,
+      priceHigh: minP + (i + 1) * binSize,
+      volume: 0,
+      upVol: 0,
+      downVol: 0
+    }));
+    // Distribute each candle's volume across the bins it spans (using high-low range)
+    for (let i = firstIdx; i <= lastIdx; i++) {
+      const c = candles[i];
+      const cLow = c.low, cHigh = c.high;
+      const cRange = cHigh - cLow || 1;
+      const firstBin = Math.max(0, Math.floor((cLow - minP) / binSize));
+      const lastBin = Math.min(numBins - 1, Math.floor((cHigh - minP) / binSize));
+      const isUp = c.close >= c.open;
+      for (let b = firstBin; b <= lastBin; b++) {
+        const binLow = bins[b].priceLow;
+        const binHigh = bins[b].priceHigh;
+        const overlapLow = Math.max(cLow, binLow);
+        const overlapHigh = Math.min(cHigh, binHigh);
+        const overlap = Math.max(0, overlapHigh - overlapLow);
+        const portion = overlap / cRange;
+        const vol = c.volume * portion;
+        bins[b].volume += vol;
+        if (isUp) bins[b].upVol += vol;
+        else bins[b].downVol += vol;
+      }
+    }
+    let maxVol = 0;
+    let pocIdx = 0;
+    for (let i = 0; i < numBins; i++) {
+      if (bins[i].volume > maxVol) { maxVol = bins[i].volume; pocIdx = i; }
+    }
+    const vwap = totalVol > 0 ? totalPV / totalVol : (minP + maxP) / 2;
+    const pocPrice = (bins[pocIdx].priceLow + bins[pocIdx].priceHigh) / 2;
+    return {bins, maxVol, vwap, pocPrice, pocIdx, minP, maxP, totalVol};
   }
 };
 
@@ -1279,26 +1347,69 @@ class TradingChart {
       this.showToast('Vertical line added');
       return;
     }
-    this.currentDrawing = {
-      type: tool, i1: idx, p1: price, i2: idx, p2: price,
-      color: THEME.drawingActive, id: Date.now(),
-      points: tool === 'brush' ? [{i: idx, p: price, x, y}] : null
-    };
+    if (tool === 'text') {
+      // For text, we use a prompt-like approach via toast; in real app use input.
+      // Here we'll add a text drawing with a default label the user can change.
+      const txt = 'Text ' + (this.drawings.length + 1);
+      this.drawings.push({type:'text', i: idx, p: price, text: txt, color: THEME.drawing, id: Date.now()});
+      this.activeTool = 'cursor';
+      this.showToast('Text added (double-click to edit)');
+      return;
+    }
+    // Tools that use single drag (i1,p1) → (i2,p2)
+    if (tool === 'trend' || tool === 'ray' || tool === 'channel' || tool === 'arrow' ||
+        tool === 'rect' || tool === 'band' || tool === 'fib') {
+      this.currentDrawing = {
+        type: tool, i1: idx, p1: price, i2: idx, p2: price,
+        color: THEME.drawingActive, id: Date.now()
+      };
+      return;
+    }
+    // Brush / Polygon: multi-point paths
+    if (tool === 'brush' || tool === 'poly') {
+      this.currentDrawing = {
+        type: tool,
+        points: [{i: idx, p: price, x, y}],
+        color: THEME.drawingActive, id: Date.now(),
+        closed: false
+      };
+      return;
+    }
   }
   updateCurrentDrawing(x, y) {
     if (!this.currentDrawing) return;
     const idx = this.xToIndex(x);
     const price = this.yToPrice(y);
-    if (this.currentDrawing.type === 'brush') {
-      this.currentDrawing.points.push({i: idx, p: price, x, y});
+    if (this.currentDrawing.type === 'brush' || this.currentDrawing.type === 'poly') {
+      // For brush: add point on every move (freehand)
+      if (this.currentDrawing.type === 'brush') {
+        this.currentDrawing.points.push({i: idx, p: price, x, y});
+      } else {
+        // For polygon: update the last point (the one being dragged)
+        const pts = this.currentDrawing.points;
+        if (pts.length > 0) {
+          pts[pts.length - 1] = {i: idx, p: price, x, y};
+        }
+      }
     } else {
       this.currentDrawing.i2 = idx;
       this.currentDrawing.p2 = price;
     }
   }
+  // For polygon: click to add a vertex, double-click to finish
+  addPolygonVertex(x, y) {
+    if (!this.currentDrawing || this.currentDrawing.type !== 'poly') return;
+    const idx = this.xToIndex(x);
+    const price = this.yToPrice(y);
+    this.currentDrawing.points.push({i: idx, p: price, x, y});
+  }
   finishDrawing() {
     if (!this.currentDrawing) return;
     this.currentDrawing.color = THEME.drawing;
+    // For polygon: mark as closed if 3+ vertices
+    if (this.currentDrawing.type === 'poly' && this.currentDrawing.points.length >= 3) {
+      this.currentDrawing.closed = true;
+    }
     this.drawings.push(this.currentDrawing);
     this.currentDrawing = null;
     this.activeTool = 'cursor';
@@ -1407,6 +1518,7 @@ class TradingChart {
     this.drawCandles();
     this.drawVolume();
     this.drawIndicators();
+    this.drawVolumeProfile();
     this.drawPane();
     this.drawDrawings();
     this.drawPriceAxis();
@@ -1595,6 +1707,84 @@ class TradingChart {
     if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
     if (n >= 1e3) return (n / 1e3).toFixed(2) + 'K';
     return n.toFixed(0);
+  }
+
+  /* --------------------------- Volume Profile ---------------------------- */
+  // Example of a custom indicator drawing on the chart (overlay).
+  // Computes volume distribution by price level over visible candles,
+  // then draws horizontal bars from the right side of the chart going left.
+  drawVolumeProfile() {
+    if (!this.activeIndicators.has('vprof')) return;
+    const ctx = this.ctx;
+    const firstIdx = Math.max(0, Math.floor(this.xToIndex(this.chartLeft)));
+    const lastIdx = Math.min(this.sim.candles.length - 1, Math.ceil(this.xToIndex(this.chartRight)));
+    if (firstIdx >= lastIdx) return;
+    const prof = Indicators.volumeProfile(this.sim.candles, firstIdx, lastIdx, 24);
+    if (!prof) return;
+    // Clip to price chart area
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(this.chartLeft, this.priceTop, this.chartRight - this.chartLeft, this.priceBottom - this.priceTop);
+    ctx.clip();
+    const maxW = (this.chartRight - this.chartLeft) * 0.30; // bars take up to 30% of chart width from right
+    const binH = (prof.maxP - prof.minP) / prof.bins.length;
+    for (let i = 0; i < prof.bins.length; i++) {
+      const b = prof.bins[i];
+      const y = this.priceToY(b.priceHigh);
+      const yLow = this.priceToY(b.priceLow);
+      const w = (b.volume / prof.maxVol) * maxW;
+      const x = this.chartRight - w;
+      const barH = Math.max(1, yLow - y);
+      // Color: green for up-volume, red for down-volume
+      const upRatio = b.upVol / Math.max(1, b.volume);
+      const color = upRatio >= 0.5 ? 'rgba(38,166,154,0.55)' : 'rgba(239,83,80,0.55)';
+      ctx.fillStyle = color;
+      ctx.fillRect(x, y, w, barH);
+      // Highlight POC (Point of Control) — the bin with highest volume
+      if (i === prof.pocIdx) {
+        ctx.strokeStyle = '#ffb74d';
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(x, y, w, barH);
+      }
+    }
+    // Draw POC line across the chart
+    const pocY = this.priceToY(prof.pocPrice);
+    ctx.strokeStyle = 'rgba(255,183,77,0.8)';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath();
+    ctx.moveTo(this.chartLeft, Math.floor(pocY) + 0.5);
+    ctx.lineTo(this.chartRight, Math.floor(pocY) + 0.5);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    // Draw VWAP line
+    const vwapY = this.priceToY(prof.vwap);
+    ctx.strokeStyle = 'rgba(156,39,176,0.9)';
+    ctx.lineWidth = 1.2;
+    ctx.setLineDash([6, 3]);
+    ctx.beginPath();
+    ctx.moveTo(this.chartLeft, Math.floor(vwapY) + 0.5);
+    ctx.lineTo(this.chartRight, Math.floor(vwapY) + 0.5);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.restore();
+    // Labels (drawn after restore so visible on price axis)
+    ctx.font = '10px -apple-system, Segoe UI, Roboto, sans-serif';
+    ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+    // POC label
+    const pocTxt = 'POC ' + this.priceScale.formatLogical(prof.pocPrice);
+    const pw = ctx.measureText(pocTxt).width + 8;
+    ctx.fillStyle = '#ffb74d';
+    ctx.fillRect(this.chartRight + 1, Math.floor(pocY) - 7, pw, 14);
+    ctx.fillStyle = THEME.bg;
+    ctx.fillText(pocTxt, this.chartRight + 5, Math.floor(pocY));
+    // VWAP label
+    const vwapTxt = 'VWAP ' + this.priceScale.formatLogical(prof.vwap);
+    const vw = ctx.measureText(vwapTxt).width + 8;
+    ctx.fillStyle = '#9c27b0';
+    ctx.fillRect(this.chartRight + 1, Math.floor(vwapY) - 7, vw, 14);
+    ctx.fillStyle = THEME.bg;
+    ctx.fillText(vwapTxt, this.chartRight + 5, Math.floor(vwapY));
   }
 
   /* --------------------------- Indicators -------------------------------- */
@@ -1807,6 +1997,105 @@ class TradingChart {
           ctx.beginPath(); ctx.arc(x2, y2, 3, 0, Math.PI * 2); ctx.fill();
           break;
         }
+        case 'ray': {
+          // Ray: starts at (i1,p1) and extends through (i2,p2) to the right edge
+          const x1 = this.indexToX(d.i1);
+          const x2 = this.indexToX(d.i2);
+          const y1 = this.priceToY(d.p1);
+          const y2 = this.priceToY(d.p2);
+          const dx = x2 - x1, dy = y2 - y1;
+          if (Math.abs(dx) < 0.001) {
+            ctx.beginPath(); ctx.moveTo(x1, this.chartTop); ctx.lineTo(x1, this.chartBottom); ctx.stroke();
+          } else {
+            const t = (this.chartRight - x1) / dx;
+            const yEnd = y1 + dy * t;
+            ctx.beginPath();
+            ctx.moveTo(x1, y1);
+            ctx.lineTo(this.chartRight, yEnd);
+            ctx.stroke();
+            ctx.beginPath(); ctx.arc(x1, y1, 3, 0, Math.PI * 2); ctx.fill();
+          }
+          break;
+        }
+        case 'channel': {
+          // Parallel channel: two parallel lines from (i1,p1)-(i2,p2) and offset by (p2-p1)
+          const x1 = this.indexToX(d.i1);
+          const x2 = this.indexToX(d.i2);
+          const y1 = this.priceToY(d.p1);
+          const y2 = this.priceToY(d.p2);
+          // Main line
+          ctx.beginPath();
+          ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+          // Parallel line: offset = (p2 - p1) added to both endpoints
+          const offsetPrice = d.p2 - d.p1;
+          const y1b = this.priceToY(d.p1 + offsetPrice);
+          const y2b = this.priceToY(d.p2 + offsetPrice);
+          ctx.setLineDash([4, 3]);
+          ctx.beginPath();
+          ctx.moveTo(x1, y1b); ctx.lineTo(x2, y2b); ctx.stroke();
+          ctx.setLineDash([]);
+          // Fill between
+          ctx.fillStyle = color + '15';
+          ctx.beginPath();
+          ctx.moveTo(x1, y1); ctx.lineTo(x2, y2);
+          ctx.lineTo(x2, y2b); ctx.lineTo(x1, y1b); ctx.closePath(); ctx.fill();
+          // Endpoint dots
+          ctx.beginPath(); ctx.arc(x1, y1, 3, 0, Math.PI * 2); ctx.fill();
+          ctx.beginPath(); ctx.arc(x2, y2, 3, 0, Math.PI * 2); ctx.fill();
+          ctx.beginPath(); ctx.arc(x1, y1b, 3, 0, Math.PI * 2); ctx.fill();
+          ctx.beginPath(); ctx.arc(x2, y2b, 3, 0, Math.PI * 2); ctx.fill();
+          break;
+        }
+        case 'arrow': {
+          const x1 = this.indexToX(d.i1);
+          const x2 = this.indexToX(d.i2);
+          const y1 = this.priceToY(d.p1);
+          const y2 = this.priceToY(d.p2);
+          // Main shaft
+          ctx.beginPath();
+          ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+          // Arrowhead at end (x2,y2)
+          const angle = Math.atan2(y2 - y1, x2 - x1);
+          const headLen = 12;
+          ctx.beginPath();
+          ctx.moveTo(x2, y2);
+          ctx.lineTo(x2 - headLen * Math.cos(angle - Math.PI / 6), y2 - headLen * Math.sin(angle - Math.PI / 6));
+          ctx.lineTo(x2 - headLen * Math.cos(angle + Math.PI / 6), y2 - headLen * Math.sin(angle + Math.PI / 6));
+          ctx.closePath();
+          ctx.fill();
+          break;
+        }
+        case 'band': {
+          // Band/Zone: shaded horizontal zone between p1 and p2, spanning full width
+          const y1 = this.priceToY(d.p1);
+          const y2 = this.priceToY(d.p2);
+          const yTop = Math.min(y1, y2), yBot = Math.max(y1, y2);
+          ctx.fillStyle = color + '25';
+          ctx.fillRect(this.chartLeft, yTop, this.chartRight - this.chartLeft, yBot - yTop);
+          ctx.setLineDash([3, 3]);
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.moveTo(this.chartLeft, Math.floor(yTop) + 0.5);
+          ctx.lineTo(this.chartRight, Math.floor(yTop) + 0.5);
+          ctx.moveTo(this.chartLeft, Math.floor(yBot) + 0.5);
+          ctx.lineTo(this.chartRight, Math.floor(yBot) + 0.5);
+          ctx.stroke();
+          ctx.setLineDash([]);
+          // Labels on price axis
+          ctx.font = '10px -apple-system, Segoe UI, Roboto, sans-serif';
+          ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+          const t1 = this.priceScale.formatLogical(d.p1);
+          const t2 = this.priceScale.formatLogical(d.p2);
+          const tw1 = ctx.measureText(t1).width + 8;
+          const tw2 = ctx.measureText(t2).width + 8;
+          ctx.fillStyle = color;
+          ctx.fillRect(this.chartRight + 1, Math.floor(y1) - 7, tw1, 14);
+          ctx.fillRect(this.chartRight + 1, Math.floor(y2) - 7, tw2, 14);
+          ctx.fillStyle = THEME.bg;
+          ctx.fillText(t1, this.chartRight + 5, Math.floor(y1));
+          ctx.fillText(t2, this.chartRight + 5, Math.floor(y2));
+          break;
+        }
         case 'hline': {
           const y = this.priceToY(d.price);
           ctx.setLineDash([4, 4]);
@@ -1845,6 +2134,45 @@ class TradingChart {
           ctx.fillStyle = color + '22';
           ctx.fillRect(rx, ry, rw, rh);
           ctx.strokeRect(rx, ry, rw, rh);
+          break;
+        }
+        case 'poly': {
+          if (!d.points || d.points.length < 2) break;
+          ctx.lineWidth = 1.5; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+          ctx.beginPath();
+          for (let i = 0; i < d.points.length; i++) {
+            const p = d.points[i];
+            const x = this.indexToX(p.i);
+            const y = this.priceToY(p.p);
+            if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+          }
+          if (d.closed) {
+            ctx.closePath();
+            ctx.fillStyle = color + '20';
+            ctx.fill();
+          }
+          ctx.stroke();
+          // Vertex dots
+          for (const p of d.points) {
+            const x = this.indexToX(p.i);
+            const y = this.priceToY(p.p);
+            ctx.beginPath(); ctx.arc(x, y, 3, 0, Math.PI * 2); ctx.fill();
+          }
+          break;
+        }
+        case 'text': {
+          const x = this.indexToX(d.i);
+          const y = this.priceToY(d.p);
+          ctx.font = '12px -apple-system, Segoe UI, Roboto, sans-serif';
+          ctx.textAlign = 'left'; ctx.textBaseline = 'bottom';
+          // Background box for readability
+          const tw = ctx.measureText(d.text).width + 8;
+          ctx.fillStyle = color + '30';
+          ctx.fillRect(x - 2, y - 16, tw, 18);
+          ctx.fillStyle = color;
+          ctx.fillText(d.text, x + 2, y - 2);
+          // Anchor dot
+          ctx.beginPath(); ctx.arc(x, y, 2.5, 0, Math.PI * 2); ctx.fill();
           break;
         }
         case 'fib': {
@@ -1905,14 +2233,30 @@ class TradingChart {
   hitTestDrawing(d, x, y) {
     const tol = 6;
     switch (d.type) {
-      case 'trend': {
+      case 'trend':
+      case 'arrow':
+      case 'ray': {
         const x1 = this.indexToX(d.i1), x2 = this.indexToX(d.i2);
         const y1 = this.priceToY(d.p1), y2 = this.priceToY(d.p2);
         return this._distToSeg(x, y, x1, y1, x2, y2) < tol;
       }
+      case 'channel': {
+        // Test both the main line and the parallel line
+        const x1 = this.indexToX(d.i1), x2 = this.indexToX(d.i2);
+        const y1 = this.priceToY(d.p1), y2 = this.priceToY(d.p2);
+        const offsetPrice = d.p2 - d.p1;
+        const y1b = this.priceToY(d.p1 + offsetPrice);
+        const y2b = this.priceToY(d.p2 + offsetPrice);
+        return this._distToSeg(x, y, x1, y1, x2, y2) < tol
+            || this._distToSeg(x, y, x1, y1b, x2, y2b) < tol;
+      }
+      case 'band':
       case 'hline': {
-        const yy = this.priceToY(d.price);
-        return Math.abs(y - yy) < tol && x >= this.chartLeft && x <= this.chartRight;
+        const y1 = this.priceToY(d.type === 'hline' ? d.price : d.p1);
+        const y2 = d.type === 'hline' ? y1 : this.priceToY(d.p2);
+        const yTop = Math.min(y1, y2), yBot = Math.max(y1, y2);
+        return ((Math.abs(y - yTop) < tol || Math.abs(y - yBot) < tol) ||
+                (y >= yTop && y <= yBot)) && x >= this.chartLeft && x <= this.chartRight;
       }
       case 'vline': {
         const xx = this.indexToX(d.index);
@@ -1925,6 +2269,23 @@ class TradingChart {
         const rw = Math.abs(x2 - x1), rh = Math.abs(y2 - y1);
         return (Math.abs(y - ry) < tol || Math.abs(y - (ry + rh)) < tol) && x >= rx && x <= rx + rw
             || (Math.abs(x - rx) < tol || Math.abs(x - (rx + rw)) < tol) && y >= ry && y <= ry + rh;
+      }
+      case 'brush':
+      case 'poly': {
+        if (!d.points || d.points.length < 2) return false;
+        for (let i = 1; i < d.points.length; i++) {
+          const p1 = d.points[i-1], p2 = d.points[i];
+          const x1 = this.indexToX(p1.i), y1 = this.priceToY(p1.p);
+          const x2 = this.indexToX(p2.i), y2 = this.priceToY(p2.p);
+          if (this._distToSeg(x, y, x1, y1, x2, y2) < tol) return true;
+        }
+        return false;
+      }
+      case 'text': {
+        const x1 = this.indexToX(d.i), y1 = this.priceToY(d.p);
+        ctx.font = '12px -apple-system, Segoe UI, Roboto, sans-serif';
+        const tw = this.ctx.measureText(d.text).width + 8;
+        return x >= x1 - 2 && x <= x1 + tw && y >= y1 - 16 && y <= y1 + 2;
       }
     }
     return false;
@@ -2190,7 +2551,7 @@ class TradingChart {
       x += gap;
       x = this.drawButton({id:'ind', action:'indicator', x, y, w:36, h, label:'Ind', icon:'plus'});
       x += gap;
-      const toolShort = {cursor:'↖', trend:'╱', hline:'─', vline:'│', rect:'▭', fib:'Fib', brush:'~', eraser:'✕'}[this.activeTool] || '↖';
+      const toolShort = TOOL_SHORTCUTS[this.activeTool] || '↖';
       x = this.drawButton({id:'tool', action:'tool', x, y, w:38, h, label:toolShort, icon:'caret'});
       x += gap;
       x = this.drawButton({id:'reset', action:'reset', x, y, w:36, h, label:'Rst', icon:null});
@@ -2317,7 +2678,7 @@ class TradingChart {
     ctx.textAlign = 'right';
     ctx.fillStyle = THEME.textDim;
     if (isMobile) {
-      const toolShort = {cursor:'↖', trend:'╱', hline:'─', vline:'│', rect:'▭', fib:'Fib', brush:'~', eraser:'✕'}[this.activeTool] || '↖';
+      const toolShort = TOOL_SHORTCUTS[this.activeTool] || '↖';
       ctx.fillText(toolShort, this.W - 6, y + this.layout.statusH / 2);
     } else {
       const toolTxt = 'Tool: ' + DRAW_TOOLS.find(t => t.id === this.activeTool).label;
