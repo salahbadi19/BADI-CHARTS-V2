@@ -1,10 +1,10 @@
-# CanvasKlines
+# BADI-CHARTS-V2
 
 > **A lightweight, dependency-free candlestick charting library built entirely with the HTML5 Canvas API.**
 >
-> Pixel-perfect rendering, 14 drawing tools, 10 indicators, mobile-responsive, no fake data — you bring the data, CanvasKlines renders it.
+> Pixel-perfect rendering, 14 drawing tools, 10 indicators, mobile-responsive, no fake data — you bring the data, BADI-CHARTS-V2 renders it.
 
-[![Version](https://img.shields.io/badge/version-1.0.0-2962ff.svg)](https://github.com/your-username/canvasklines)
+[![Version](https://img.shields.io/badge/version-1.0.0-2962ff.svg)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-26a69a.svg)](LICENSE)
 [![No Dependencies](https://img.shields.io/badge/dependencies-zero-ff9800.svg)](#)
 
@@ -30,19 +30,19 @@
 ```html
 <script src="chart.js"></script>
 <script>
-  const chart = new CanvasKlines(canvas, { /* options */ });
+  const chart = new BadiCharts(canvas, { /* options */ });
 </script>
 ```
 
-### Option 2: npm (coming soon)
+### Option 2: npm
 
 ```bash
-npm install canvasklines
+npm install badi-charts-v2
 ```
 
 ```js
-import CanvasKlines from 'canvasklines';
-const chart = new CanvasKlines(canvas, { /* options */ });
+import BadiCharts from 'badi-charts-v2';
+const chart = new BadiCharts(canvas, { /* options */ });
 ```
 
 ## 🚀 Quick Start
@@ -59,7 +59,7 @@ const chart = new CanvasKlines(canvas, { /* options */ });
   <script src="chart.js"></script>
   <script>
     const canvas = document.getElementById('chart');
-    const chart = new CanvasKlines(canvas, {
+    const chart = new BadiCharts(canvas, {
       symbol:    { label: 'BTCUSDT', priceScale: 100, decimals: 2 },
       timeframe: { label: '1H', ms: 60 * 60 * 1000 },
       indicators: ['ma20', 'ma50', 'volsma']
@@ -83,7 +83,7 @@ const chart = new CanvasKlines(canvas, { /* options */ });
 ### Constructor
 
 ```js
-const chart = new CanvasKlines(canvas, options);
+const chart = new BadiCharts(canvas, options);
 ```
 
 **Options:**
@@ -200,7 +200,7 @@ See `demo.html` for a complete working example fetching real data from Binance R
 
 ## 🏗️ Architecture
 
-CanvasKlines is built as a single IIFE-wrapped file (`chart.js`) exposing the `CanvasKlines` constructor globally. Key components:
+BADI-CHARTS-V2 is built as a single IIFE-wrapped file (`chart.js`) exposing the `BadiCharts` constructor globally. Key components:
 
 - **`DataLayer`** — Passive data store (no fake data generation)
 - **`PriceScale`** — LWC-compatible price axis with `PriceTickMarkBuilder`
@@ -233,14 +233,16 @@ Apache License 2.0 — see [LICENSE](LICENSE) for details.
 ## 📊 File Structure
 
 ```
-canvasklines/
+badi-charts-v2/
 ├── chart.js           # Main library (2800+ lines, no dependencies)
 ├── demo.html          # Working demo with real Binance data
 ├── index.html         # Minimal empty-chart example
 ├── standalone.html    # Compact standalone usage
-└── README.md          # This file
+├── README.md          # This file
+├── package.json       # npm package config
+└── LICENSE            # Apache-2.0
 ```
 
 ---
 
-**CanvasKlines** — Built with ❤️ for the trading community.
+**BADI-CHARTS-V2** — Built for the trading community.

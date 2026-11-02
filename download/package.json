@@ -1,5 +1,5 @@
 {
-  "name": "canvasklines",
+  "name": "badi-charts-v2",
   "version": "1.0.0",
   "description": "A lightweight, dependency-free candlestick charting library built entirely with the HTML5 Canvas API. Pixel-perfect rendering, 14 drawing tools, 10 indicators, mobile-responsive, no fake data.",
   "main": "chart.js",
@@ -10,6 +10,8 @@
     "demo": "open http://localhost:8080/demo.html"
   },
   "keywords": [
+    "badi-charts",
+    "badi",
     "chart",
     "charts",
     "candlestick",
@@ -27,14 +29,6 @@
   ],
   "author": "",
   "license": "Apache-2.0",
-  "homepage": "https://github.com/your-username/canvasklines",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/your-username/canvasklines.git"
-  },
-  "bugs": {
-    "url": "https://github.com/your-username/canvasklines/issues"
-  },
   "files": [
     "chart.js",
     "README.md",

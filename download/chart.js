@@ -1,5 +1,5 @@
 /* =============================================================================
- * CanvasKlines v1.0.0 — Pixel-Perfect Pure JavaScript Trading Chart Library
+ * BADI-CHARTS-V2 v1.0.0 — Pixel-Perfect Pure JavaScript Trading Chart Library
  *
  * A lightweight, dependency-free candlestick charting library built entirely
  * with the HTML5 Canvas API. Inspired by TradingView Lightweight Charts.
@@ -23,7 +23,6 @@
  *   - Coordinate transforms      — internalHeight + scaleMargins
  *   - HiDPI rendering            — bitmap vs media coordinates
  *
- * GitHub: https://github.com/your-username/canvasklines
  * License: Apache-2.0
  * ============================================================================= */
 
@@ -2800,11 +2799,11 @@ class TradingChart {
 }
 
 /* ============================ LIBRARY EXPORT =============================== */
-// CanvasKlines — expose the chart as a global so users can create instances
+// BADI-CHARTS-V2 — expose the chart as a global so users can create instances
 // with their own data.
 //
 // Usage (browser, standalone):
-//   const chart = new CanvasKlines(canvas, {
+//   const chart = new BadiCharts(canvas, {
 //     symbol:    { label:'BTCUSDT', priceScale:100, decimals:2 },
 //     timeframe: { label:'1H', ms:60*60*1000 },
 //     indicators: ['ma20','ma50','volsma']  // optional
@@ -2813,15 +2812,16 @@ class TradingChart {
 //   chart.start();
 //
 // Usage (ES module / npm):
-//   import CanvasKlines from 'canvasklines';
-//   const chart = new CanvasKlines(canvas, opts);
+//   import BadiCharts from 'badi-charts-v2';
+//   const chart = new BadiCharts(canvas, opts);
 
 // Global alias (preferred)
+window.BadiCharts = TradingChart;
+// Backward-compatible aliases
 window.CanvasKlines = TradingChart;
-// Backward-compatible alias
 window.TradingChart = TradingChart;
 // Expose version and helpers
-window.CanvasKlines.version = VERSION;
+window.BadiCharts.version = VERSION;
 window.THEME = THEME;
 window.INDICATOR_LIST = INDICATOR_LIST;
 window.DRAW_TOOLS = DRAW_TOOLS;
@@ -2834,7 +2834,7 @@ window.PriceScale = PriceScale;
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = TradingChart;
   module.exports.default = TradingChart;
-  module.exports.CanvasKlines = TradingChart;
+  module.exports.BadiCharts = TradingChart;
   module.exports.VERSION = VERSION;
 }
 if (typeof define === 'function' && define.amd) {

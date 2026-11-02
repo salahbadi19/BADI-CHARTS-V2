@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
 <meta name="theme-color" content="#0e1015">
-<title>CanvasKlines — Pure JS Canvas Chart Library</title>
+<title>BADI-CHARTS-V2 — Pure JS Canvas Chart Library</title>
 <style>
   body { margin:0; background:#0e1015; overflow:hidden; font-family:-apple-system,Segoe UI,Roboto,sans-serif; }
   #chart { display:block; }
@@ -15,13 +15,13 @@
     text-align:center;
   }
   #hint code { color:#26a69a; background:#0e1015; padding:2px 6px; border-radius:3px; font-size:12px; }
-  #hint h1 { margin:0 0 8px 0; font-size:18px; color:#f0f3fa; }
+  #hint h1 { margin:0 0 8px 0; font-size:20px; color:#f0f3fa; letter-spacing:1px; }
 </style>
 </head>
 <body>
 <canvas id="chart"></canvas>
 <div id="hint">
-  <h1>CanvasKlines</h1>
+  <h1>BADI-CHARTS-V2</h1>
   Chart engine loaded. Provide your data to start.<br>
   See <code>demo.html</code> for a working example with real Binance data.<br>
   <small style="color:#787b86">Minimal usage: <code>chart.setData(candles)</code></small>
@@ -35,7 +35,7 @@
 document.body.style.background = '#0e1015';
 const canvas = document.getElementById('chart');
 canvas.style.cursor = 'crosshair';
-const chart = new CanvasKlines(canvas, {
+const chart = new BadiCharts(canvas, {
   symbol:    { label:'YOUR_SYMBOL', priceScale:100, decimals:2 },
   timeframe: { label:'1H', ms:60*60*1000 },
   indicators: []
