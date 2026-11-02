@@ -124,6 +124,63 @@ chart.start();       // Start the render loop (requestAnimationFrame)
 chart.onCrosshair(cb);  // Subscribe to crosshair updates
 ```
 
+### Indicator Cards (TradingView-style)
+
+Each active indicator appears as a **card** in the chart legend with its current value. Click a card to reveal 4 default icons:
+
+| Icon | Action |
+|---|---|
+| 👁 (eye) | Toggle visibility (hide/show) |
+| ✏️ (pencil) | Open code editor (calls `onEdit` callback) |
+| ⚙️ (gear) | Open settings card popup |
+| ✕ (delete) | Remove the indicator |
+
+### Indicator API (Advanced)
+
+```js
+// Add indicator with custom config
+chart.addIndicator('ma20', {
+  settings: { period: 20, color: '#2962ff' },  // override defaults
+  icons: ['hide', 'settings', 'delete'],        // customize which icons show
+  onSettings: function(settings) {              // called when settings change
+    console.log('MA20 settings:', settings);
+  },
+  onEdit: function(state) {                     // called when edit icon clicked
+    console.log('Edit MA20');
+  }
+});
+
+// Add a custom icon (e.g., alert button)
+chart.addIndicatorIcon('ma20', {
+  id: 'alert',
+  label: 'Set Alert',
+  icon: '🔔',                                    // emoji or short text
+  onClick: function(indId, state) {
+    alert('Alert set for ' + indId);
+  }
+});
+
+// Programmatic control
+chart.setIndicatorVisible('ma20', false);   // hide
+chart.setIndicatorVisible('ma20', true);    // show
+chart.isIndicatorVisible('ma20');           // check visibility
+chart.setIndicatorSettings('ma20', { period: 50 });  // update settings
+chart.getIndicatorSettings('ma20');         // read settings
+chart.openIndicatorSettings('ma20');        // open settings popup
+chart.openIndicatorEditor('ma20');          // trigger edit callback
+chart.removeIndicator('ma20');              // remove
+```
+
+### Settings Card (User-Customizable)
+
+When the user clicks the ⚙️ icon, a settings popup appears with fields auto-generated from the indicator's `settings` object:
+
+- **Number fields** (period, mult, fast, slow, signal, bins) — click to edit via prompt
+- **Color field** — click to cycle through preset colors
+- **Save / Cancel** buttons
+
+The `onSettings(settings)` callback is invoked when the user saves, so you can persist changes or trigger custom logic.
+
 ### Available Indicators
 
 | ID | Label | Type |

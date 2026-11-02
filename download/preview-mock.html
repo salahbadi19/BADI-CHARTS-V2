@@ -83,6 +83,25 @@
   const candles = genMockCandles(800, 67500, 0.012);
   chart.setData(candles);
 
+  // 3b. Add a custom icon (alert 🔔) to MA20 to showcase the custom-icon API
+  chart.addIndicatorIcon('ma20', {
+    id: 'alert',
+    label: 'Set Alert',
+    icon: '🔔',
+    onClick: function(indId, state) {
+      chart.showToast('Alert set for ' + indId + ' at period ' + state.settings.period);
+    }
+  });
+  // Add onEdit callback to MA50 to showcase the editor API
+  chart.addIndicator('ma50', {
+    onEdit: function(state) {
+      chart.showToast('Custom editor opened for MA50 (period ' + state.settings.period + ')');
+    },
+    onSettings: function(settings) {
+      chart.showToast('MA50 settings changed: period=' + settings.period);
+    }
+  });
+
   // 4. Start the render loop
   chart.start();
 

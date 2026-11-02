@@ -771,6 +771,19 @@ class TradingChart {
     // Indicators — empty by default, user adds via addIndicator()
     this.activeIndicators = new Set(opts.indicators || []);
     this.indCache = {};
+    // Per-indicator state: { visible, settings, customIcons, onSettings, onEdit }
+    // Each active indicator gets a state entry on addIndicator().
+    this.indicatorStates = new Map();
+    // Initialize states for indicators passed in constructor options
+    for (const id of this.activeIndicators) {
+      this.indicatorStates.set(id, this._defaultIndicatorState(id));
+    }
+    // Active indicator card (which card's icons are currently shown expanded)
+    this.activeIndicatorCard = null;
+    // Settings card popup state
+    this.settingsCard = null; // {id, x, y, w, h, fields, onSave}
+    // Icon hit-test registry (rebuilt each frame in drawLegend)
+    this._iconHits = [];
 
     // UI
     this.buttons = [];
@@ -833,9 +846,45 @@ class TradingChart {
     this.computeIndicators();
     this.resetView();
   }
-  // Add an indicator by id (e.g. 'ma20', 'rsi', 'macd', 'vprof', ...)
-  addIndicator(id) {
+  // Default state for an indicator (visible, default settings, default icons)
+  _defaultIndicatorState(id) {
+    const meta = INDICATOR_LIST.find(i => i.id === id);
+    const defaults = {
+      ma20:  {period: 20,  color: THEME.ma1},
+      ma50:  {period: 50,  color: THEME.ma2},
+      ma200: {period: 200, color: THEME.ma3},
+      ema20: {period: 20,  color: THEME.ma1},
+      ema50: {period: 50,  color: THEME.ma2},
+      bb:    {period: 20,  mult: 2, color: THEME.bollingerMid},
+      volsma:{period: 20,  color: THEME.ma2},
+      rsi:   {period: 14,  color: THEME.rsi},
+      macd:  {fast: 12, slow: 26, signal: 9, color: THEME.macd},
+      vprof: {bins: 24, color: THEME.ma1}
+    };
+    return {
+      visible: true,
+      settings: defaults[id] || {},
+      // Default 4 icons (TradingView-style): hide/show, edit, settings, delete
+      icons: ['hide', 'edit', 'settings', 'delete'],
+      // Custom icons added by user (array of {id, label, icon, onClick})
+      customIcons: [],
+      // Callbacks
+      onSettings: null,  // function(settings) — called when settings change
+      onEdit: null       // function() — called when edit/code button clicked
+    };
+  }
+  // Add an indicator by id with optional config
+  // config: { settings, icons, customIcons, onSettings, onEdit }
+  addIndicator(id, config) {
+    config = config || {};
     this.activeIndicators.add(id);
+    const state = this._defaultIndicatorState(id);
+    if (config.settings) state.settings = Object.assign({}, state.settings, config.settings);
+    if (config.icons) state.icons = config.icons.slice();
+    if (config.customIcons) state.customIcons = config.customIcons.slice();
+    if (config.onSettings) state.onSettings = config.onSettings;
+    if (config.onEdit) state.onEdit = config.onEdit;
+    this.indicatorStates.set(id, state);
     this.updateLayout();
     this.computeIndicators();
     this.autoScale();
@@ -843,9 +892,59 @@ class TradingChart {
   // Remove an indicator by id
   removeIndicator(id) {
     this.activeIndicators.delete(id);
+    this.indicatorStates.delete(id);
+    if (this.activeIndicatorCard === id) this.activeIndicatorCard = null;
+    if (this.settingsCard && this.settingsCard.id === id) this.settingsCard = null;
     this.updateLayout();
     this.computeIndicators();
     this.autoScale();
+  }
+  // Toggle indicator visibility
+  setIndicatorVisible(id, visible) {
+    const s = this.indicatorStates.get(id);
+    if (s) { s.visible = visible; }
+  }
+  isIndicatorVisible(id) {
+    const s = this.indicatorStates.get(id);
+    return s ? s.visible : true;
+  }
+  // Update indicator settings (calls onSettings callback if set)
+  setIndicatorSettings(id, settings) {
+    const s = this.indicatorStates.get(id);
+    if (s) {
+      s.settings = Object.assign({}, s.settings, settings);
+      this.computeIndicators();
+      this.autoScale();
+      if (s.onSettings) s.onSettings(s.settings);
+    }
+  }
+  // Get indicator settings
+  getIndicatorSettings(id) {
+    const s = this.indicatorStates.get(id);
+    return s ? Object.assign({}, s.settings) : {};
+  }
+  // Add a custom icon to an indicator
+  // icon: {id, label, icon (string/emoji), onClick (function)}
+  addIndicatorIcon(id, icon) {
+    const s = this.indicatorStates.get(id);
+    if (s && icon && icon.id) {
+      // Replace if exists, else add
+      const idx = s.customIcons.findIndex(c => c.id === icon.id);
+      if (idx >= 0) s.customIcons[idx] = icon;
+      else s.customIcons.push(icon);
+    }
+  }
+  // Open the settings card programmatically for an indicator
+  openIndicatorSettings(id) {
+    const s = this.indicatorStates.get(id);
+    if (!s) return;
+    this._openSettingsCard(id, s);
+  }
+  // Open the code editor callback for an indicator
+  openIndicatorEditor(id) {
+    const s = this.indicatorStates.get(id);
+    if (s && s.onEdit) s.onEdit();
+    else this.showToast('No editor for ' + id);
   }
   // Add a drawing programmatically
   addDrawing(drawing) {
@@ -1074,6 +1173,8 @@ class TradingChart {
     this.mouseY = y;
     this.mouseInside = true;
     this.hoverButton = this.hitButton(x, y);
+    // Check icon hover
+    this.hoverIcon = this._hitIcon(x, y);
 
     if (this.isDragging && this.activeTool === 'cursor') {
       const dx = x - this.dragStartX;
@@ -1093,10 +1194,144 @@ class TradingChart {
     }
   }
 
+  // Hit-test for indicator icons (returns {indId, iconId} or null)
+  _hitIcon(x, y) {
+    for (const h of this._iconHits) {
+      if (h.type === 'icon' && x >= h.x && x <= h.x + h.w && y >= h.y && y <= h.y + h.h) {
+        return {indId: h.indId, iconId: h.iconId};
+      }
+    }
+    return null;
+  }
+  // Hit-test for indicator cards (returns indicator id or null)
+  _hitCard(x, y) {
+    for (const h of this._iconHits) {
+      if (h.type === 'card' && x >= h.x && x <= h.x + h.w && y >= h.y && y <= h.y + h.h) {
+        return h.id;
+      }
+    }
+    return null;
+  }
+  // Hit-test for settings card elements
+  _hitSettingsCard(x, y) {
+    if (!this.settingsCard) return null;
+    const sc = this.settingsCard;
+    // Close button (X)
+    if (x >= sc.x + sc.w - 22 && x <= sc.x + sc.w - 6 && y >= sc.y + 8 && y <= sc.y + 22) {
+      return {action: 'close'};
+    }
+    // Cancel button
+    const btnY = sc.y + sc.h - 32;
+    if (x >= sc.x + 10 && x <= sc.x + 90 && y >= btnY && y <= btnY + 24) {
+      return {action: 'cancel'};
+    }
+    // Save button
+    if (x >= sc.x + sc.w - 90 && x <= sc.x + sc.w - 10 && y >= btnY && y <= btnY + 24) {
+      return {action: 'save'};
+    }
+    // Field input boxes
+    let fy = sc.y + 36;
+    for (let i = 0; i < sc.fields.length; i++) {
+      const ix = sc.x + 90, iw = sc.w - 100, ih = 20;
+      if (x >= ix && x <= ix + iw && y >= fy && y <= fy + ih) {
+        return {action: 'field', index: i};
+      }
+      fy += 30;
+    }
+    // Inside card but not on a control
+    if (x >= sc.x && x <= sc.x + sc.w && y >= sc.y && y <= sc.y + sc.h) {
+      return {action: 'inside'};
+    }
+    return null;
+  }
+
+  // Handle a click on an indicator icon
+  _handleIconClick(indId, iconId) {
+    const state = this.indicatorStates.get(indId);
+    if (!state) return;
+    // Check custom icons first
+    const custom = state.customIcons.find(c => c.id === iconId);
+    if (custom) {
+      if (custom.onClick) custom.onClick(indId, state);
+      return;
+    }
+    // Default icons
+    switch (iconId) {
+      case 'hide':
+        state.visible = !state.visible;
+        this.showToast(state.visible ? 'Showed ' + indId : 'Hid ' + indId);
+        break;
+      case 'edit':
+        if (state.onEdit) state.onEdit(state);
+        else this.showToast('Editor for ' + indId);
+        break;
+      case 'settings':
+        this._openSettingsCard(indId, state);
+        break;
+      case 'delete':
+        this.removeIndicator(indId);
+        this.showToast('Removed ' + indId);
+        break;
+    }
+  }
+
   onMouseDown(e) {
     const r = this.canvas.getBoundingClientRect();
     const x = e.clientX - r.left;
     const y = e.clientY - r.top;
+
+    // 1. Check settings card first (topmost overlay)
+    const scHit = this._hitSettingsCard(x, y);
+    if (scHit) {
+      if (scHit.action === 'close' || scHit.action === 'cancel') {
+        this.settingsCard = null;
+      } else if (scHit.action === 'save') {
+        // Apply draft values
+        const sc = this.settingsCard;
+        const newSettings = {};
+        for (const f of sc.fields) newSettings[f.key] = f.value;
+        this.setIndicatorSettings(sc.id, newSettings);
+        this.settingsCard = null;
+        this.showToast('Settings saved');
+      } else if (scHit.action === 'field') {
+        // Cycle field value via prompt (simple editor) — for number/color
+        const sc = this.settingsCard;
+        const f = sc.fields[scHit.index];
+        if (f.type === 'color') {
+          // Cycle through preset colors
+          const colors = ['#2962ff','#ff9800','#e91e63','#26a69a','#9c27b0','#ef5350','#7e57c2'];
+          const idx = colors.indexOf(f.value);
+          f.value = colors[(idx + 1) % colors.length];
+        } else {
+          // Prompt for new number value
+          const newVal = prompt(f.label + ' (current: ' + f.value + '):', String(f.value));
+          if (newVal !== null) {
+            const num = parseFloat(newVal);
+            if (!isNaN(num)) f.value = num;
+          }
+        }
+      }
+      return;
+    }
+    // Click outside settings card closes it
+    if (this.settingsCard) {
+      this.settingsCard = null;
+      return;
+    }
+
+    // 2. Check indicator icons
+    const iconHit = this._hitIcon(x, y);
+    if (iconHit) {
+      this._handleIconClick(iconHit.indId, iconHit.iconId);
+      return;
+    }
+    // 3. Check indicator cards (click to activate)
+    const cardHit = this._hitCard(x, y);
+    if (cardHit) {
+      this.activeIndicatorCard = this.activeIndicatorCard === cardHit ? null : cardHit;
+      return;
+    }
+
     const btn = this.hitButton(x, y);
     if (btn) { this.handleButtonClick(btn); return; }
     if (this.dropdown) {
@@ -1556,6 +1791,7 @@ class TradingChart {
     this.drawCurrentPriceLine();  // After axes so the price label sits ON TOP
     this.drawCrosshair();
     this.drawLegend();
+    this.drawSettingsCard();      // Settings popup (drawn last so it overlays everything)
     this.drawToolbar();
     this.drawStatusBar();
     this.drawDropdown();
@@ -1708,7 +1944,7 @@ class TradingChart {
     }
 
     // Vol SMA
-    if (this.activeIndicators.has('volsma') && this.indCache.volsma) {
+    if (this.activeIndicators.has('volsma') && this.isIndicatorVisible('volsma') && this.indCache.volsma) {
       const sma = this.indCache.volsma;
       ctx.strokeStyle = THEME.ma2;
       ctx.lineWidth = 1.4;
@@ -1744,7 +1980,7 @@ class TradingChart {
   // Computes volume distribution by price level over visible candles,
   // then draws horizontal bars from the right side of the chart going left.
   drawVolumeProfile() {
-    if (!this.activeIndicators.has('vprof')) return;
+    if (!this.activeIndicators.has('vprof') || !this.isIndicatorVisible('vprof')) return;
     const ctx = this.ctx;
     const firstIdx = Math.max(0, Math.floor(this.xToIndex(this.chartLeft)));
     const lastIdx = Math.min(this.sim.candles.length - 1, Math.ceil(this.xToIndex(this.chartRight)));
@@ -1843,12 +2079,12 @@ class TradingChart {
       }
       ctx.stroke();
     };
-    if (this.activeIndicators.has('ma20'))  drawLine(this.indCache.ma20,  THEME.ma1);
-    if (this.activeIndicators.has('ma50'))  drawLine(this.indCache.ma50,  THEME.ma2);
-    if (this.activeIndicators.has('ma200')) drawLine(this.indCache.ma200, THEME.ma3);
-    if (this.activeIndicators.has('ema20')) drawLine(this.indCache.ema20, THEME.ma1, 1.6);
-    if (this.activeIndicators.has('ema50')) drawLine(this.indCache.ema50, THEME.ma2, 1.6);
-    if (this.activeIndicators.has('bb') && this.indCache.bb) {
+    if (this.activeIndicators.has('ma20') && this.isIndicatorVisible('ma20'))  drawLine(this.indCache.ma20,  THEME.ma1);
+    if (this.activeIndicators.has('ma50') && this.isIndicatorVisible('ma50'))  drawLine(this.indCache.ma50,  THEME.ma2);
+    if (this.activeIndicators.has('ma200') && this.isIndicatorVisible('ma200')) drawLine(this.indCache.ma200, THEME.ma3);
+    if (this.activeIndicators.has('ema20') && this.isIndicatorVisible('ema20')) drawLine(this.indCache.ema20, THEME.ma1, 1.6);
+    if (this.activeIndicators.has('ema50') && this.isIndicatorVisible('ema50')) drawLine(this.indCache.ema50, THEME.ma2, 1.6);
+    if (this.activeIndicators.has('bb') && this.isIndicatorVisible('bb') && this.indCache.bb) {
       const bb = this.indCache.bb;
       ctx.fillStyle = THEME.bollingerBand;
       ctx.beginPath();
@@ -1901,7 +2137,7 @@ class TradingChart {
     ctx.rect(left, top, right - left, bot - top);
     ctx.clip();
 
-    if (this.activeIndicators.has('rsi') && this.indCache.rsi) {
+    if (this.activeIndicators.has('rsi') && this.isIndicatorVisible('rsi') && this.indCache.rsi) {
       const rsi = this.indCache.rsi;
       // 30/70 dashed lines
       ctx.setLineDash([3, 3]);
@@ -1925,7 +2161,7 @@ class TradingChart {
         if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
       }
       ctx.stroke();
-    } else if (this.activeIndicators.has('macd') && this.indCache.macd) {
+    } else if (this.activeIndicators.has('macd') && this.isIndicatorVisible('macd') && this.indCache.macd) {
       const macd = this.indCache.macd;
       const midY = (top + bot) / 2;
       // Zero line
@@ -2546,32 +2782,306 @@ class TradingChart {
     ctx.fillStyle = isBull ? THEME.bull : THEME.bear;
     ctx.fillText(changeTxt, x, y);
 
-    // Indicator values second line (desktop only)
+    // Indicator cards (second line) — TradingView-style with icons
     if (isMobile) return;
-    let x2 = this.chartLeft + 6, y2 = y + 18;
-    const drawInd = (label, val, color) => {
-      ctx.fillStyle = color;
-      ctx.fillText(label, x2, y2);
-      x2 += ctx.measureText(label).width + 4;
-      ctx.fillStyle = THEME.text;
-      ctx.fillText(val, x2, y2);
-      x2 += ctx.measureText(val).width + 14;
-    };
-    if (this.activeIndicators.has('ma20') && this.indCache.ma20 && this.indCache.ma20[idx] !== null)
-      drawInd('MA20:', this.priceScale.formatLogical(this.indCache.ma20[idx]), THEME.ma1);
-    if (this.activeIndicators.has('ma50') && this.indCache.ma50 && this.indCache.ma50[idx] !== null)
-      drawInd('MA50:', this.priceScale.formatLogical(this.indCache.ma50[idx]), THEME.ma2);
-    if (this.activeIndicators.has('ma200') && this.indCache.ma200 && this.indCache.ma200[idx] !== null)
-      drawInd('MA200:', this.priceScale.formatLogical(this.indCache.ma200[idx]), THEME.ma3);
-    if (this.activeIndicators.has('ema20') && this.indCache.ema20 && this.indCache.ema20[idx] !== null)
-      drawInd('EMA20:', this.priceScale.formatLogical(this.indCache.ema20[idx]), THEME.ma1);
-    if (this.activeIndicators.has('ema50') && this.indCache.ema50 && this.indCache.ema50[idx] !== null)
-      drawInd('EMA50:', this.priceScale.formatLogical(this.indCache.ema50[idx]), THEME.ma2);
-    if (this.activeIndicators.has('bb') && this.indCache.bb && this.indCache.bb.mid[idx] !== null) {
-      drawInd('BB(20,2):', this.priceScale.formatLogical(this.indCache.bb.mid[idx]), THEME.bollingerMid);
-      drawInd('U:', this.priceScale.formatLogical(this.indCache.bb.upper[idx]), THEME.ma3);
-      drawInd('L:', this.priceScale.formatLogical(this.indCache.bb.lower[idx]), THEME.ma3);
+    this._iconHits = []; // reset icon hit registry
+    let cx = this.chartLeft + 6;
+    const cy = y + 18;
+    const activeIds = Array.from(this.activeIndicators);
+    for (const id of activeIds) {
+      const state = this.indicatorStates.get(id) || {visible: true, settings: {}, icons: ['hide','edit','settings','delete'], customIcons: []};
+      const meta = INDICATOR_LIST.find(i => i.id === id);
+      if (!meta) continue;
+      // Get current value for this indicator at idx
+      const val = this._getIndicatorValueAt(id, idx);
+      const cardW = this._drawIndicatorCard(cx, cy, id, meta, state, val);
+      cx += cardW + 8;
+      if (cx > this.chartRight - 100) break; // stop if no room
     }
+  }
+
+  // Get formatted value for an indicator at a given candle index
+  _getIndicatorValueAt(id, idx) {
+    if (id === 'ma20' && this.indCache.ma20 && this.indCache.ma20[idx] !== null)
+      return this.priceScale.formatLogical(this.indCache.ma20[idx]);
+    if (id === 'ma50' && this.indCache.ma50 && this.indCache.ma50[idx] !== null)
+      return this.priceScale.formatLogical(this.indCache.ma50[idx]);
+    if (id === 'ma200' && this.indCache.ma200 && this.indCache.ma200[idx] !== null)
+      return this.priceScale.formatLogical(this.indCache.ma200[idx]);
+    if (id === 'ema20' && this.indCache.ema20 && this.indCache.ema20[idx] !== null)
+      return this.priceScale.formatLogical(this.indCache.ema20[idx]);
+    if (id === 'ema50' && this.indCache.ema50 && this.indCache.ema50[idx] !== null)
+      return this.priceScale.formatLogical(this.indCache.ema50[idx]);
+    if (id === 'bb' && this.indCache.bb && this.indCache.bb.mid && this.indCache.bb.mid[idx] !== null)
+      return this.priceScale.formatLogical(this.indCache.bb.mid[idx]);
+    if (id === 'volsma' && this.indCache.volsma && this.indCache.volsma[idx] !== null)
+      return this._fmtVol(this.indCache.volsma[idx]);
+    if (id === 'rsi' && this.indCache.rsi && this.indCache.rsi[idx] !== null)
+      return this.indCache.rsi[idx].toFixed(2);
+    if (id === 'macd' && this.indCache.macd && this.indCache.macd.macd && this.indCache.macd.macd[idx] !== null)
+      return this.indCache.macd.macd[idx].toFixed(3);
+    if (id === 'vprof') return 'VP';
+    return '—';
+  }
+
+  // Draw a single indicator card with label + value + icons
+  // Returns the card width
+  _drawIndicatorCard(x, y, id, meta, state, val) {
+    const ctx = this.ctx;
+    const isActive = this.activeIndicatorCard === id;
+    const isVisible = state.visible !== false;
+    const color = meta.color;
+    ctx.font = '11px -apple-system, Segoe UI, Roboto, sans-serif';
+    ctx.textBaseline = 'top'; ctx.textAlign = 'left';
+    // Measure label + value
+    const labelTxt = meta.label + ':';
+    const labelW = ctx.measureText(labelTxt).width;
+    const valTxt = val || '';
+    const valW = ctx.measureText(valTxt).width;
+    // Icons: show only when active (hovered/selected) OR always show on desktop
+    const allIcons = state.icons.concat(state.customIcons.map(c => c.id));
+    const iconSize = 14;
+    const iconGap = 2;
+    let iconsW = 0;
+    if (isActive) {
+      iconsW = allIcons.length * (iconSize + iconGap);
+    }
+    const padX = 6;
+    const cardH = 18;
+    const cardW = padX + labelW + 4 + valW + padX + (isActive ? iconsW + 4 : 0);
+    // Background (subtle, only when active)
+    if (isActive) {
+      ctx.fillStyle = 'rgba(42,46,57,0.6)';
+      this._roundRect(x, y - 2, cardW, cardH + 2, 3);
+      ctx.fill();
+    }
+    // Label (colored)
+    ctx.fillStyle = isVisible ? color : THEME.textDim;
+    ctx.fillText(labelTxt, x + padX, y);
+    // Value
+    ctx.fillStyle = isVisible ? THEME.text : THEME.textDim;
+    ctx.fillText(valTxt, x + padX + labelW + 4, y);
+    // Icons (only when active)
+    if (isActive) {
+      let ix = x + padX + labelW + 4 + valW + 4;
+      for (const iconId of allIcons) {
+        const isCustom = state.customIcons.find(c => c.id === iconId);
+        this._drawIndicatorIcon(ix, y, iconId, iconSize, id, isCustom);
+        ix += iconSize + iconGap;
+      }
+    } else {
+      // Register the card area for hit-test (click to activate)
+      this._iconHits.push({type: 'card', id: id, x: x, y: y - 2, w: cardW, h: cardH + 2});
+    }
+    return cardW;
+  }
+
+  // Draw a single icon (default icons: hide/edit/settings/delete, or custom)
+  _drawIndicatorIcon(x, y, iconId, size, indId, custom) {
+    const ctx = this.ctx;
+    const cx = x + size / 2;
+    const cy = y + size / 2 - 1;
+    const state = this.indicatorStates.get(indId);
+    const isHover = this.hoverIcon && this.hoverIcon.indId === indId && this.hoverIcon.iconId === iconId;
+    // Hover background
+    if (isHover) {
+      ctx.fillStyle = 'rgba(255,255,255,0.1)';
+      this._roundRect(x, y - 1, size, size, 2);
+      ctx.fill();
+    }
+    ctx.strokeStyle = isHover ? THEME.textBright : THEME.textDim;
+    ctx.fillStyle = isHover ? THEME.textBright : THEME.textDim;
+    ctx.lineWidth = 1.2;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    if (custom && custom.icon) {
+      // Custom icon: draw as emoji/text
+      ctx.font = '10px -apple-system, Segoe UI, Roboto, sans-serif';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(custom.icon, cx, cy);
+      ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+    } else {
+      // Default icons drawn as simple SVG-like paths
+      switch (iconId) {
+        case 'hide': {
+          // Eye icon — open eye when visible, closed eye when hidden
+          if (state && state.visible !== false) {
+            // Open eye
+            ctx.beginPath();
+            ctx.arc(cx, cy, 3, 0, Math.PI * 2);
+            ctx.stroke();
+            ctx.beginPath();
+            ctx.ellipse(cx, cy, 4.5, 2.5, 0, 0, Math.PI * 2);
+            ctx.stroke();
+          } else {
+            // Closed eye (eye with line through)
+            ctx.beginPath();
+            ctx.ellipse(cx, cy, 4.5, 2.5, 0, 0, Math.PI * 2);
+            ctx.stroke();
+            ctx.beginPath();
+            ctx.moveTo(cx - 4, cy - 3);
+            ctx.lineTo(cx + 4, cy + 3);
+            ctx.stroke();
+          }
+          break;
+        }
+        case 'edit': {
+          // Pencil icon
+          ctx.beginPath();
+          ctx.moveTo(cx - 3, cy + 3);
+          ctx.lineTo(cx + 2, cy - 2);
+          ctx.lineTo(cx + 4, cy);
+          ctx.lineTo(cx - 1, cy + 5);
+          ctx.closePath();
+          ctx.stroke();
+          ctx.beginPath();
+          ctx.moveTo(cx - 3, cy + 3);
+          ctx.lineTo(cx - 4, cy + 4);
+          ctx.lineTo(cx - 1, cy + 5);
+          ctx.stroke();
+          break;
+        }
+        case 'settings': {
+          // Gear icon (simplified: circle + 4 small ticks)
+          ctx.beginPath();
+          ctx.arc(cx, cy, 2.5, 0, Math.PI * 2);
+          ctx.stroke();
+          for (let a = 0; a < 4; a++) {
+            const ang = a * Math.PI / 2;
+            ctx.beginPath();
+            ctx.moveTo(cx + Math.cos(ang) * 3.5, cy + Math.sin(ang) * 3.5);
+            ctx.lineTo(cx + Math.cos(ang) * 5, cy + Math.sin(ang) * 5);
+            ctx.stroke();
+          }
+          break;
+        }
+        case 'delete': {
+          // X icon
+          ctx.beginPath();
+          ctx.moveTo(cx - 3, cy - 3);
+          ctx.lineTo(cx + 3, cy + 3);
+          ctx.moveTo(cx + 3, cy - 3);
+          ctx.lineTo(cx - 3, cy + 3);
+          ctx.stroke();
+          break;
+        }
+      }
+    }
+    // Register icon for hit-test
+    this._iconHits.push({type: 'icon', indId: indId, iconId: iconId, x: x, y: y - 1, w: size, h: size});
+  }
+
+  // Open a settings card popup for an indicator
+  _openSettingsCard(id, state) {
+    // Build default fields based on indicator type
+    const meta = INDICATOR_LIST.find(i => i.id === id);
+    const fields = [];
+    const s = state.settings;
+    if (s.period !== undefined) fields.push({key: 'period', label: 'Period', type: 'number', value: s.period});
+    if (s.mult !== undefined) fields.push({key: 'mult', label: 'Std Dev Mult', type: 'number', value: s.mult});
+    if (s.fast !== undefined) fields.push({key: 'fast', label: 'Fast', type: 'number', value: s.fast});
+    if (s.slow !== undefined) fields.push({key: 'slow', label: 'Slow', type: 'number', value: s.slow});
+    if (s.signal !== undefined) fields.push({key: 'signal', label: 'Signal', type: 'number', value: s.signal});
+    if (s.bins !== undefined) fields.push({key: 'bins', label: 'Bins', type: 'number', value: s.bins});
+    if (s.color !== undefined) fields.push({key: 'color', label: 'Color', type: 'color', value: s.color});
+    // Allow user to override fields via onSettings callback returning custom fields
+    // (handled by user — here we just provide defaults)
+    const w = 220;
+    const h = 36 + fields.length * 30 + 40;
+    this.settingsCard = {
+      id: id,
+      x: this.chartLeft + 50,
+      y: this.chartTop + 50,
+      w: w,
+      h: h,
+      fields: fields,
+      title: meta ? meta.label : id,
+      // Editable field values (copied so user can cancel)
+      draft: Object.assign({}, s)
+    };
+  }
+
+  // Draw the settings card popup
+  drawSettingsCard() {
+    if (!this.settingsCard) return;
+    const ctx = this.ctx;
+    const sc = this.settingsCard;
+    // Backdrop overlay (semi-transparent) — clicking outside closes
+    ctx.fillStyle = 'rgba(0,0,0,0.3)';
+    ctx.fillRect(0, 0, this.W, this.H);
+    // Card background
+    ctx.fillStyle = THEME.panelBg;
+    this._roundRect(sc.x, sc.y, sc.w, sc.h, 6);
+    ctx.fill();
+    ctx.strokeStyle = THEME.toolbarBorder;
+    ctx.lineWidth = 1;
+    this._roundRect(sc.x + 0.5, sc.y + 0.5, sc.w - 1, sc.h - 1, 6);
+    ctx.stroke();
+    // Title bar
+    ctx.fillStyle = THEME.toolbarBg;
+    this._roundRect(sc.x, sc.y, sc.w, 28, 6);
+    // Only round top corners — redraw bottom of title bar as straight
+    ctx.fillRect(sc.x, sc.y + 20, sc.w, 8);
+    ctx.fill();
+    ctx.font = 'bold 12px -apple-system, Segoe UI, Roboto, sans-serif';
+    ctx.fillStyle = THEME.textBright;
+    ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+    ctx.fillText(sc.title + ' Settings', sc.x + 10, sc.y + 14);
+    // Close button (X)
+    ctx.strokeStyle = THEME.textDim;
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    ctx.moveTo(sc.x + sc.w - 18, sc.y + 10);
+    ctx.lineTo(sc.x + sc.w - 12, sc.y + 18);
+    ctx.moveTo(sc.x + sc.w - 12, sc.y + 10);
+    ctx.lineTo(sc.x + sc.w - 18, sc.y + 18);
+    ctx.stroke();
+    // Fields
+    let fy = sc.y + 36;
+    ctx.font = '11px -apple-system, Segoe UI, Roboto, sans-serif';
+    for (const f of sc.fields) {
+      ctx.fillStyle = THEME.text;
+      ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+      ctx.fillText(f.label, sc.x + 10, fy + 8);
+      // Input box
+      const ix = sc.x + 90, iy = fy, iw = sc.w - 100, ih = 20;
+      ctx.fillStyle = THEME.bg;
+      this._roundRect(ix, iy, iw, ih, 3);
+      ctx.fill();
+      ctx.strokeStyle = THEME.toolbarBorder;
+      this._roundRect(ix + 0.5, iy + 0.5, iw - 1, ih - 1, 3);
+      ctx.stroke();
+      // Value text
+      ctx.fillStyle = THEME.textBright;
+      ctx.textAlign = 'left';
+      const valStr = String(f.type === 'color' ? f.value : f.value);
+      ctx.fillText(valStr, ix + 6, iy + ih / 2);
+      if (f.type === 'color') {
+        // Color swatch
+        ctx.fillStyle = f.value;
+        ctx.fillRect(ix + iw - 20, iy + 3, 14, 14);
+      }
+      fy += 30;
+    }
+    // Save / Cancel buttons
+    const btnY = sc.y + sc.h - 32;
+    // Cancel
+    ctx.fillStyle = THEME.buttonBg;
+    this._roundRect(sc.x + 10, btnY, 80, 24, 3);
+    ctx.fill();
+    ctx.strokeStyle = THEME.toolbarBorder;
+    this._roundRect(sc.x + 10.5, btnY + 0.5, 79, 23, 3);
+    ctx.stroke();
+    ctx.fillStyle = THEME.text;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText('Cancel', sc.x + 50, btnY + 12);
+    // Save
+    ctx.fillStyle = THEME.accent;
+    this._roundRect(sc.x + sc.w - 90, btnY, 80, 24, 3);
+    ctx.fill();
+    ctx.fillStyle = THEME.textBright;
+    ctx.fillText('Save', sc.x + sc.w - 50, btnY + 12);
+    ctx.textAlign = 'left'; ctx.textBaseline = 'top';
   }
 
   /* --------------------------- Toolbar ----------------------------------- */
