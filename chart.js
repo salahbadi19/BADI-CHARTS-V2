@@ -731,7 +731,7 @@ class TradingChart {
     // Viewport — barSpacing in media coords (CSS pixels)
     this.barSpacing = 8;       // LWC default ~6, we use 8 for cleaner initial view
     this.minBarSpacing = 1.4;  // LWC default minimum
-    this.maxBarSpacing = 1e6;
+    this.maxBarSpacing = 80;   // reasonable max — prevents over-sized candles
     this.rightOffset = 4;      // bars of empty space on the right (LWC default ~4-5)
 
     // Price scales
@@ -1395,12 +1395,8 @@ class TradingChart {
     const x = e.clientX - r.left;
     if (!this.inChartArea(x, this.mouseY) && !this.inPriceAxis(x, this.mouseY)) return;
     const dir = e.deltaY < 0 ? 1 : -1;
-    // Adaptive zoom factor: faster zoom at large spacings, slower at small.
-    // This allows reaching very large candle sizes quickly.
-    // Base factor 1.15 (15% per tick), but scale up when barSpacing is already large.
-    const baseFactor = 1.15;
-    const accel = this.barSpacing > 50 ? 1.05 : 1.0; // accelerate when already zoomed in
-    const factor = dir > 0 ? baseFactor * accel : 1 / (baseFactor * accel);
+    // Reasonable zoom factor (10% per tick) — smooth, not too fast
+    const factor = dir > 0 ? 1.1 : 1/1.1;
     const oldSpacing = this.barSpacing;
     let newSpacing = clamp(oldSpacing * factor, this.minBarSpacing, this.maxBarSpacing);
     if (newSpacing === oldSpacing) return;
@@ -1437,8 +1433,8 @@ class TradingChart {
 
   onKeyDown(e) {
     if (e.key === 'r' || e.key === 'R') { this.resetView(); }
-    if (e.key === '+' || e.key === '=') this.zoomAtCenter(1.25);
-    if (e.key === '-' || e.key === '_') this.zoomAtCenter(1/1.25);
+    if (e.key === '+' || e.key === '=') this.zoomAtCenter(1.1);
+    if (e.key === '-' || e.key === '_') this.zoomAtCenter(1/1.1);
     if (e.key === 'Escape') { this.activeTool = 'cursor'; this.currentDrawing = null; this.dropdown = null; }
     if (e.key === 'Delete' || e.key === 'Backspace') {
       if (this.hoverDrawing) {
