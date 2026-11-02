@@ -1009,7 +1009,8 @@ class TradingChart {
     const paneTop = this.layout.toolbarH;
     const bottomStart = this.H - this.layout.statusH - this.layout.timeAxisH;
     const hasPane = this.activeIndicators.has('rsi') || this.activeIndicators.has('macd');
-    this.layout.paneH = hasPane ? (isMobile ? 80 : 100) : 0;
+    // Increased pane height so the indicator card + line are both clearly visible
+    this.layout.paneH = hasPane ? (isMobile ? 110 : 140) : 0;
 
     this.chartLeft = this.layout.leftPad;
     this.chartRight = this.W - this.layout.priceAxisW;
@@ -1585,8 +1586,9 @@ class TradingChart {
     }
 
     // Pane scale (RSI: 0-100, MACD: auto)
+    // Use larger top margin (0.18) to leave room for the indicator card at the top of the pane
     if (this.activeIndicators.has('rsi')) {
-      this.paneScale = new PriceScale({scaleMargins: {top: 0.1, bottom: 0.1}, base: 100});
+      this.paneScale = new PriceScale({scaleMargins: {top: 0.18, bottom: 0.1}, base: 100});
       this.paneScale.setHeight(this.paneBottom - this.paneTop);
       this.paneScale.setRange(0, 100);
       this.paneScale.setFormatter(new PriceFormatter(100, 1));
@@ -1604,7 +1606,7 @@ class TradingChart {
         }
         if (!isFinite(mMin)) { mMin = -1; mMax = 1; }
         const pad = (mMax - mMin) * 0.1;
-        this.paneScale = new PriceScale({scaleMargins: {top: 0.1, bottom: 0.1}, base: 1000});
+        this.paneScale = new PriceScale({scaleMargins: {top: 0.18, bottom: 0.1}, base: 1000});
         this.paneScale.setHeight(this.paneBottom - this.paneTop);
         this.paneScale.setRange(mMin - pad, mMax + pad);
         this.paneScale.setFormatter(new PriceFormatter(1000, 1));
@@ -2837,7 +2839,14 @@ class TradingChart {
       return this.indCache.rsi[idx].toFixed(2);
     if (id === 'macd' && this.indCache.macd && this.indCache.macd.macd && this.indCache.macd.macd[idx] !== null)
       return this.indCache.macd.macd[idx].toFixed(3);
-    if (id === 'vprof') return 'VP';
+    if (id === 'vprof') {
+      // Show POC price for Volume Profile
+      const firstIdx = Math.max(0, Math.floor(this.xToIndex(this.chartLeft)));
+      const lastIdx = Math.min(this.sim.candles.length - 1, Math.ceil(this.xToIndex(this.chartRight)));
+      const prof = Indicators.volumeProfile(this.sim.candles, firstIdx, lastIdx, 24);
+      if (prof) return 'POC ' + this.priceScale.formatLogical(prof.pocPrice);
+      return 'VP';
+    }
     return '—';
   }
 
@@ -2866,11 +2875,21 @@ class TradingChart {
     const padX = 6;
     const cardH = 18;
     const cardW = padX + labelW + 4 + valW + padX + (isActive ? iconsW + 4 : 0);
-    // Background (subtle, only when active)
-    if (isActive) {
-      ctx.fillStyle = 'rgba(42,46,57,0.6)';
-      this._roundRect(x, y - 2, cardW, cardH + 2, 3);
+    // Background: always show a solid background for pane cards (RSI/MACD) so they're
+    // readable over the indicator line. For main-legend cards, only show when active.
+    const isPaneCard = id === 'rsi' || id === 'macd';
+    if (isActive || isPaneCard) {
+      // Use solid panelBg for pane cards (fully opaque) so text is always readable
+      ctx.fillStyle = isActive ? 'rgba(42,46,57,0.95)' : (isPaneCard ? THEME.panelBg : 'rgba(19,23,34,0.85)');
+      this._roundRect(x, y - 3, cardW, cardH + 4, 3);
       ctx.fill();
+      // Subtle border for pane cards
+      if (isPaneCard && !isActive) {
+        ctx.strokeStyle = 'rgba(42,46,57,0.6)';
+        ctx.lineWidth = 1;
+        this._roundRect(x + 0.5, y - 2.5, cardW - 1, cardH + 3, 3);
+        ctx.stroke();
+      }
     }
     // Label (colored)
     ctx.fillStyle = isVisible ? color : THEME.textDim;
