@@ -4,8 +4,9 @@
 <meta charset="UTF-8">
 <title>Embed BADI-CHARTS-V2 in Any Page</title>
 <style>
-  body { margin: 0; font-family: Arial; background: #f0f0f0; padding: 20px; }
-  h1 { color: #333; }
+  body { margin: 0; font-family: Arial, sans-serif; background: #f0f0f0; padding: 20px; }
+  h1 { color: #333; margin-bottom: 8px; }
+  p { color: #666; margin-bottom: 16px; }
   .chart-container {
     width: 100%;
     height: 500px;
@@ -17,7 +18,7 @@
 </head>
 <body>
   <h1>My Page with BADI-CHARTS-V2</h1>
-  <p>Embed the chart anywhere on your page:</p>
+  <p>Embed the chart anywhere on your page — live BTC/USDT data from Binance:</p>
 
   <!-- Chart container -->
   <div class="chart-container">
@@ -27,17 +28,42 @@
   <!-- Load BADI-CHARTS-V2 from CDN -->
   <script src="https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@main/chart.js"></script>
   <script>
-    // Create an EMPTY chart (no indicators, no data)
+    // Create the chart with MA20 + MA50 indicators
     const chart = new BadiCharts(document.getElementById('myChart'), {
       symbol: { label: 'BTCUSDT', priceScale: 100, decimals: 2 },
       timeframe: { label: '1H', ms: 3600000 },
-      indicators: []  // empty — add later via chart.addIndicator('ma20')
+      indicators: ['ma20', 'ma50', 'volsma']
     });
-    chart.start();
 
-    // Feed your data:
-    // chart.setData([{time, open, high, low, close, volume}, ...]);
-    // chart.update(latestCandle);  // real-time
+    // Fetch REAL candles from Binance public API (no key needed)
+    fetch('https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=500')
+      .then(r => r.json())
+      .then(raw => raw.map(k => ({
+        time: Math.floor(k[0] / 1000),
+        open: +k[1], high: +k[2], low: +k[3], close: +k[4], volume: +k[5]
+      })))
+      .then(candles => {
+        chart.setData(candles);
+        chart.start();
+        console.log('Loaded ' + candles.length + ' candles');
+      })
+      .catch(err => {
+        console.error('Failed to load:', err);
+        chart.start();
+      });
+
+    // Optional: live updates via WebSocket
+    /*
+    const ws = new WebSocket('wss://stream.binance.com:9443/ws/btcusdt@kline_1h');
+    ws.onmessage = (ev) => {
+      const k = JSON.parse(ev.data).k;
+      if (!k) return;
+      chart.update({
+        time: Math.floor(k.t / 1000),
+        open: +k.o, high: +k.h, low: +k.l, close: +k.c, volume: +k.v
+      });
+    };
+    */
   </script>
 </body>
 </html>
