@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#0e1015">
+<title>BADI-CHARTS-V2 — Full Preview (Mock Data)</title>
+<style>
+  body { margin:0; background:#0e1015; overflow:hidden; font-family:-apple-system,Segoe UI,Roboto,sans-serif; }
+  #chart { display:block; }
+</style>
+</head>
+<body>
+<canvas id="chart"></canvas>
+
+<!-- Load the BADI-CHARTS-V2 library -->
+<script src="chart.js"></script>
+
+<script>
+/* =============================================================================
+ * BADI-CHARTS-V2 — Full Preview with Mock Data
+ *
+ * This file generates fake candles (similar to the original demo) so you can
+ * preview every feature of the library: candles, volume, all indicators,
+ * drawing tools, crosshair, current price line, etc.
+ *
+ * In production, replace genMockCandles() with your real data source.
+ * ============================================================================= */
+
+(function() {
+  document.body.style.background = '#0e1015';
+
+  // 1. Create the chart with full configuration
+  const canvas = document.getElementById('chart');
+  canvas.style.cursor = 'crosshair';
+  const chart = new BadiCharts(canvas, {
+    symbol:    { label:'BTCUSD', priceScale:100, decimals:2 },
+    timeframe: { label:'1H', ms:60*60*1000 },
+    indicators: ['ma20','ma50','volsma']  // initial indicators
+  });
+  window.__chart = chart;
+
+  // 2. Generate mock candle data (realistic-looking price action)
+  function genMockCandles(count, basePrice, vol) {
+    let price = basePrice;
+    const now = Math.floor(Date.now() / 3600) * 3600;
+    const startTime = now - count * 3600;
+    const out = [];
+    // Use a seeded random for reproducibility
+    let seed = 12345;
+    const rand = () => {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return seed / 0x7fffffff;
+    };
+    for (let i = 0; i < count; i++) {
+      const t = startTime + i * 3600;
+      const open = price;
+      const volMult = 1 + Math.sin(i * 0.07) * 0.4 + (rand() - 0.5) * 0.6;
+      const drift = (rand() - 0.5) * vol * volMult * 1.6;
+      const macroBias = Math.sin(i * 0.013) * 0.0018
+                      + Math.sin(i * 0.005 + 0.7) * 0.0012
+                      + Math.sin(i * 0.027 + 1.3) * 0.0008;
+      const meanRevert = (basePrice - price) / price * 0.006;
+      const close = open * (1 + drift + macroBias + meanRevert);
+      const range = vol * volMult * price * (0.5 + rand() * 0.8);
+      const high = Math.max(open, close) + range * rand() * 0.7;
+      const low = Math.min(open, close) - range * rand() * 0.7;
+      const volume = Math.abs(close - open) / open * price * 50 + rand() * 1000 + 500;
+      out.push({
+        time: t,
+        open: open,
+        high: high,
+        low: low,
+        close: close,
+        volume: volume
+      });
+      price = close;
+    }
+    return out;
+  }
+
+  // 3. Generate 800 mock 1H candles for BTCUSD
+  const candles = genMockCandles(800, 67500, 0.012);
+  chart.setData(candles);
+
+  // 4. Start the render loop
+  chart.start();
+
+  // 5. Simulate real-time ticks (every 1 second) so the chart feels alive
+  setInterval(function() {
+    const last = chart.sim.candles[chart.sim.candles.length - 1];
+    const drift = (Math.random() - 0.5) * 0.012 * 0.5;
+    const newClose = last.close * (1 + drift);
+    chart.update({
+      time: last.time,
+      open: last.open,
+      high: Math.max(last.high, newClose),
+      low: Math.min(last.low, newClose),
+      close: newClose,
+      volume: last.volume + Math.random() * 50 + 10
+    });
+  }, 1000);
+
+  // 6. Add some demo drawings to showcase drawing tools
+  setTimeout(function() {
+    const c = chart.sim.candles;
+    const idx1 = c.length - 80;
+    const idx2 = c.length - 1;
+    // Trend line (orange) connecting a low to a high
+    chart.addDrawing({
+      type: 'trend',
+      i1: idx1, p1: c[idx1].low,
+      i2: idx2, p2: c[idx2].high,
+      color: '#ff9800'
+    });
+    // Horizontal support line (blue dashed)
+    chart.addDrawing({
+      type: 'hline',
+      price: c[idx2].close * 0.95,
+      color: '#2962ff'
+    });
+    // Rectangle highlighting a consolidation zone (purple)
+    chart.addDrawing({
+      type: 'rect',
+      i1: idx1 - 20, p1: c[idx1 - 20].high * 1.01,
+      i2: idx1 + 20, p2: c[idx1 - 20].low * 0.99,
+      color: '#9c27b0'
+    });
+  }, 500);
+
+  // Expose helpers for interactive testing
+  window.badiPreview = {
+    // Toggle all indicators
+    showAllIndicators: function() {
+      ['ma20','ma50','ma200','ema20','ema50','bb','volsma','rsi','macd','vprof'].forEach(function(id) {
+        chart.addIndicator(id);
+      });
+    },
+    // Clear all indicators
+    clearIndicators: function() {
+      ['ma20','ma50','ma200','ema20','ema50','bb','volsma','rsi','macd','vprof'].forEach(function(id) {
+        chart.removeIndicator(id);
+      });
+    },
+    // Switch symbol (just changes the label, keeps the data)
+    setSymbol: function(label, priceScale, decimals) {
+      chart.setSymbol({ label: label, priceScale: priceScale, decimals: decimals });
+    },
+    // Set a drawing tool
+    setTool: function(toolId) {
+      chart.setTool(toolId);
+    },
+    // Clear all drawings
+    clearDrawings: function() {
+      chart.clearDrawings();
+    },
+    // Reset view
+    resetView: function() {
+      chart.resetView();
+    },
+    // Get current state
+    state: function() {
+      return {
+        symbol: chart.symbol.label,
+        timeframe: chart.timeframe.label,
+        candles: chart.sim.candles.length,
+        indicators: Array.from(chart.activeIndicators),
+        drawings: chart.drawings.length,
+        tool: chart.activeTool
+      };
+    }
+  };
+
+  console.log('BADI-CHARTS-V2 preview loaded.');
+  console.log('Try: badiPreview.showAllIndicators()');
+  console.log('Try: badiPreview.setTool("trend") then click-drag on the chart');
+  console.log('Try: badiPreview.state()');
+})();
+</script>
+</body>
+</html>
