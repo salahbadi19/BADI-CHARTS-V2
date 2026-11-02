@@ -400,28 +400,8 @@ function formatTickMark(timeSec, weight, tf) {
 }
 
 /* ============================ CONSTANTS ===================================== */
-const TIMEFRAMES = [
-  {label:'1S',  ms:1000},
-  {label:'1m',  ms:60*1000},
-  {label:'5m',  ms:5*60*1000},
-  {label:'15m', ms:15*60*1000},
-  {label:'1H',  ms:60*60*1000},
-  {label:'4H',  ms:4*60*60*1000},
-  {label:'1D',  ms:24*60*60*1000},
-  {label:'1W',  ms:7*24*60*60*1000}
-];
-
-const SYMBOLS = [
-  {label:'BTCUSD', price:67500,   vol:0.012, decimals:2, priceScale:100},
-  {label:'ETHUSD', price:3500,    vol:0.014, decimals:2, priceScale:100},
-  {label:'SOLUSD', price:175,     vol:0.020, decimals:2, priceScale:100},
-  {label:'XAUUSD', price:2380,    vol:0.004, decimals:2, priceScale:100},
-  {label:'EURUSD', price:1.085,   vol:0.002, decimals:5, priceScale:100000},
-  {label:'GBPUSD', price:1.275,   vol:0.002, decimals:5, priceScale:100000},
-  {label:'AAPL',   price:225,     vol:0.008, decimals:2, priceScale:100},
-  {label:'TSLA',   price:250,     vol:0.018, decimals:2, priceScale:100},
-  {label:'NVDA',   price:120,     vol:0.014, decimals:2, priceScale:100}
-];
+// Timeframes and symbols are now USER-PROVIDED via the chart constructor options.
+// The chart library itself is data-source-agnostic.
 
 const INDICATOR_LIST = [
   {id:'ma20',   label:'MA 20',       type:'overlay',  color:THEME.ma1},
@@ -595,62 +575,43 @@ const Indicators = {
   }
 };
 
-/* ============================ DATA SIMULATOR =============================== */
-class DataSimulator {
-  constructor(symbol, timeframe) {
-    this.symbol = symbol;
-    this.timeframe = timeframe;
-    this.tfMs = timeframe.ms;
-    this.candles = [];
-    this.basePrice = symbol.price;
-    this.vol = symbol.vol;
-    this.decimals = symbol.decimals;
-    this.generate(800);
+/* ============================ DATA LAYER (USER-PROVIDED) ================== */
+// The chart does NOT generate fake data. The user must call setData() with
+// real candle data. Each candle: {time: number (unix seconds), open, high, low, close, volume}
+// time must be monotonically increasing across candles.
+class DataLayer {
+  constructor() {
+    this.candles = [];          // sorted array of candles
+    this.timeframeMs = 60 * 60 * 1000; // default 1H, updated via setTimeframe
   }
-  generate(count) {
-    let price = this.basePrice;
-    const now = Date.now();
-    const startTime = Math.floor(now / this.tfMs) * this.tfMs - count * this.tfMs;
-    for (let i = 0; i < count; i++) {
-      const t = startTime + i * this.tfMs;
-      const open = price;
-      const volMult = 1 + Math.sin(i * 0.07) * 0.4 + (Math.random() - 0.5) * 0.6;
-      const drift = (Math.random() - 0.5) * this.vol * volMult * 1.6;
-      const macroBias = Math.sin(i * 0.013) * 0.0018
-                      + Math.sin(i * 0.005 + 0.7) * 0.0012
-                      + Math.sin(i * 0.027 + 1.3) * 0.0008;
-      const meanRevert = (this.basePrice - price) / price * 0.006;
-      const close = open * (1 + drift + macroBias + meanRevert);
-      const range = this.vol * volMult * price * (0.5 + Math.random() * 0.8);
-      const high = Math.max(open, close) + range * Math.random() * 0.7;
-      const low = Math.min(open, close) - range * Math.random() * 0.7;
-      const volume = Math.abs(close - open) / open * price * 50 + Math.random() * 1000 + 500;
-      this.candles.push({time: Math.floor(t / 1000), open, high, low, close, volume});
-      price = close;
+  setData(candles) {
+    if (!Array.isArray(candles)) throw new Error('setData: expected array of candles');
+    // Sort by time ascending and dedupe
+    const map = new Map();
+    for (const c of candles) {
+      if (!c || typeof c.time !== 'number') continue;
+      map.set(c.time, c);
     }
+    this.candles = Array.from(map.values()).sort((a, b) => a.time - b.time);
   }
-  tick() {
-    const now = Math.floor(Date.now() / this.tfMs) * this.tfMs;
+  // Append or update a single candle (real-time tick)
+  update(candle) {
+    if (!candle || typeof candle.time !== 'number') return;
     const last = this.candles[this.candles.length - 1];
-    if (now > last.time * 1000) {
-      const open = last.close;
-      const drift = (Math.random() - 0.5) * this.vol * 2;
-      const range = this.vol * open * (0.4 + Math.random() * 0.6);
-      const high = open + Math.abs(drift) * open + range * Math.random();
-      const low = open - Math.abs(drift) * open * 0.6 - range * Math.random();
-      const close = low + (high - low) * Math.random();
-      const volume = Math.abs(close - open) / open * open * 30 + 500 + Math.random() * 500;
-      this.candles.push({time: Math.floor(now / 1000), open, high, low, close, volume});
-      if (this.candles.length > 5000) this.candles.shift();
-    } else {
-      const drift = (Math.random() - 0.5) * this.vol * 0.5;
-      const newClose = last.close * (1 + drift);
-      last.close = newClose;
-      last.high = Math.max(last.high, newClose);
-      last.low = Math.min(last.low, newClose);
-      last.volume += Math.random() * 50 + 10;
+    if (!last || candle.time > last.time) {
+      this.candles.push(candle);
+      if (this.candles.length > 50000) this.candles.shift();
+    } else if (last && candle.time === last.time) {
+      this.candles[this.candles.length - 1] = candle;
     }
   }
+  // Append multiple candles (batch)
+  append(candles) {
+    if (!Array.isArray(candles)) return;
+    for (const c of candles) this.update(c);
+  }
+  setTimeframeMs(ms) { this.timeframeMs = ms; }
+  get length() { return this.candles.length; }
 }
 
 /* ============================ PRICE SCALE (LWC-COMPAT) ===================== */
@@ -725,7 +686,7 @@ class PriceScale {
 
 /* ============================ MAIN CHART CLASS ============================= */
 class TradingChart {
-  constructor(canvas) {
+  constructor(canvas, opts = {}) {
     this.canvas = canvas;
     this.ctx = canvas.getContext('2d');
     this.dpr = window.devicePixelRatio || 1;
@@ -742,10 +703,12 @@ class TradingChart {
       leftPad: 0
     };
 
-    // State
-    this.symbol = SYMBOLS[0];
-    this.timeframe = TIMEFRAMES[4]; // 1H
-    this.sim = new DataSimulator(this.symbol, this.timeframe);
+    // User-provided state (no fake data)
+    this.symbol = opts.symbol || {label: 'SYMBOL', priceScale: 100, decimals: 2};
+    this.timeframe = opts.timeframe || {label: '1H', ms: 60 * 60 * 1000};
+    this.sim = new DataLayer();
+    this.sim.setTimeframeMs(this.timeframe.ms);
+    this._autoTick = false; // disabled by default; user controls updates
 
     // Viewport — barSpacing in media coords (CSS pixels)
     this.barSpacing = 8;       // LWC default ~6, we use 8 for cleaner initial view
@@ -789,8 +752,8 @@ class TradingChart {
     this.currentDrawing = null;
     this.hoverDrawing = null;
 
-    // Indicators
-    this.activeIndicators = new Set(['ma20', 'ma50', 'volsma']);
+    // Indicators — empty by default, user adds via addIndicator()
+    this.activeIndicators = new Set(opts.indicators || []);
     this.indCache = {};
 
     // UI
@@ -810,6 +773,85 @@ class TradingChart {
     this.computeIndicators();
     this.autoScale();
   }
+
+  /* ============================ PUBLIC API ================================ */
+  // Set the full candle dataset. Replaces all existing data.
+  // candles: array of {time (unix sec), open, high, low, close, volume}
+  setData(candles) {
+    this.sim.setData(candles);
+    this.computeTimeWeights();
+    this.computeIndicators();
+    this.resetView();
+  }
+  // Append or update a single candle (real-time tick)
+  update(candle) {
+    this.sim.update(candle);
+    this.computeTimeWeights();
+    this.computeIndicators();
+    this.autoScale();
+  }
+  // Append multiple candles
+  append(candles) {
+    this.sim.append(candles);
+    this.computeTimeWeights();
+    this.computeIndicators();
+    this.autoScale();
+  }
+  // Set symbol config (label, priceScale, decimals)
+  setSymbol(sym) {
+    this.symbol = Object.assign({}, this.symbol, sym);
+    this.priceScale = new PriceScale({scaleMargins:{top:0.15,bottom:0.15}, base: this.symbol.priceScale});
+    this.priceScale.setFormatter(new PriceFormatter(this.symbol.priceScale, 1));
+    this.priceScale.setHeight(this.priceBottom - this.priceTop);
+    this.drawings = [];
+    this.computeTimeWeights();
+    this.computeIndicators();
+    this.resetView();
+  }
+  // Set timeframe {label, ms}
+  setTimeframe(tf) {
+    this.timeframe = tf;
+    this.sim.setTimeframeMs(tf.ms);
+    this.drawings = [];
+    this.computeTimeWeights();
+    this.computeIndicators();
+    this.resetView();
+  }
+  // Add an indicator by id (e.g. 'ma20', 'rsi', 'macd', 'vprof', ...)
+  addIndicator(id) {
+    this.activeIndicators.add(id);
+    this.updateLayout();
+    this.computeIndicators();
+    this.autoScale();
+  }
+  // Remove an indicator by id
+  removeIndicator(id) {
+    this.activeIndicators.delete(id);
+    this.updateLayout();
+    this.computeIndicators();
+    this.autoScale();
+  }
+  // Add a drawing programmatically
+  addDrawing(drawing) {
+    drawing.id = drawing.id || Date.now();
+    this.drawings.push(drawing);
+  }
+  // Clear all drawings
+  clearDrawings() { this.drawings = []; }
+  // Set the active drawing tool by id
+  setTool(toolId) { this.activeTool = toolId; }
+  // Reset the view (zoom/pan) to fit all data
+  resetView() {
+    this.barSpacing = 8;
+    this.rightOffset = 4;
+    this.constrainRightOffset();
+    this.invalidateTimeMarks();
+    this.autoScale();
+  }
+  // Subscribe to crosshair updates (callback receives {index, price, time, candle})
+  onCrosshair(cb) { this._crosshairCb = cb; }
+  // Fit the chart to show all data
+  fit() { this.resetView(); }
 
   /* --------------------------- Canvas Setup ------------------------------ */
   setupHiDPICanvas() {
@@ -1245,6 +1287,11 @@ class TradingChart {
 
   /* --------------------------- Auto Scale -------------------------------- */
   autoScale() {
+    // If no data, set a safe default range and skip
+    if (this.sim.candles.length === 0) {
+      this.priceScale.setRange(0, 1);
+      return;
+    }
     // Determine visible candle range
     const firstIdx = Math.max(0, Math.floor(this.xToIndex(this.chartLeft)));
     const lastIdx = Math.min(this.sim.candles.length - 1, Math.ceil(this.xToIndex(this.chartRight)));
@@ -1273,7 +1320,9 @@ class TradingChart {
       }
     }
     if (!isFinite(min) || !isFinite(max) || min === max) {
-      min = (min || 0) - 1; max = (max || 1) + 1;
+      min = isFinite(min) ? min - 1 : -1;
+      max = isFinite(max) ? max + 1 : 1;
+      if (min === max) { min -= 1; max += 1; }
     }
     this.priceScale.setRange(min, max);
     this.priceScale.rebuildMarks();
@@ -1433,11 +1482,9 @@ class TradingChart {
   }
   handleButtonClick(btn) {
     switch (btn.action) {
-      case 'symbol': this.openDropdown('symbol', SYMBOLS.map(s => ({label: s.label, value: s.label})), btn); break;
-      case 'timeframe': this.openDropdown('timeframe', TIMEFRAMES.map(t => ({label: t.label, value: t.label})), btn); break;
       case 'indicator': this.openDropdown('indicator', INDICATOR_LIST.map(i => ({label: i.label, value: i.id, checked: this.activeIndicators.has(i.id)})), btn); break;
       case 'tool': this.openDropdown('tool', DRAW_TOOLS.map(t => ({label: t.label, value: t.id})), btn); break;
-      case 'reset': this.resetView(); break;
+      case 'reset': this.resetView(); this.showToast('Reset view'); break;
       case 'settings': this.showToast('R reset · +/- zoom · Esc cancel · Del delete'); break;
     }
   }
@@ -1455,33 +1502,7 @@ class TradingChart {
     this.dropdown.h = y - this.dropdown.y;
   }
   handleDropdownSelect(item) {
-    if (this.dropdown.type === 'symbol') {
-      const sym = SYMBOLS.find(s => s.label === item.value);
-      if (sym) {
-        this.symbol = sym;
-        this.sim = new DataSimulator(sym, this.timeframe);
-        this.priceScale = new PriceScale({scaleMargins:{top:0.15,bottom:0.15}, base: sym.priceScale});
-        this.priceScale.setFormatter(new PriceFormatter(sym.priceScale, 1));
-        this.priceScale.setHeight(this.priceBottom - this.priceTop);
-        this.volScale.setHeight(this.volBottom - this.volTop);
-        this.drawings = [];
-        this.computeTimeWeights();
-        this.computeIndicators();
-        this.resetView();
-        this.showToast('Loaded ' + sym.label);
-      }
-    } else if (this.dropdown.type === 'timeframe') {
-      const tf = TIMEFRAMES.find(t => t.label === item.value);
-      if (tf) {
-        this.timeframe = tf;
-        this.sim = new DataSimulator(this.symbol, tf);
-        this.drawings = [];
-        this.computeTimeWeights();
-        this.computeIndicators();
-        this.resetView();
-        this.showToast('Timeframe: ' + tf.label);
-      }
-    } else if (this.dropdown.type === 'indicator') {
+    if (this.dropdown.type === 'indicator') {
       if (this.activeIndicators.has(item.value)) {
         this.activeIndicators.delete(item.value);
         this.showToast('Removed: ' + item.label);
@@ -1502,14 +1523,7 @@ class TradingChart {
   /* --------------------------- MAIN RENDER LOOP -------------------------- */
   render(now) {
     if (!now) now = performance.now();
-    if (now - this.lastTickAt > this.tickInterval) {
-      this.sim.tick();
-      this.lastTickAt = now;
-      this.computeTimeWeights();
-      this.computeIndicators();
-      // Do NOT auto-follow price. User controls the view via pan/zoom only.
-      this.autoScale();
-    }
+    // No auto-tick. User must call update() with real data.
     const ctx = this.ctx;
     ctx.clearRect(0, 0, this.W, this.H);
     this.buttons = [];
@@ -2465,10 +2479,20 @@ class TradingChart {
   drawLegend() {
     const ctx = this.ctx;
     const isMobile = this.W < 600;
+    // If no data, just show the symbol/timeframe label
+    if (this.sim.candles.length === 0) {
+      ctx.font = 'bold ' + (isMobile ? '11px' : '12px') + ' -apple-system, Segoe UI, Roboto, sans-serif';
+      ctx.fillStyle = THEME.textBright;
+      ctx.textBaseline = 'top'; ctx.textAlign = 'left';
+      const symTxt = this.symbol.label + ' · ' + this.timeframe.label;
+      ctx.fillText(symTxt, this.chartLeft + 6, this.chartTop + 6);
+      return;
+    }
     const idx = this.crosshairIndex !== null ?
       clamp(Math.round(this.crosshairIndex), 0, this.sim.candles.length - 1) :
       this.sim.candles.length - 1;
     const c = this.sim.candles[idx];
+    if (!c) return;
     ctx.font = (isMobile ? '11px' : '12px') + ' -apple-system, Segoe UI, Roboto, sans-serif';
     ctx.textBaseline = 'top'; ctx.textAlign = 'left';
     let x = this.chartLeft + 6;
@@ -2544,30 +2568,35 @@ class TradingChart {
     const gap = isMobile ? 3 : 6;
 
     if (isMobile) {
-      // Compact toolbar for mobile: shorter labels, fewer buttons
-      x = this.drawButton({id:'symbol', action:'symbol', x, y, w:70, h, label:this.symbol.label, icon:'caret'});
-      x += gap;
-      x = this.drawButton({id:'tf', action:'timeframe', x, y, w:38, h, label:this.timeframe.label, icon:'caret'});
-      x += gap;
+      // Mobile: compact. Symbol + TF shown as static label (no dropdown).
+      // Buttons: Indicators, Tool, Reset.
+      const label = this.symbol.label + ' · ' + this.timeframe.label;
+      ctx.font = 'bold 11px -apple-system, Segoe UI, Roboto, sans-serif';
+      ctx.fillStyle = THEME.textBright;
+      ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+      ctx.fillText(label, x, y + h / 2);
+      x += ctx.measureText(label).width + gap + 4;
       x = this.drawButton({id:'ind', action:'indicator', x, y, w:36, h, label:'Ind', icon:'plus'});
       x += gap;
       const toolShort = TOOL_SHORTCUTS[this.activeTool] || '↖';
       x = this.drawButton({id:'tool', action:'tool', x, y, w:38, h, label:toolShort, icon:'caret'});
       x += gap;
       x = this.drawButton({id:'reset', action:'reset', x, y, w:36, h, label:'Rst', icon:null});
-
-      // Right side: LIVE only (no clock on mobile to save space)
+      // Right side: LIVE only
       const rightX = this.W - 4;
       ctx.font = '10px -apple-system, Segoe UI, Roboto, sans-serif';
       ctx.fillStyle = THEME.bull;
       ctx.textBaseline = 'middle'; ctx.textAlign = 'right';
       ctx.fillText('● LIVE', rightX, y + h / 2);
     } else {
-      // Full toolbar for desktop
-      x = this.drawButton({id:'symbol', action:'symbol', x, y, w:100, h, label:this.symbol.label, icon:'caret'});
-      x += gap;
-      x = this.drawButton({id:'tf', action:'timeframe', x, y, w:50, h, label:this.timeframe.label, icon:'caret'});
-      x += gap;
+      // Desktop: Symbol + TF shown as static label (no dropdown).
+      // Buttons: Indicators, Tool, Reset, Settings.
+      const label = this.symbol.label + ' · ' + this.timeframe.label;
+      ctx.font = 'bold 12px -apple-system, Segoe UI, Roboto, sans-serif';
+      ctx.fillStyle = THEME.textBright;
+      ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+      ctx.fillText(label, x, y + h / 2);
+      x += ctx.measureText(label).width + gap + 8;
       x = this.drawButton({id:'ind', action:'indicator', x, y, w:110, h, label:'Indicators', icon:'plus'});
       x += gap;
       const toolLabel = DRAW_TOOLS.find(t => t.id === this.activeTool).label;
@@ -2576,7 +2605,6 @@ class TradingChart {
       x = this.drawButton({id:'reset', action:'reset', x, y, w:60, h, label:'Reset', icon:null});
       x += gap;
       x = this.drawButton({id:'settings', action:'settings', x, y, w:70, h, label:'Settings', icon:null});
-
       // Right side: LIVE + clock
       const rightX = this.W - 8;
       ctx.font = '11px -apple-system, Segoe UI, Roboto, sans-serif';
@@ -2754,18 +2782,19 @@ class TradingChart {
   }
 }
 
-/* ============================ BOOTSTRAP ==================================== */
-window.addEventListener('DOMContentLoaded', () => {
-  document.body.style.margin = '0';
-  document.body.style.background = THEME.bg;
-  document.body.style.overflow = 'hidden';
-  document.body.style.fontFamily = '-apple-system, Segoe UI, Roboto, sans-serif';
-  const canvas = document.getElementById('chart');
-  canvas.style.display = 'block';
-  canvas.style.cursor = 'crosshair';
-  const chart = new TradingChart(canvas);
-  chart.start();
-  window.__chart = chart;
-});
+/* ============================ LIBRARY EXPORT =============================== */
+// Expose the chart as a global so users can create instances with their own data.
+// Usage:
+//   const chart = new TradingChart(canvas, { symbol: {...}, timeframe: {...} });
+//   chart.setData(candles);
+//   chart.start();
+window.TradingChart = TradingChart;
+window.THEME = THEME;
+window.INDICATOR_LIST = INDICATOR_LIST;
+window.DRAW_TOOLS = DRAW_TOOLS;
+window.TOOL_SHORTCUTS = TOOL_SHORTCUTS;
+window.Indicators = Indicators;
+window.PriceFormatter = PriceFormatter;
+window.PriceScale = PriceScale;
 
 })();
