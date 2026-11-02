@@ -780,6 +780,8 @@ class TradingChart {
     }
     // Active indicator card (which card's icons are currently shown expanded)
     this.activeIndicatorCard = null;
+    // Whether the indicator legend list is collapsed (hidden) — toggled by the arrow
+    this.indicatorsCollapsed = false;
     // Settings card popup state
     this.settingsCard = null; // {id, x, y, w, h, fields, onSave}
     // Icon hit-test registry (rebuilt each frame in drawLegend)
@@ -1248,6 +1250,11 @@ class TradingChart {
 
   // Handle a click on an indicator icon
   _handleIconClick(indId, iconId) {
+    // Handle the collapse/expand arrow
+    if (iconId === 'collapse') {
+      this.indicatorsCollapsed = !this.indicatorsCollapsed;
+      return;
+    }
     const state = this.indicatorStates.get(indId);
     if (!state) return;
     // Check custom icons first
@@ -2206,33 +2213,30 @@ class TradingChart {
     }
     ctx.restore();
 
-    // Indicator cards for the pane (TradingView-style, with icons)
-    // Reuse the same _drawIndicatorCard system as the main legend.
+    // Indicator labels for the pane — stacked vertically like the main legend.
+    // Drawn INSIDE the pane (not as separate cards), same style as TradingView.
     ctx.font = '11px -apple-system, Segoe UI, Roboto, sans-serif';
     ctx.textBaseline = 'top';
     const paneIdx = this.crosshairIndex !== null ?
       clamp(Math.round(this.crosshairIndex), 0, this.sim.candles.length - 1) :
       this.sim.candles.length - 1;
-    let pcx = left + 6;
     const pcy = top + 4;
-    // RSI card
+    // RSI line (inside the pane)
     if (this.activeIndicators.has('rsi')) {
       const state = this.indicatorStates.get('rsi') || {visible: true, settings: {}, icons: ['hide','edit','settings','delete'], customIcons: []};
       const meta = INDICATOR_LIST.find(i => i.id === 'rsi');
       if (meta) {
         const val = this._getIndicatorValueAt('rsi', paneIdx);
-        const cardW = this._drawIndicatorCard(pcx, pcy, 'rsi', meta, state, val);
-        pcx += cardW + 8;
+        this._drawIndicatorLine(left + 6, pcy, 'rsi', meta, state, val);
       }
     }
-    // MACD card
+    // MACD line (inside the pane)
     if (this.activeIndicators.has('macd')) {
       const state = this.indicatorStates.get('macd') || {visible: true, settings: {}, icons: ['hide','edit','settings','delete'], customIcons: []};
       const meta = INDICATOR_LIST.find(i => i.id === 'macd');
       if (meta) {
         const val = this._getIndicatorValueAt('macd', paneIdx);
-        const cardW = this._drawIndicatorCard(pcx, pcy, 'macd', meta, state, val);
-        pcx += cardW + 8;
+        this._drawIndicatorLine(left + 6, pcy, 'macd', meta, state, val);
       }
     }
     // Right axis labels (price scale of the pane)
@@ -2761,6 +2765,8 @@ class TradingChart {
       this.sim.candles.length - 1;
     const c = this.sim.candles[idx];
     if (!c) return;
+
+    // Line 1: Symbol · Timeframe · OHLC · Change (always shown)
     ctx.font = (isMobile ? '11px' : '12px') + ' -apple-system, Segoe UI, Roboto, sans-serif';
     ctx.textBaseline = 'top'; ctx.textAlign = 'left';
     let x = this.chartLeft + 6;
@@ -2772,7 +2778,6 @@ class TradingChart {
     x += ctx.measureText(symTxt).width + (isMobile ? 8 : 12);
     ctx.font = (isMobile ? '11px' : '12px') + ' -apple-system, Segoe UI, Roboto, sans-serif';
     const isBull = c.close >= c.open;
-    // On mobile: show only Close + Change. On desktop: full OHLC.
     const parts = isMobile ? [
       {label:'C', value: this.priceScale.formatLogical(c.close)}
     ] : [
@@ -2798,25 +2803,111 @@ class TradingChart {
     ctx.fillStyle = isBull ? THEME.bull : THEME.bear;
     ctx.fillText(changeTxt, x, y);
 
-    // Indicator cards (second line) — TradingView-style with icons
+    // Lines 2+: Indicator labels stacked VERTICALLY (TradingView-style)
+    // Each indicator on its own line, with icons shown when active (clicked).
     if (isMobile) return;
-    // NOTE: _iconHits is reset once per frame in render(), not here,
-    // so pane cards (drawn in drawPane) are preserved.
-    let cx = this.chartLeft + 6;
-    const cy = y + 18;
-    // Only show overlay/volume indicators in the main legend.
-    // Pane indicators (rsi, macd) are shown in their own pane via drawPane().
-    const activeIds = Array.from(this.activeIndicators).filter(id => id !== 'rsi' && id !== 'macd');
-    for (const id of activeIds) {
+    // Get overlay/volume indicators (pane indicators rsi/macd are drawn in drawPane)
+    const overlayIds = Array.from(this.activeIndicators).filter(id => id !== 'rsi' && id !== 'macd');
+    if (overlayIds.length === 0) return;
+    // If collapsed, draw only the expand arrow (downward) and return
+    let lineY = y + 18;
+    const lineH = 16;
+    if (this.indicatorsCollapsed) {
+      // Draw a small downward arrow to expand
+      this._drawCollapseArrow(this.chartLeft + 8, lineY, false);
+      return;
+    }
+    // Draw each indicator on its own line
+    for (const id of overlayIds) {
       const state = this.indicatorStates.get(id) || {visible: true, settings: {}, icons: ['hide','edit','settings','delete'], customIcons: []};
       const meta = INDICATOR_LIST.find(i => i.id === id);
       if (!meta) continue;
-      // Get current value for this indicator at idx
       const val = this._getIndicatorValueAt(id, idx);
-      const cardW = this._drawIndicatorCard(cx, cy, id, meta, state, val);
-      cx += cardW + 8;
-      if (cx > this.chartRight - 100) break; // stop if no room
+      this._drawIndicatorLine(this.chartLeft + 6, lineY, id, meta, state, val);
+      lineY += lineH;
     }
+    // Draw the collapse arrow (upward) below the last indicator
+    this._drawCollapseArrow(this.chartLeft + 8, lineY + 2, true);
+  }
+
+  // Draw a single indicator line (label + value + icons when active)
+  // Stacked vertically like TradingView.
+  _drawIndicatorLine(x, y, id, meta, state, val) {
+    const ctx = this.ctx;
+    const isActive = this.activeIndicatorCard === id;
+    const isVisible = state.visible !== false;
+    const color = meta.color;
+    ctx.font = '11px -apple-system, Segoe UI, Roboto, sans-serif';
+    ctx.textBaseline = 'top'; ctx.textAlign = 'left';
+    const labelTxt = meta.label + ':';
+    const labelW = ctx.measureText(labelTxt).width;
+    const valTxt = val || '';
+    const valW = ctx.measureText(valTxt).width;
+    // Background when active (subtle highlight)
+    const allIcons = state.icons.concat(state.customIcons.map(c => c.id));
+    const iconSize = 13;
+    const iconGap = 2;
+    const padX = 4;
+    let iconsW = 0;
+    if (isActive) iconsW = allIcons.length * (iconSize + iconGap);
+    const lineW = labelW + 4 + valW + (isActive ? iconsW + 6 : 0);
+    // Highlight background when active
+    if (isActive) {
+      ctx.fillStyle = 'rgba(42,46,57,0.6)';
+      this._roundRect(x - 2, y - 1, lineW + 4, 16, 2);
+      ctx.fill();
+    }
+    // Label (colored dot + name)
+    ctx.fillStyle = isVisible ? color : THEME.textDim;
+    // Small colored dot before the label
+    ctx.beginPath();
+    ctx.arc(x + 3, y + 6, 3, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillText(labelTxt, x + 10, y);
+    // Value
+    ctx.fillStyle = isVisible ? THEME.text : THEME.textDim;
+    ctx.fillText(valTxt, x + 10 + labelW + 4, y);
+    // Icons (only when active)
+    if (isActive) {
+      let ix = x + 10 + labelW + 4 + valW + 6;
+      for (const iconId of allIcons) {
+        const isCustom = state.customIcons.find(c => c.id === iconId);
+        this._drawIndicatorIcon(ix, y, iconId, iconSize, id, isCustom);
+        ix += iconSize + iconGap;
+      }
+    } else {
+      // Register the line area for hit-test (click to activate)
+      this._iconHits.push({type: 'card', id: id, x: x - 2, y: y - 1, w: lineW + 4, h: 16});
+    }
+  }
+
+  // Draw the collapse/expand arrow for the indicator list
+  _drawCollapseArrow(x, y, isUp) {
+    const ctx = this.ctx;
+    const isHover = this.hoverIcon && this.hoverIcon.iconId === 'collapse';
+    const color = isHover ? THEME.textBright : THEME.textDim;
+    ctx.strokeStyle = color;
+    ctx.fillStyle = color;
+    ctx.lineWidth = 1.2;
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    // Draw a small triangle (up or down)
+    const cx = x + 5, cy = y + 6, sz = 4;
+    ctx.beginPath();
+    if (isUp) {
+      // Up arrow (collapse) — triangle pointing up
+      ctx.moveTo(cx, cy - sz);
+      ctx.lineTo(cx - sz, cy + sz);
+      ctx.lineTo(cx + sz, cy + sz);
+    } else {
+      // Down arrow (expand) — triangle pointing down
+      ctx.moveTo(cx, cy + sz);
+      ctx.lineTo(cx - sz, cy - sz);
+      ctx.lineTo(cx + sz, cy - sz);
+    }
+    ctx.closePath();
+    ctx.fill();
+    // Register for hit-test
+    this._iconHits.push({type: 'icon', indId: '__legend__', iconId: 'collapse', x: x - 3, y: y - 3, w: 16, h: 16});
   }
 
   // Get formatted value for an indicator at a given candle index
