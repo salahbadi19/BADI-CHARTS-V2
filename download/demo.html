@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
 <meta name="theme-color" content="#0e1015">
-<title>TradingView-Style Chart — Demo with Real Data (Binance)</title>
+<title>CanvasKlines — Demo with Real Data (Binance)</title>
 <style>
   body { margin:0; background:#0e1015; overflow:hidden; font-family:-apple-system,Segoe UI,Roboto,sans-serif; }
   #chart { display:block; }
@@ -20,19 +20,19 @@
 <div id="loader">Loading real BTCUSDT 1H data from Binance…</div>
 
 <!-- ============================================================
-     Load the chart library (chart.js = the engine, no fake data)
+     Load the CanvasKlines library (chart.js = the engine, no fake data)
      ============================================================ -->
 <script src="chart.js"></script>
 
 <script>
 /* =============================================================================
- * DEMO: How to use the TradingChart library with REAL data.
+ * CanvasKlines — Demo with REAL data
  *
  * This demo fetches real BTC/USDT candles from Binance's public REST API.
  * Replace this fetch logic with your own data source (WebSocket, REST, etc.).
  *
- * Public API of TradingChart:
- *   const chart = new TradingChart(canvas, {
+ * Public API of CanvasKlines:
+ *   const chart = new CanvasKlines(canvas, {
  *     symbol:    { label:'BTCUSDT', priceScale:100, decimals:2 },
  *     timeframe: { label:'1H', ms:60*60*1000 },
  *     indicators: ['ma20','ma50','volsma']  // optional initial indicators
@@ -60,7 +60,7 @@
   // 2. Create the chart instance with user configuration (NO fake data)
   const canvas = document.getElementById('chart');
   canvas.style.cursor = 'crosshair';
-  const chart = new TradingChart(canvas, {
+  const chart = new CanvasKlines(canvas, {
     symbol:    { label:'BTCUSDT', priceScale:100, decimals:2 },
     timeframe: { label:'1H', ms:60*60*1000 },
     indicators: ['ma20','ma50','volsma']

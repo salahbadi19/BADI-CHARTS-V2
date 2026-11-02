@@ -4,19 +4,20 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
 <meta name="theme-color" content="#0e1015">
-<title>TradingView-Style Chart</title>
+<title>CanvasKlines</title>
 </head>
 <body>
 <canvas id="chart"></canvas>
 <script src="chart.js"></script>
 <script>
+// CanvasKlines — minimal standalone usage
+// Replace this with your own data feed (REST/WebSocket/file)
 document.body.style.margin = '0';
 document.body.style.background = '#0e1015';
 document.body.style.overflow = 'hidden';
 const canvas = document.getElementById('chart');
 canvas.style.cursor = 'crosshair';
-// Minimal usage: empty chart waiting for data
-const chart = new TradingChart(canvas, {
+const chart = new CanvasKlines(canvas, {
   symbol: {label:'SYMBOL', priceScale:100, decimals:2},
   timeframe: {label:'1H', ms:3600000},
   indicators: []

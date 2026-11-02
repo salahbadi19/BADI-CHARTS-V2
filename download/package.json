@@ -1,0 +1,47 @@
+{
+  "name": "canvasklines",
+  "version": "1.0.0",
+  "description": "A lightweight, dependency-free candlestick charting library built entirely with the HTML5 Canvas API. Pixel-perfect rendering, 14 drawing tools, 10 indicators, mobile-responsive, no fake data.",
+  "main": "chart.js",
+  "module": "chart.js",
+  "browser": "chart.js",
+  "scripts": {
+    "start": "python3 -m http.server 8080",
+    "demo": "open http://localhost:8080/demo.html"
+  },
+  "keywords": [
+    "chart",
+    "charts",
+    "candlestick",
+    "klines",
+    "trading",
+    "finance",
+    "canvas",
+    "javascript",
+    "library",
+    "tradingview",
+    "lightweight-charts",
+    "technical-analysis",
+    "indicators",
+    "drawing-tools"
+  ],
+  "author": "",
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/your-username/canvasklines",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/your-username/canvasklines.git"
+  },
+  "bugs": {
+    "url": "https://github.com/your-username/canvasklines/issues"
+  },
+  "files": [
+    "chart.js",
+    "README.md",
+    "LICENSE",
+    "demo.html",
+    "index.html"
+  ],
+  "unpkg": "chart.js",
+  "jsdelivr": "chart.js"
+}

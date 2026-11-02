@@ -1,5 +1,18 @@
 /* =============================================================================
- * TRADING CHART ENGINE v2 — Pixel-Perfect Pure JavaScript Canvas
+ * CanvasKlines v1.0.0 — Pixel-Perfect Pure JavaScript Trading Chart Library
+ *
+ * A lightweight, dependency-free candlestick charting library built entirely
+ * with the HTML5 Canvas API. Inspired by TradingView Lightweight Charts.
+ *
+ * Key features:
+ *   - 100% pure JavaScript — no HTML/CSS for UI, no dependencies
+ *   - Pixel-perfect rendering (HiDPI-aware, LWC-compatible algorithms)
+ *   - User-provided data only (no fake/mock data)
+ *   - 14 drawing tools (trend, channel, band, arrow, fib, polygon, text, ...)
+ *   - 10 indicators (MA, EMA, Bollinger, RSI, MACD, Volume Profile, ...)
+ *   - Responsive (desktop + mobile with touch/pinch support)
+ *   - Crosshair, current price line, OHLC legend
+ *   - Clipping for all chart areas (no overflow)
  *
  * Algorithms ported 1:1 from TradingView Lightweight Charts (v5):
  *   - optimalCandlestickWidth()  — exact same formula
@@ -10,11 +23,15 @@
  *   - Coordinate transforms      — internalHeight + scaleMargins
  *   - HiDPI rendering            — bitmap vs media coordinates
  *
- * No HTML elements for UI, no CSS styling — everything is canvas-drawn.
+ * GitHub: https://github.com/your-username/canvasklines
+ * License: Apache-2.0
  * ============================================================================= */
 
 (function () {
 'use strict';
+
+/* ============================ VERSION ====================================== */
+const VERSION = '1.0.0';
 
 /* ============================ THEME ========================================= */
 const THEME = {
@@ -2783,12 +2800,28 @@ class TradingChart {
 }
 
 /* ============================ LIBRARY EXPORT =============================== */
-// Expose the chart as a global so users can create instances with their own data.
-// Usage:
-//   const chart = new TradingChart(canvas, { symbol: {...}, timeframe: {...} });
-//   chart.setData(candles);
+// CanvasKlines — expose the chart as a global so users can create instances
+// with their own data.
+//
+// Usage (browser, standalone):
+//   const chart = new CanvasKlines(canvas, {
+//     symbol:    { label:'BTCUSDT', priceScale:100, decimals:2 },
+//     timeframe: { label:'1H', ms:60*60*1000 },
+//     indicators: ['ma20','ma50','volsma']  // optional
+//   });
+//   chart.setData(candles);  // [{time, open, high, low, close, volume}, ...]
 //   chart.start();
+//
+// Usage (ES module / npm):
+//   import CanvasKlines from 'canvasklines';
+//   const chart = new CanvasKlines(canvas, opts);
+
+// Global alias (preferred)
+window.CanvasKlines = TradingChart;
+// Backward-compatible alias
 window.TradingChart = TradingChart;
+// Expose version and helpers
+window.CanvasKlines.version = VERSION;
 window.THEME = THEME;
 window.INDICATOR_LIST = INDICATOR_LIST;
 window.DRAW_TOOLS = DRAW_TOOLS;
@@ -2796,5 +2829,16 @@ window.TOOL_SHORTCUTS = TOOL_SHORTCUTS;
 window.Indicators = Indicators;
 window.PriceFormatter = PriceFormatter;
 window.PriceScale = PriceScale;
+
+// UMD-style export for CommonJS / ES modules
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = TradingChart;
+  module.exports.default = TradingChart;
+  module.exports.CanvasKlines = TradingChart;
+  module.exports.VERSION = VERSION;
+}
+if (typeof define === 'function' && define.amd) {
+  define([], function () { return TradingChart; });
+}
 
 })();
