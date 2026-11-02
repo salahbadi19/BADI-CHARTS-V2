@@ -728,6 +728,12 @@ class TradingChart {
     this.sim.setTimeframeMs(this.timeframe.ms);
     this._autoTick = false; // disabled by default; user controls updates
 
+    // Background: image or video URL (drawn behind the chart)
+    this._bgImage = null;   // HTMLImageElement
+    this._bgVideo = null;   // HTMLVideoElement
+    this._bgOpacity = opts.backgroundOpacity !== undefined ? opts.backgroundOpacity : 0.15;
+    if (opts.background) this.setBackground(opts.background);
+
     // Viewport — barSpacing in media coords (CSS pixels)
     this.barSpacing = 8;       // LWC default ~6, we use 8 for cleaner initial view
     this.minBarSpacing = 1.4;  // LWC default minimum
@@ -769,6 +775,9 @@ class TradingChart {
     this.drawings = [];
     this.currentDrawing = null;
     this.hoverDrawing = null;
+    this.selectedDrawing = null;  // currently selected drawing (shows properties panel)
+    this._customTools = {};       // custom drawing tool renderers
+    this._drawPanelHits = [];     // hit-test for drawing properties panel
 
     // Indicators — default includes volume so the volume pane always has a card.
     // User can remove via removeIndicator('volume') if desired.
@@ -958,12 +967,77 @@ class TradingChart {
   // Add a drawing programmatically
   addDrawing(drawing) {
     drawing.id = drawing.id || Date.now();
+    drawing.color = drawing.color || THEME.drawing;
+    drawing.lineWidth = drawing.lineWidth || 1.5;
+    drawing.locked = false;
     this.drawings.push(drawing);
   }
   // Clear all drawings
   clearDrawings() { this.drawings = []; }
   // Set the active drawing tool by id
   setTool(toolId) { this.activeTool = toolId; }
+
+  // ─── Background image / video ─────────────────────────────────────────────
+  // url: string (image URL or video URL), or null to clear
+  setBackground(url) {
+    this._bgImage = null;
+    this._bgVideo = null;
+    if (!url) return;
+    // Detect video by extension
+    const lower = url.toLowerCase();
+    const isVideo = lower.endsWith('.mp4') || lower.endsWith('.webm') || lower.endsWith('.ogg') || lower.endsWith('.mov');
+    if (isVideo) {
+      const v = document.createElement('video');
+      v.src = url;
+      v.loop = true;
+      v.muted = true;
+      v.autoplay = true;
+      v.playsInline = true;
+      v.play().catch(function () {});
+      this._bgVideo = v;
+    } else {
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      img.src = url;
+      this._bgImage = img;
+    }
+  }
+  setBackgroundOpacity(opacity) {
+    this._bgOpacity = clamp(opacity, 0, 1);
+  }
+
+  // ─── Custom drawing tools ─────────────────────────────────────────────────
+  // tool: { id, label, icon (emoji/short text), onDraw(ctx, drawing), onHitTest(drawing, x, y), defaultStyle }
+  addDrawingTool(tool) {
+    if (!tool || !tool.id) return;
+    // Add to DRAW_TOOLS list
+    const exists = DRAW_TOOLS.find(function (t) { return t.id === tool.id; });
+    if (!exists) {
+      DRAW_TOOLS.push({ id: tool.id, label: tool.label || tool.id, icon: 'custom' });
+      TOOL_SHORTCUTS[tool.id] = tool.icon || '◆';
+    }
+    // Store the custom tool renderer/hit-test
+    if (!this._customTools) this._customTools = {};
+    this._customTools[tool.id] = tool;
+  }
+
+  // ─── Drawing properties panel ─────────────────────────────────────────────
+  // When a drawing is selected (clicked), show a floating properties panel
+  // with: delete, lock, color picker, stroke width, etc.
+  // The selected drawing is stored in this.selectedDrawing.
+  selectDrawing(drawing) {
+    this.selectedDrawing = drawing;
+  }
+  deselectDrawing() {
+    this.selectedDrawing = null;
+  }
+  updateDrawingStyle(drawing, style) {
+    if (!drawing) return;
+    if (style.color !== undefined) drawing.color = style.color;
+    if (style.lineWidth !== undefined) drawing.lineWidth = style.lineWidth;
+    if (style.locked !== undefined) drawing.locked = style.locked;
+  }
+
   // Reset the view (zoom/pan) to fit all data
   resetView() {
     this.barSpacing = 8;
@@ -1188,6 +1262,16 @@ class TradingChart {
     this.hoverButton = this.hitButton(x, y);
     // Check icon hover
     this.hoverIcon = this._hitIcon(x, y);
+    // Check drawing panel hover
+    this._hoverDrawPanelIcon = null;
+    if (this.selectedDrawing) {
+      for (const h of this._drawPanelHits) {
+        if (x >= h.x && x <= h.x + h.w && y >= h.y && y <= h.y + h.h) {
+          this._hoverDrawPanelIcon = h.action;
+          break;
+        }
+      }
+    }
 
     if (this.isDragging && this.activeTool === 'cursor') {
       const dx = x - this.dragStartX;
@@ -1337,6 +1421,11 @@ class TradingChart {
       return;
     }
 
+    // 1b. Check drawing properties panel (if a drawing is selected)
+    if (this.selectedDrawing && this._handleDrawPanelClick(x, y)) {
+      return;  // click was on the panel, handled
+    }
+
     // 2. Check indicator icons
     const iconHit = this._hitIcon(x, y);
     if (iconHit) {
@@ -1362,9 +1451,19 @@ class TradingChart {
     }
     if (this.activeTool === 'cursor') {
       if (this.inChartArea(x, y)) {
+        // Check if clicking on a drawing (select it) before starting drag
+        const clickedDrawing = this.findDrawingAt(x, y);
+        if (clickedDrawing && !clickedDrawing.locked) {
+          this.selectDrawing(clickedDrawing);
+          return;  // don't start drag — user clicked on a drawing
+        }
+        // Click on empty area → deselect drawing + start drag
+        this.deselectDrawing();
         this.isDragging = true;
         this.dragStartX = x;
         this.dragStartRightOffset = this.rightOffset;
+      } else {
+        this.deselectDrawing();
       }
     } else if (this.activeTool === 'eraser') {
       if (this.hoverDrawing) {
@@ -1435,7 +1534,7 @@ class TradingChart {
     if (e.key === 'r' || e.key === 'R') { this.resetView(); }
     if (e.key === '+' || e.key === '=') this.zoomAtCenter(1.1);
     if (e.key === '-' || e.key === '_') this.zoomAtCenter(1/1.1);
-    if (e.key === 'Escape') { this.activeTool = 'cursor'; this.currentDrawing = null; this.dropdown = null; }
+    if (e.key === 'Escape') { this.activeTool = 'cursor'; this.currentDrawing = null; this.dropdown = null; this.deselectDrawing(); }
     if (e.key === 'Delete' || e.key === 'Backspace') {
       if (this.hoverDrawing) {
         this.drawings = this.drawings.filter(d => d !== this.hoverDrawing);
@@ -1807,6 +1906,7 @@ class TradingChart {
     this.drawVolumeProfile();
     this.drawPane();
     this.drawDrawings();
+    this.drawDrawingPanel();  // Floating properties panel for selected drawing
     this.drawPriceAxis();
     this.drawTimeAxis();
     this.drawCurrentPriceLine();  // After axes so the price label sits ON TOP
@@ -1825,8 +1925,40 @@ class TradingChart {
   /* --------------------------- Background -------------------------------- */
   drawBackground() {
     const ctx = this.ctx;
+    // Fill base background
     ctx.fillStyle = THEME.bg;
     ctx.fillRect(0, 0, this.W, this.H);
+    // Draw background image or video (behind everything, with opacity)
+    if (this._bgImage && this._bgImage.complete && this._bgImage.naturalWidth > 0) {
+      ctx.save();
+      ctx.globalAlpha = this._bgOpacity;
+      // Cover-fit: scale image to cover the chart area while maintaining aspect ratio
+      const cw = this.chartRight - this.chartLeft;
+      const ch = (this.layout.paneBottom || this.chartBottom) - this.chartTop;
+      const iw = this._bgImage.naturalWidth;
+      const ih = this._bgImage.naturalHeight;
+      const scale = Math.max(cw / iw, ch / ih);
+      const dw = iw * scale, dh = ih * scale;
+      const dx = this.chartLeft + (cw - dw) / 2;
+      const dy = this.chartTop + (ch - dh) / 2;
+      ctx.drawImage(this._bgImage, dx, dy, dw, dh);
+      ctx.restore();
+    }
+    if (this._bgVideo && this._bgVideo.readyState >= 2) {
+      ctx.save();
+      ctx.globalAlpha = this._bgOpacity;
+      const cw = this.chartRight - this.chartLeft;
+      const ch = (this.layout.paneBottom || this.chartBottom) - this.chartTop;
+      const vw = this._bgVideo.videoWidth || cw;
+      const vh = this._bgVideo.videoHeight || ch;
+      const scale = Math.max(cw / vw, ch / vh);
+      const dw = vw * scale, dh = vh * scale;
+      const dx = this.chartLeft + (cw - dw) / 2;
+      const dy = this.chartTop + (ch - dh) / 2;
+      ctx.drawImage(this._bgVideo, dx, dy, dw, dh);
+      ctx.restore();
+    }
+    // Toolbar and status bar backgrounds
     ctx.fillStyle = THEME.toolbarBg;
     ctx.fillRect(0, 0, this.W, this.layout.toolbarH);
     ctx.fillRect(0, this.H - this.layout.statusH, this.W, this.layout.statusH);
@@ -2273,11 +2405,13 @@ class TradingChart {
     const ctx = this.ctx;
     const drawOne = (d, isActive = false) => {
       const color = isActive ? THEME.drawingActive : (d.color || THEME.drawing);
-      ctx.strokeStyle = color;
+      const isSelected = (d === this.selectedDrawing);
+      ctx.strokeStyle = isSelected ? THEME.drawingActive : color;
       ctx.fillStyle = color;
-      ctx.lineWidth = 1.5;
+      ctx.lineWidth = d.lineWidth || 1.5;
       const isHover = (d === this.hoverDrawing);
-      if (isHover) { ctx.lineWidth = 2.5; ctx.strokeStyle = THEME.drawingActive; }
+      if (isHover && !isSelected) { ctx.lineWidth = (d.lineWidth || 1.5) + 1; ctx.strokeStyle = THEME.drawingActive; }
+      if (isSelected) { ctx.lineWidth = (d.lineWidth || 1.5) + 0.5; }
 
       // For drawings that stay inside the chart area, apply clip.
       // hline and fib draw labels on the price axis, so they need special handling.
@@ -2531,6 +2665,199 @@ class TradingChart {
     };
     for (const d of this.drawings) drawOne(d);
     if (this.currentDrawing) drawOne(this.currentDrawing, true);
+  }
+
+  /* --------------------------- Drawing Properties Panel ------------------- */
+  // Floating rectangle (like Excalidraw/TradingView) that appears when a
+  // drawing is selected. Contains: delete, lock, color picker, stroke width.
+  drawDrawingPanel() {
+    if (!this.selectedDrawing) { this._drawPanelHits = []; return; }
+    const d = this.selectedDrawing;
+    const ctx = this.ctx;
+    this._drawPanelHits = [];
+
+    // Position the panel near the drawing's first point
+    let anchorX, anchorY;
+    if (d.type === 'hline') {
+      anchorX = this.chartLeft + 60;
+      anchorY = this.priceToY(d.price) - 30;
+    } else if (d.type === 'vline') {
+      anchorX = this.indexToX(d.index) + 10;
+      anchorY = this.chartTop + 10;
+    } else if (d.points && d.points.length > 0) {
+      anchorX = this.indexToX(d.points[0].i);
+      anchorY = this.priceToY(d.points[0].p) - 30;
+    } else {
+      anchorX = this.indexToX(d.i1 || 0);
+      anchorY = this.priceToY(d.p1 || 0) - 30;
+    }
+    // Clamp to chart area
+    anchorX = clamp(anchorX, this.chartLeft + 4, this.chartRight - 280);
+    anchorY = clamp(anchorY, this.chartTop + 4, this.chartBottom - 40);
+
+    // Panel dimensions
+    const iconSize = 20;
+    const iconGap = 4;
+    const panelH = 30;
+    // Icons: delete, lock, color, width, duplicate
+    const colors = ['#2962ff','#26a69a','#ef5350','#ff9800','#9c27b0','#e91e63','#f0f3fa','#787b86'];
+    const widths = [1, 1.5, 2, 3, 5];
+    const numIcons = 5 + colors.length + widths.length; // delete + lock + colorSwatches + widthButtons + duplicate
+    const panelW = 8 + numIcons * (iconSize - 6) + 8;
+
+    // Draw panel background
+    ctx.fillStyle = 'rgba(26,30,42,0.95)';
+    this._roundRect(anchorX, anchorY, panelW, panelH, 5);
+    ctx.fill();
+    ctx.strokeStyle = THEME.toolbarBorder;
+    ctx.lineWidth = 1;
+    this._roundRect(anchorX + 0.5, anchorY + 0.5, panelW - 1, panelH - 1, 5);
+    ctx.stroke();
+
+    let ix = anchorX + 6;
+    const iy = anchorY + 5;
+    const drawIconBtn = function (iconFn, action, tooltip) {
+      const isHover = this._hoverDrawPanelIcon === action;
+      if (isHover) {
+        ctx.fillStyle = 'rgba(255,255,255,0.12)';
+        this._roundRect(ix - 2, iy - 1, iconSize + 2, iconSize + 2, 3);
+        ctx.fill();
+      }
+      ctx.strokeStyle = isHover ? THEME.textBright : THEME.textDim;
+      ctx.fillStyle = isHover ? THEME.textBright : THEME.textDim;
+      ctx.lineWidth = 1.3;
+      ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+      iconFn(ix + iconSize / 2, iy + iconSize / 2);
+      this._drawPanelHits.push({ action: action, x: ix - 2, y: iy - 1, w: iconSize + 2, h: iconSize + 2 });
+      ix += iconSize - 4;
+    }.bind(this);
+
+    // 1. Delete (trash) icon
+    drawIconBtn(function (cx, cy) {
+      ctx.beginPath();
+      ctx.moveTo(cx - 4, cy - 3); ctx.lineTo(cx + 4, cy - 3);
+      ctx.moveTo(cx - 3, cy - 3); ctx.lineTo(cx - 3, cy + 4);
+      ctx.lineTo(cx + 3, cy + 4); ctx.lineTo(cx + 3, cy - 3);
+      ctx.moveTo(cx - 2, cy - 4); ctx.lineTo(cx + 2, cy - 4);
+      ctx.stroke();
+    }, 'delete', 'Delete');
+
+    // 2. Lock icon
+    drawIconBtn(function (cx, cy) {
+      if (d.locked) {
+        ctx.fillStyle = THEME.accent;
+        ctx.beginPath();
+        ctx.roundRect ? ctx.roundRect(cx - 4, cy - 1, 8, 6, 1) : ctx.rect(cx - 4, cy - 1, 8, 6);
+        ctx.fill();
+        ctx.strokeStyle = THEME.accent;
+        ctx.beginPath();
+        ctx.arc(cx, cy - 1, 2.5, Math.PI, 0);
+        ctx.stroke();
+      } else {
+        ctx.beginPath();
+        ctx.rect(cx - 4, cy - 1, 8, 6);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.arc(cx, cy - 1, 2.5, Math.PI, 0);
+        ctx.stroke();
+      }
+    }, 'lock', 'Lock');
+
+    // 3. Divider
+    ctx.strokeStyle = THEME.toolbarBorder;
+    ctx.beginPath(); ctx.moveTo(ix, iy + 2); ctx.lineTo(ix, iy + iconSize - 4); ctx.stroke();
+    ix += 4;
+
+    // 4. Color swatches
+    for (let ci = 0; ci < colors.length; ci++) {
+      const isSelected = d.color === colors[ci];
+      ctx.fillStyle = colors[ci];
+      ctx.beginPath();
+      ctx.arc(ix + 5, iy + iconSize / 2, isSelected ? 6 : 5, 0, Math.PI * 2);
+      ctx.fill();
+      if (isSelected) {
+        ctx.strokeStyle = THEME.textBright;
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.arc(ix + 5, iy + iconSize / 2, 7, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+      this._drawPanelHits.push({ action: 'color', value: colors[ci], x: ix - 1, y: iy - 1, w: 12, h: iconSize + 2 });
+      ix += 12;
+    }
+
+    // 5. Divider
+    ctx.strokeStyle = THEME.toolbarBorder;
+    ctx.beginPath(); ctx.moveTo(ix, iy + 2); ctx.lineTo(ix, iy + iconSize - 4); ctx.stroke();
+    ix += 4;
+
+    // 6. Stroke width buttons
+    for (let wi = 0; wi < widths.length; wi++) {
+      const isSelected = (d.lineWidth || 1.5) === widths[wi];
+      ctx.strokeStyle = isSelected ? THEME.accent : THEME.textDim;
+      ctx.lineWidth = widths[wi];
+      ctx.beginPath();
+      ctx.moveTo(ix + 2, iy + iconSize / 2);
+      ctx.lineTo(ix + 10, iy + iconSize / 2);
+      ctx.stroke();
+      ctx.lineWidth = 1;
+      this._drawPanelHits.push({ action: 'width', value: widths[wi], x: ix - 1, y: iy - 1, w: 13, h: iconSize + 2 });
+      ix += 13;
+    }
+
+    // 7. Divider
+    ctx.strokeStyle = THEME.toolbarBorder;
+    ctx.beginPath(); ctx.moveTo(ix, iy + 2); ctx.lineTo(ix, iy + iconSize - 4); ctx.stroke();
+    ix += 4;
+
+    // 8. Duplicate icon
+    drawIconBtn(function (cx, cy) {
+      ctx.beginPath();
+      ctx.rect(cx - 4, cy - 4, 6, 6);
+      ctx.rect(cx - 2, cy - 2, 6, 6);
+      ctx.stroke();
+    }, 'duplicate', 'Duplicate');
+
+    ctx.lineCap = 'butt'; ctx.lineJoin = 'miter';
+  }
+
+  // Handle click on drawing properties panel
+  _handleDrawPanelClick(x, y) {
+    for (const h of this._drawPanelHits) {
+      if (x >= h.x && x <= h.x + h.w && y >= h.y && y <= h.y + h.h) {
+        const d = this.selectedDrawing;
+        if (!d) return true;
+        switch (h.action) {
+          case 'delete':
+            this.drawings = this.drawings.filter(function (dd) { return dd !== d; });
+            this.selectedDrawing = null;
+            this.showToast('Drawing deleted');
+            break;
+          case 'lock':
+            d.locked = !d.locked;
+            this.showToast(d.locked ? 'Drawing locked' : 'Drawing unlocked');
+            break;
+          case 'color':
+            d.color = h.value;
+            break;
+          case 'width':
+            d.lineWidth = h.value;
+            break;
+          case 'duplicate':
+            var copy = JSON.parse(JSON.stringify(d));
+            copy.id = Date.now();
+            if (copy.i1 !== undefined) copy.i1 += 5;
+            if (copy.i2 !== undefined) copy.i2 += 5;
+            if (copy.points) copy.points = copy.points.map(function (p) { return { i: p.i + 5, p: p.p, x: p.x, y: p.y }; });
+            this.drawings.push(copy);
+            this.selectedDrawing = copy;
+            this.showToast('Drawing duplicated');
+            break;
+        }
+        return true;
+      }
+    }
+    return false;
   }
 
   findDrawingAt(x, y) {
