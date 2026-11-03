@@ -710,9 +710,12 @@ class TradingChart {
     this.dpr = window.devicePixelRatio || 1;
 
     // Layout
+    // User can hide the toolbar and/or status bar via opts (for embedding in custom UIs)
+    this._showToolbar = opts.toolbar !== false;   // default: true
+    this._showStatusBar = opts.statusBar !== false; // default: true
     this.layout = {
-      toolbarH: 44,
-      statusH: 26,
+      toolbarH: this._showToolbar ? 44 : 0,
+      statusH: this._showStatusBar ? 26 : 0,
       priceAxisW: 64,
       timeAxisH: 28,
       volumeH: 64,
@@ -1074,15 +1077,15 @@ class TradingChart {
     // Responsive layout: smaller dimensions on mobile (width < 600px)
     const isMobile = this.W < 600;
     if (isMobile) {
-      this.layout.toolbarH = 40;
-      this.layout.statusH = 22;
+      this.layout.toolbarH = this._showToolbar ? 40 : 0;
+      this.layout.statusH = this._showStatusBar ? 22 : 0;
       this.layout.priceAxisW = 56;
       this.layout.timeAxisH = 24;
       this.layout.volumeH = 50;
       this.layout.gap = 4;
     } else {
-      this.layout.toolbarH = 44;
-      this.layout.statusH = 26;
+      this.layout.toolbarH = this._showToolbar ? 44 : 0;
+      this.layout.statusH = this._showStatusBar ? 26 : 0;
       this.layout.priceAxisW = 64;
       this.layout.timeAxisH = 28;
       this.layout.volumeH = 64;
@@ -1913,8 +1916,8 @@ class TradingChart {
     this.drawCrosshair();
     this.drawLegend();
     this.drawSettingsCard();      // Settings popup (drawn last so it overlays everything)
-    this.drawToolbar();
-    this.drawStatusBar();
+    if (this._showToolbar) this.drawToolbar();
+    if (this._showStatusBar) this.drawStatusBar();
     this.drawDropdown();
     this.drawToast(now);
     if (!this.isDragging && this.activeTool === 'eraser') {
