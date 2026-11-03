@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
 <meta name="theme-color" content="#0e1015">
-<title>BADI-CHARTS-V2</title>
+<title>BADI-CHARTS-V2 — Live Demo</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   html, body { width: 100%; height: 100%; overflow: hidden; background: #0e1015; }
@@ -15,35 +15,14 @@
 <body>
 <canvas id="chart"></canvas>
 
-<!-- ============================================================
-     BADI-CHARTS-V2 — Single HTML file demo
-     ============================================================
-     CDN URL (jsDelivr):
-       https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@v1.1.0/chart.js
-
-     This page tries to load REAL candles from Binance public API.
-     If that fails (e.g. CORS / rate limit), it falls back to mock data
-     so the chart is always visible.
-
-     To use your OWN data source, replace the fetchBinanceCandles()
-     function with your API call, or call chart.setData() directly.
-     ============================================================ -->
-
 <!-- Load BADI-CHARTS-V2 from CDN (jsDelivr) -->
-<script src="https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@v1.1.0/chart.js"></script>
-
-<!-- Fallback: if CDN is unreachable, load locally -->
-<script>
-  if (typeof BadiCharts === 'undefined') {
-    document.write('<script src="chart.js"><\/script>');
-  }
-</script>
+<script src="https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@v1.1.1/chart.js"></script>
 
 <script>
 (function () {
   const canvas = document.getElementById('chart');
 
-  // Create the chart with Volume + MA20 + MA50 + Vol SMA
+  // Create the chart with: Volume + MA20 + MA50 + Vol SMA
   const chart = new BadiCharts(canvas, {
     symbol:    { label: 'BTCUSDT', priceScale: 100, decimals: 2 },
     timeframe: { label: '1H', ms: 60 * 60 * 1000 },
@@ -51,10 +30,9 @@
   });
   window.chart = chart;
 
-  // ─── Try to fetch REAL candles from Binance ──────────────────────────────
+  // Fetch REAL candles from Binance public API
   async function fetchBinanceCandles(symbol, interval, limit) {
-    const url = 'https://api.binance.com/api/v3/klines?symbol=' + symbol +
-                '&interval=' + interval + '&limit=' + limit;
+    const url = 'https://api.binance.com/api/v3/klines?symbol=' + symbol + '&interval=' + interval + '&limit=' + limit;
     const res = await fetch(url);
     if (!res.ok) throw new Error('Binance API error: ' + res.status);
     const raw = await res.json();
@@ -70,38 +48,6 @@
     });
   }
 
-  // ─── Fallback: generate mock candles if Binance fails ────────────────────
-  function genMockCandles(count, basePrice, vol) {
-    let price = basePrice;
-    const now = Math.floor(Date.now() / 3600) * 3600;
-    const startTime = now - count * 3600;
-    const out = [];
-    let seed = 12345;
-    const rand = function () {
-      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
-      return seed / 0x7fffffff;
-    };
-    for (let i = 0; i < count; i++) {
-      const t = startTime + i * 3600;
-      const open = price;
-      const volMult = 1 + Math.sin(i * 0.07) * 0.4 + (rand() - 0.5) * 0.6;
-      const drift = (rand() - 0.5) * vol * volMult * 1.6;
-      const macroBias = Math.sin(i * 0.013) * 0.0018
-                      + Math.sin(i * 0.005 + 0.7) * 0.0012
-                      + Math.sin(i * 0.027 + 1.3) * 0.0008;
-      const meanRevert = (basePrice - price) / price * 0.006;
-      const close = open * (1 + drift + macroBias + meanRevert);
-      const range = vol * volMult * price * (0.5 + rand() * 0.8);
-      const high = Math.max(open, close) + range * rand() * 0.7;
-      const low = Math.min(open, close) - range * rand() * 0.7;
-      const volume = Math.abs(close - open) / open * price * 50 + rand() * 1000 + 500;
-      out.push({ time: t, open: open, high: high, low: low, close: close, volume: volume });
-      price = close;
-    }
-    return out;
-  }
-
-  // ─── Load data: try Binance first, fall back to mock ─────────────────────
   fetchBinanceCandles('BTCUSDT', '1h', 500)
     .then(function (candles) {
       chart.setData(candles);
@@ -109,13 +55,11 @@
       console.log('[BADI-CHARTS-V2] Loaded ' + candles.length + ' candles from Binance');
     })
     .catch(function (err) {
-      console.warn('[BADI-CHARTS-V2] Binance failed, using mock data:', err.message);
-      const candles = genMockCandles(500, 67500, 0.012);
-      chart.setData(candles);
+      console.error('[BADI-CHARTS-V2] Failed to load data:', err);
       chart.start();
     });
 
-  // ─── (Optional) Live WebSocket updates — uncomment to enable ─────────────
+  // (Optional) Live WebSocket updates — uncomment to enable:
   /*
   const ws = new WebSocket('wss://stream.binance.com:9443/ws/btcusdt@kline_1h');
   ws.onmessage = function (ev) {
