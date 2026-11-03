@@ -1623,14 +1623,44 @@ class TradingChart {
 
   /* --------------------------- Time Weights ------------------------------ */
   computeTimeWeights() {
-    // Build time points with weights for time tick mark builder
+    // Build time points with weights for time tick mark builder.
+    // Include virtual points for the future/past area so the time axis
+    // shows labels when scrolling beyond the data (like TradingView).
     const pts = [];
     const candles = this.sim.candles;
-    for (let i = 0; i < candles.length; i++) {
+    const N = candles.length;
+    const tfSec = this.timeframe.ms / 1000;
+
+    // Actual candle data
+    for (let i = 0; i < N; i++) {
       const prev = i > 0 ? candles[i - 1].time : null;
       const w = assignTimeWeight(prev, candles[i].time);
       pts.push({time: candles[i].time, weight: w});
     }
+
+    // Virtual future points: extend up to 500 bars beyond the last candle
+    // so the time axis shows future labels when scrolling right
+    if (N > 0) {
+      const lastTime = candles[N - 1].time;
+      const prevLastTime = N > 1 ? candles[N - 2].time : lastTime - tfSec;
+      for (let i = 1; i <= 500; i++) {
+        const t = lastTime + i * tfSec;
+        const w = assignTimeWeight(lastTime + (i - 1) * tfSec, t);
+        pts.push({time: t, weight: w});
+      }
+    }
+
+    // Virtual past points: extend 500 bars before the first candle
+    if (N > 0) {
+      const firstTime = candles[0].time;
+      for (let i = 1; i <= 500; i++) {
+        const t = firstTime - i * tfSec;
+        const nextT = firstTime - (i - 1) * tfSec;
+        const w = assignTimeWeight(t, nextT);
+        pts.unshift({time: t, weight: w});
+      }
+    }
+
     this._timePoints = pts;
     this.timeTickMarks.setPoints(pts);
     this.invalidateTimeMarks();
@@ -1638,16 +1668,35 @@ class TradingChart {
   invalidateTimeMarks() { this._timeMarksCache = null; }
 
   getTimeMarks() {
-    // LWC: maxLabelWidth = pixelsPerCharacter * tickMarkMaxCharacterLength
-    // pixelsPer8Characters = (fontSize + 4) * 5
-    // pixelsPerCharacter = pixelsPer8Characters / defaultTickMarkMaxCharacterLength (8)
-    // => maxLabelWidth = (fontSize + 4) * 5  (since both numerator/denominator use 8)
-    const fontSize = 11;
-    const maxLabelWidth = (fontSize + 4) * 5; // = 75 for fontSize=11
-    if (!this._timeMarksCache) {
-      this._timeMarksCache = this.timeTickMarks.build(this.barSpacing, maxLabelWidth);
+    // Simple approach: generate time marks at regular intervals across the
+    // visible range (including future/past areas). This is simpler and more
+    // reliable than the weight-based LWC system for free-scrolling charts.
+    const visibleBars = Math.ceil((this.chartRight - this.chartLeft) / this.barSpacing);
+    const firstIdx = Math.floor(this.xToIndex(this.chartLeft));
+    const lastIdx = Math.ceil(this.xToIndex(this.chartRight));
+    // Choose a step so we get ~8-12 marks
+    let step = 1;
+    const targetMarks = 10;
+    while (Math.ceil(visibleBars / step) > targetMarks * 1.5) {
+      step *= 2;
+      if (step > visibleBars) break;
     }
-    return this._timeMarksCache;
+    // Round step to nice numbers (5, 10, 15, 30, 60, 120, 240, 360, 720)
+    const niceSteps = [1, 2, 3, 5, 6, 10, 15, 30, 60, 120, 240, 360, 720, 1440];
+    const stepInBars = step;
+    // Build marks
+    const marks = [];
+    const startMark = Math.ceil(firstIdx / stepInBars) * stepInBars;
+    for (let i = startMark; i <= lastIdx; i += stepInBars) {
+      const t = this._timeAtIndex(i);
+      if (t <= 0) continue;
+      // Assign weight based on time boundaries
+      const tfSec = this.timeframe.ms / 1000;
+      const prevT = t - tfSec;
+      const w = assignTimeWeight(prevT, t);
+      marks.push({index: i, time: t, weight: w});
+    }
+    return marks;
   }
 
   /* --------------------------- Auto Scale -------------------------------- */
@@ -3030,9 +3079,8 @@ class TradingChart {
     for (const m of marks) {
       const x = this.indexToX(m.index);
       if (x < this.chartLeft || x > this.chartRight) continue;
-      // Get time at this index (works for past, present, and future)
-      const timeSec = this._timeAtIndex(m.index);
-      const label = formatTickMark(timeSec, m.weight, this.timeframe.label);
+      // Use the time stored in the mark (works for past, present, and future)
+      const label = formatTickMark(m.time, m.weight, this.timeframe.label);
       const labelW = label.length * 6 + 8;
       const leftEdge = x - labelW / 2;
       const rightEdge = x + labelW / 2;

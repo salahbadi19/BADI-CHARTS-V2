@@ -4,76 +4,32 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
 <meta name="theme-color" content="#0e1015">
-<title>BADI-CHARTS-V2 — Live Demo</title>
+<title>BADI-CHARTS-V2</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   html, body { width: 100%; height: 100%; overflow: hidden; background: #0e1015; }
-  body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; }
   #chart { display: block; width: 100vw; height: 100vh; cursor: crosshair; }
 </style>
 </head>
 <body>
 <canvas id="chart"></canvas>
 
-<!-- Load BADI-CHARTS-V2 from CDN (jsDelivr) -->
-<script src="https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@v1.1.1/chart.js"></script>
-
+<!-- BADI-CHARTS-V2 from CDN -->
+<script src="https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@v1.1.4/chart.js"></script>
 <script>
-(function () {
-  const canvas = document.getElementById('chart');
-
-  // Create the chart with: Volume + MA20 + MA50 + Vol SMA
-  const chart = new BadiCharts(canvas, {
-    symbol:    { label: 'BTCUSDT', priceScale: 100, decimals: 2 },
-    timeframe: { label: '1H', ms: 60 * 60 * 1000 },
-    indicators: ['volume', 'ma20', 'ma50', 'volsma']
+  // EMPTY chart — no toolbar, no status bar, no indicators, no data
+  const chart = new BadiCharts(document.getElementById('chart'), {
+    symbol: { label: 'SYMBOL', priceScale: 100, decimals: 2 },
+    timeframe: { label: '1H', ms: 3600000 },
+    indicators: [],        // no indicators
+    toolbar: false,        // no toolbar
+    statusBar: false       // no status bar
   });
-  window.chart = chart;
+  chart.start();
 
-  // Fetch REAL candles from Binance public API
-  async function fetchBinanceCandles(symbol, interval, limit) {
-    const url = 'https://api.binance.com/api/v3/klines?symbol=' + symbol + '&interval=' + interval + '&limit=' + limit;
-    const res = await fetch(url);
-    if (!res.ok) throw new Error('Binance API error: ' + res.status);
-    const raw = await res.json();
-    return raw.map(function (k) {
-      return {
-        time: Math.floor(k[0] / 1000),
-        open:  parseFloat(k[1]),
-        high:  parseFloat(k[2]),
-        low:   parseFloat(k[3]),
-        close: parseFloat(k[4]),
-        volume: parseFloat(k[5])
-      };
-    });
-  }
-
-  fetchBinanceCandles('BTCUSDT', '1h', 500)
-    .then(function (candles) {
-      chart.setData(candles);
-      chart.start();
-      console.log('[BADI-CHARTS-V2] Loaded ' + candles.length + ' candles from Binance');
-    })
-    .catch(function (err) {
-      console.error('[BADI-CHARTS-V2] Failed to load data:', err);
-      chart.start();
-    });
-
-  // (Optional) Live WebSocket updates — uncomment to enable:
-  /*
-  const ws = new WebSocket('wss://stream.binance.com:9443/ws/btcusdt@kline_1h');
-  ws.onmessage = function (ev) {
-    const k = JSON.parse(ev.data).k;
-    if (!k) return;
-    chart.update({
-      time: Math.floor(k.t / 1000),
-      open: parseFloat(k.o), high: parseFloat(k.h),
-      low: parseFloat(k.l), close: parseFloat(k.c),
-      volume: parseFloat(k.v)
-    });
-  };
-  */
-})();
+  // Feed your data here:
+  // chart.setData([{time, open, high, low, close, volume}, ...]);
+  // chart.update(latestCandle);
 </script>
 </body>
 </html>
