@@ -1177,7 +1177,7 @@ class TradingChart {
       // Update crosshair
       if (this.inChartArea(this.touchStartX, this.touchStartY)) {
         const idx = this.xToIndex(this.touchStartX);
-        this.crosshairIndex = clamp(idx, 0, this.sim.candles.length - 1);
+        this.crosshairIndex = idx;
       }
     } else if (touches.length === 2) {
       // Two-finger pinch = zoom
@@ -1228,7 +1228,7 @@ class TradingChart {
       this.autoScale();
       if (this.inChartArea(x, y)) {
         const idx = this.xToIndex(x);
-        this.crosshairIndex = clamp(idx, 0, this.sim.candles.length - 1);
+        this.crosshairIndex = idx;
       }
     } else if (this.currentDrawing && touches.length === 1) {
       const t = touches[0];
@@ -1575,27 +1575,20 @@ class TradingChart {
   // - Maximum rightOffset: allows up to ~50% of visible width as empty space on right
   // - Minimum rightOffset: keeps at least ~50% of visible width showing actual data
   constrainRightOffset() {
+    // Free scrolling — allow dragging freely in both directions (past and future).
+    // Like TradingView, the user can scroll as far as they want.
+    // The only limit: don't allow scrolling so far that the chart is completely empty
+    // (at least keep some context visible). We allow up to 10x the visible width
+    // of empty space on either side.
     const visibleBars = (this.chartRight - this.chartLeft) / this.barSpacing;
     const N = this.sim.candles.length;
-    // Don't allow scrolling more than half the visible width past the last candle
-    const maxRight = visibleBars * 0.5;
-    // Don't allow scrolling more than (N + half visible) past — prevents leaving chart blank
-    const minRight = -(N - 1) - visibleBars * 0.5 + (N - 1); // = -visibleBars * 0.5
-    // Actually: we need at least the last candle visible-ish OR first candle visible
-    // Simpler: ensure the rightmost visible index is at least 0 (some data on screen)
-    // idx_at_chartRight = N - 1 + rightOffset
-    // require: idx_at_chartLeft >= -visibleBars * 0.5  (allow some empty space on left)
-    //          idx_at_chartRight <= N - 1 + visibleBars * 0.5  (allow some empty on right)
-    const idxAtRight = (N - 1) + this.rightOffset;
-    const idxAtLeft = idxAtRight - visibleBars;
-    const minIdxLeft = -visibleBars * 0.3;
-    const maxIdxRight = (N - 1) + visibleBars * 0.3;
-    if (idxAtLeft < minIdxLeft) {
-      this.rightOffset = minIdxLeft + visibleBars - (N - 1);
-    }
-    if (idxAtRight > maxIdxRight) {
-      this.rightOffset = maxIdxRight - (N - 1);
-    }
+    const maxEmpty = visibleBars * 10;  // generous limit — 10 screen widths of empty space
+    // Right side (future): rightOffset can go up to maxEmpty
+    // Left side (past): rightOffset can go down to -(N - 1) - maxEmpty
+    const maxRight = maxEmpty;
+    const minRight = -(N - 1) - maxEmpty;
+    if (this.rightOffset > maxRight) this.rightOffset = maxRight;
+    if (this.rightOffset < minRight) this.rightOffset = minRight;
   }
 
   /* --------------------------- Coordinate Helpers ------------------------ */
@@ -1990,10 +1983,9 @@ class TradingChart {
       ctx.lineTo(this.chartRight, Math.floor(y) + 0.5);
       ctx.stroke();
     }
-    // Time tick marks for vertical grid lines
+    // Time tick marks for vertical grid lines (including future area)
     const timeMarks = this.getTimeMarks();
     for (const m of timeMarks) {
-      if (m.index < 0 || m.index >= this.sim.candles.length) continue;
       const x = this.indexToX(m.index);
       if (x < this.chartLeft || x > this.chartRight) continue;
       ctx.beginPath();
@@ -3002,6 +2994,21 @@ class TradingChart {
   }
 
   /* --------------------------- Time Axis --------------------------------- */
+  // Get the time (unix seconds) at any index, including future indices.
+  // For indices within the data: use actual candle time.
+  // For indices beyond the data (future): extrapolate from last candle + timeframe.
+  _timeAtIndex(idx) {
+    const N = this.sim.candles.length;
+    if (N === 0) return 0;
+    if (idx >= 0 && idx < N) return this.sim.candles[idx].time;
+    if (idx < 0) {
+      // Past: extrapolate backwards from first candle
+      return this.sim.candles[0].time + idx * (this.timeframe.ms / 1000);
+    }
+    // Future: extrapolate from last candle
+    return this.sim.candles[N - 1].time + (idx - (N - 1)) * (this.timeframe.ms / 1000);
+  }
+
   drawTimeAxis() {
     const ctx = this.ctx;
     const axisTop = this.layout.paneBottom || this.chartBottom;
@@ -3019,18 +3026,16 @@ class TradingChart {
     ctx.textAlign = 'center';
     const marks = this.getTimeMarks();
     // LWC-style collision detection: skip labels that would overlap previous one.
-    // Use estimated label width + small gap.
     let prevRightEdge = -Infinity;
     for (const m of marks) {
-      if (m.index < 0 || m.index >= this.sim.candles.length) continue;
       const x = this.indexToX(m.index);
       if (x < this.chartLeft || x > this.chartRight) continue;
-      const label = formatTickMark(this.sim.candles[m.index].time, m.weight, this.timeframe.label);
-      // Approximate width: each char ~6px at 11px font
+      // Get time at this index (works for past, present, and future)
+      const timeSec = this._timeAtIndex(m.index);
+      const label = formatTickMark(timeSec, m.weight, this.timeframe.label);
       const labelW = label.length * 6 + 8;
       const leftEdge = x - labelW / 2;
       const rightEdge = x + labelW / 2;
-      // Skip if would overlap previous label or go off-chart
       if (leftEdge < prevRightEdge + 4) continue;
       if (leftEdge < this.chartLeft + 4 || rightEdge > this.chartRight - 4) continue;
       ctx.fillText(label, Math.floor(x), axisTop + this.layout.timeAxisH / 2);
@@ -3046,7 +3051,7 @@ class TradingChart {
         !this.inPriceAxis(this.mouseX, this.mouseY)) return;
     const ctx = this.ctx;
     const idx = Math.round(this.crosshairIndex);
-    if (idx < 0 || idx >= this.sim.candles.length) return;
+    // Allow crosshair in future area (idx >= candles.length) and past area (idx < 0)
     const x = this.indexToX(idx);
     const y = this.mouseY;
 
@@ -3067,8 +3072,8 @@ class TradingChart {
     }
     ctx.setLineDash([]);
 
-    // Time label on axis
-    const t = this.sim.candles[idx].time;
+    // Time label on axis — use _timeAtIndex for future/past support
+    const t = this._timeAtIndex(idx);
     const date = new Date(t * 1000);
     const pad2 = (n) => n < 10 ? '0' + n : '' + n;
     let timeStr;
@@ -3114,9 +3119,11 @@ class TradingChart {
       return;
     }
     const idx = this.crosshairIndex !== null ?
-      clamp(Math.round(this.crosshairIndex), 0, this.sim.candles.length - 1) :
+      Math.round(this.crosshairIndex) :
       this.sim.candles.length - 1;
-    const c = this.sim.candles[idx];
+    // For OHLC display, use the last candle if hovering in the future area
+    const ohlcIdx = clamp(idx, 0, this.sim.candles.length - 1);
+    const c = this.sim.candles[ohlcIdx];
     if (!c) return;
 
     // Line 1: Symbol · Timeframe · OHLC · Change (always shown)
@@ -3273,24 +3280,30 @@ class TradingChart {
       if (c) return this._fmtVol(c.volume);
       return '—';
     }
-    if (id === 'ma20' && this.indCache.ma20 && this.indCache.ma20[idx] !== null)
-      return this.priceScale.formatLogical(this.indCache.ma20[idx]);
-    if (id === 'ma50' && this.indCache.ma50 && this.indCache.ma50[idx] !== null)
-      return this.priceScale.formatLogical(this.indCache.ma50[idx]);
-    if (id === 'ma200' && this.indCache.ma200 && this.indCache.ma200[idx] !== null)
-      return this.priceScale.formatLogical(this.indCache.ma200[idx]);
-    if (id === 'ema20' && this.indCache.ema20 && this.indCache.ema20[idx] !== null)
-      return this.priceScale.formatLogical(this.indCache.ema20[idx]);
-    if (id === 'ema50' && this.indCache.ema50 && this.indCache.ema50[idx] !== null)
-      return this.priceScale.formatLogical(this.indCache.ema50[idx]);
-    if (id === 'bb' && this.indCache.bb && this.indCache.bb.mid && this.indCache.bb.mid[idx] !== null)
-      return this.priceScale.formatLogical(this.indCache.bb.mid[idx]);
-    if (id === 'volsma' && this.indCache.volsma && this.indCache.volsma[idx] !== null)
-      return this._fmtVol(this.indCache.volsma[idx]);
-    if (id === 'rsi' && this.indCache.rsi && this.indCache.rsi[idx] !== null)
-      return this.indCache.rsi[idx].toFixed(2);
-    if (id === 'macd' && this.indCache.macd && this.indCache.macd.macd && this.indCache.macd.macd[idx] !== null)
-      return this.indCache.macd.macd[idx].toFixed(3);
+    // For all other indicators, check that idx is within bounds and value is not null/undefined
+    const safeGet = function (arr) {
+      if (!arr || idx < 0 || idx >= arr.length) return null;
+      return arr[idx];
+    };
+    if (id === 'ma20') { const v = safeGet(this.indCache.ma20); if (v !== null && v !== undefined) return this.priceScale.formatLogical(v); }
+    if (id === 'ma50') { const v = safeGet(this.indCache.ma50); if (v !== null && v !== undefined) return this.priceScale.formatLogical(v); }
+    if (id === 'ma200') { const v = safeGet(this.indCache.ma200); if (v !== null && v !== undefined) return this.priceScale.formatLogical(v); }
+    if (id === 'ema20') { const v = safeGet(this.indCache.ema20); if (v !== null && v !== undefined) return this.priceScale.formatLogical(v); }
+    if (id === 'ema50') { const v = safeGet(this.indCache.ema50); if (v !== null && v !== undefined) return this.priceScale.formatLogical(v); }
+    if (id === 'bb') {
+      if (this.indCache.bb && this.indCache.bb.mid) {
+        const v = safeGet(this.indCache.bb.mid);
+        if (v !== null && v !== undefined) return this.priceScale.formatLogical(v);
+      }
+    }
+    if (id === 'volsma') { const v = safeGet(this.indCache.volsma); if (v !== null && v !== undefined) return this._fmtVol(v); }
+    if (id === 'rsi') { const v = safeGet(this.indCache.rsi); if (v !== null && v !== undefined) return v.toFixed(2); }
+    if (id === 'macd') {
+      if (this.indCache.macd && this.indCache.macd.macd) {
+        const v = safeGet(this.indCache.macd.macd);
+        if (v !== null && v !== undefined) return v.toFixed(3);
+      }
+    }
     if (id === 'vprof') {
       // Show POC price for Volume Profile
       const firstIdx = Math.max(0, Math.floor(this.xToIndex(this.chartLeft)));
