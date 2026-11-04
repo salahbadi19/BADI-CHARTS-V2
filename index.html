@@ -45,6 +45,8 @@
   <button data-tool="text"    title="Text">T</button>
   <button data-tool="eraser"  title="Eraser">✕</button>
   <div class="sep"></div>
+  <button data-tool="circle"   title="Circle (custom tool)">○ Circle</button>
+  <div class="sep"></div>
   <button data-ind="sma20"   class="active">SMA20</button>
   <button data-ind="sma50"   class="active">SMA50</button>
   <button data-ind="rsi"     class="active">RSI</button>
@@ -54,8 +56,8 @@
   <button data-action="clear"    title="Clear drawings">Clr</button>
 </div>
 
-<!-- BADI-CHARTS-V2 v2.1.0 from CDN -->
-<script src="https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@v2.1.0/chart.js"></script>
+<!-- BADI-CHARTS-V2 v2.1.1 from CDN -->
+<script src="https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@v2.1.1/chart.js"></script>
 <script>
   // ─── 1. Create a headless chart instance (no built-in indicators) ──
   const chart = new BadiCharts(document.getElementById('chart'), {
@@ -64,6 +66,40 @@
     // No `indicators` option here — we add them below via addIndicator(def).
   });
   chart.start();
+
+  // ─── 2a. Register a CUSTOM drawing tool (v2.1.1+) ─────────────────
+  // Custom tools have: onStart, onUpdate (optional), onDraw, onHitTest.
+  chart.addDrawingTool({
+    id: 'circle',
+    label: 'Circle',
+    icon: '○',
+    defaultStyle: { color: '#ff9800', lineWidth: 1.5 },
+    onStart: function (ctx) {
+      // ctx = { x, y, idx, price } — click position in pixels and chart coords
+      return {
+        type: 'circle',
+        cx: ctx.x, cy: ctx.y,
+        i: ctx.idx, p: ctx.price,
+        radius: 0,
+        color: '#ff9800',
+        lineWidth: 1.5
+      };
+    },
+    onUpdate: function (drawing, ctx) {
+      drawing.radius = Math.hypot(ctx.x - drawing.cx, ctx.y - drawing.cy);
+    },
+    onDraw: function (ctx, d, helpers) {
+      ctx.strokeStyle = d.color;
+      ctx.lineWidth = d.lineWidth || 1.5;
+      ctx.beginPath();
+      ctx.arc(d.cx, d.cy, Math.max(1, d.radius), 0, Math.PI * 2);
+      ctx.stroke();
+    },
+    onHitTest: function (d, x, y, helpers) {
+      const dist = Math.hypot(x - d.cx, y - d.cy);
+      return Math.abs(dist - d.radius) < 8;
+    }
+  });
 
   // ─── 2. Register custom indicators (all user-defined) ──────────────
   // Each definition has: id, label, type ('overlay'|'pane'|'volume'),

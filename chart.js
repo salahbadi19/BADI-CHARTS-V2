@@ -30,7 +30,7 @@
 'use strict';
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.1.0';
+const VERSION = '2.1.1';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 
 /* ============================ THEME ========================================= */
@@ -2031,11 +2031,66 @@ class TradingChart {
       };
       return;
     }
+    // ── Custom tool support (v2.1.1+) ──────────────────────────────────
+    // If the active tool is a registered custom tool, call its onStart(ctx)
+    // hook to create the drawing object. If onStart is not provided, create a
+    // generic drawing object with the click position.
+    const customTool = this._customTools && this._customTools[tool];
+    if (customTool) {
+      const startCtx = { x: x, y: y, idx: idx, price: price };
+      let newDrawing = null;
+      if (typeof customTool.onStart === 'function') {
+        try {
+          newDrawing = customTool.onStart(startCtx);
+        } catch (e) {
+          if (BADI_DEBUG) console.error('[BadiCharts] Custom tool onStart error (' + tool + '):', e);
+        }
+      } else {
+        // Default: create a generic click-and-drag drawing object.
+        const ds = customTool.defaultStyle || {};
+        newDrawing = {
+          type: tool,
+          i1: idx, p1: price, i2: idx, p2: price,
+          x1: x, y1: y, x2: x, y2: y,
+          color: ds.color || THEME.drawingActive,
+          lineWidth: ds.lineWidth || 1.5,
+          id: Date.now()
+        };
+      }
+      if (newDrawing) {
+        // Ensure required fields
+        newDrawing.type = newDrawing.type || tool;
+        newDrawing.id = newDrawing.id || Date.now();
+        newDrawing.color = newDrawing.color || (customTool.defaultStyle && customTool.defaultStyle.color) || THEME.drawingActive;
+        newDrawing.lineWidth = newDrawing.lineWidth || (customTool.defaultStyle && customTool.defaultStyle.lineWidth) || 1.5;
+        this.currentDrawing = newDrawing;
+      }
+      return;
+    }
   }
   updateCurrentDrawing(x, y) {
     if (!this.currentDrawing) return;
     const idx = this.xToIndex(x);
     const price = this.yToPrice(y);
+    // ── Custom tool support (v2.1.1+) ──────────────────────────────────
+    const customTool = this._customTools && this._customTools[this.currentDrawing.type];
+    if (customTool) {
+      if (typeof customTool.onUpdate === 'function') {
+        const updateCtx = { x: x, y: y, idx: idx, price: price };
+        try {
+          customTool.onUpdate(this.currentDrawing, updateCtx);
+        } catch (e) {
+          if (BADI_DEBUG) console.error('[BadiCharts] Custom tool onUpdate error (' + this.currentDrawing.type + '):', e);
+        }
+      } else {
+        // Default: update i2/p2 and x2/y2 (click-and-drag behavior)
+        this.currentDrawing.i2 = idx;
+        this.currentDrawing.p2 = price;
+        this.currentDrawing.x2 = x;
+        this.currentDrawing.y2 = y;
+      }
+      return;
+    }
     if (this.currentDrawing.type === 'brush' || this.currentDrawing.type === 'poly') {
       // For brush: add point on every move (freehand)
       if (this.currentDrawing.type === 'brush') {
@@ -2744,11 +2799,47 @@ class TradingChart {
           ctx.stroke();
           break;
         }
+        default: {
+          // ── Custom tool support (v2.1.1+) ────────────────────────────
+          // If the drawing's type matches a registered custom tool, call its
+          // onDraw(ctx, drawing, helpers) to render it.
+          const customTool = this._customTools && this._customTools[d.type];
+          if (customTool && typeof customTool.onDraw === 'function') {
+            const helpers = this._drawingHelpers();
+            try {
+              customTool.onDraw(ctx, d, helpers);
+            } catch (e) {
+              if (BADI_DEBUG) console.error('[BadiCharts] Custom tool onDraw error (' + d.type + '):', e);
+            }
+          }
+          break;
+        }
       }
       if (needsClip) ctx.restore();
     };
     for (const d of this.drawings) drawOne(d);
     if (this.currentDrawing) drawOne(this.currentDrawing, true);
+  }
+
+  // Build the helpers object passed to custom drawing tools' onDraw / onHitTest.
+  // Contains coordinate-conversion functions and current chart geometry.
+  _drawingHelpers() {
+    const self = this;
+    return {
+      indexToX:    function (i) { return self.indexToX(i); },
+      priceToY:    function (p) { return self.priceToY(p); },
+      xToIndex:    function (x) { return self.xToIndex(x); },
+      yToPrice:    function (y) { return self.yToPrice(y); },
+      chartLeft:   self.chartLeft,
+      chartRight:  self.chartRight,
+      chartTop:    self.chartTop,
+      chartBottom: self.chartBottom,
+      priceTop:    self.priceTop,
+      priceBottom: self.priceBottom,
+      barSpacing:  self.barSpacing,
+      dpr:         self.dpr,
+      THEME:       THEME
+    };
   }
 
   /* --------------------------- Drawing Properties Panel ------------------- */
@@ -3006,6 +3097,21 @@ class TradingChart {
         ctx.font = '12px -apple-system, Segoe UI, Roboto, sans-serif';
         const tw = this.ctx.measureText(d.text).width + 8;
         return x >= x1 - 2 && x <= x1 + tw && y >= y1 - 16 && y <= y1 + 2;
+      }
+      default: {
+        // ── Custom tool support (v2.1.1+) ────────────────────────────
+        // If the drawing's type matches a registered custom tool, call its
+        // onHitTest(drawing, x, y, helpers) to determine if (x,y) is on it.
+        const customTool = this._customTools && this._customTools[d.type];
+        if (customTool && typeof customTool.onHitTest === 'function') {
+          const helpers = this._drawingHelpers();
+          try {
+            return !!customTool.onHitTest(d, x, y, helpers);
+          } catch (e) {
+            if (BADI_DEBUG) console.error('[BadiCharts] Custom tool onHitTest error (' + d.type + '):', e);
+          }
+        }
+        return false;
       }
     }
     return false;

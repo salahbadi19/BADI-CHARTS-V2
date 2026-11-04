@@ -4,10 +4,23 @@
 >
 > Pixel-perfect rendering, 14 drawing tools, fully custom indicators via API — you bring the data, the UI, and the indicators. BADI-CHARTS-V2 renders the chart.
 
-[![Version](https://img.shields.io/badge/version-2.1.0-2962ff.svg)](#)
+[![Version](https://img.shields.io/badge/version-2.1.1-2962ff.svg)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-26a69a.svg)](LICENSE)
 [![No Dependencies](https://img.shields.io/badge/dependencies-zero-ff9800.svg)](#)
 [![Headless](https://img.shields.io/badge/UI-headless-9c27b0.svg)](#)
+
+---
+
+## ⚠️ What changed in v2.1.1
+
+**Custom drawing tools are now fully functional.** Previous versions registered custom tools via `addDrawingTool()` but the rendering/hit-testing/start hooks were never actually called. v2.1.1 wires them up:
+
+- `drawDrawings()` now has a `default` case that calls `tool.onDraw(ctx, drawing, helpers)` for custom tool drawings.
+- `startDrawing()` now calls `tool.onStart(ctx)` when a custom tool is activated (or creates a generic drawing object if `onStart` is not provided).
+- `updateCurrentDrawing()` now calls `tool.onUpdate(drawing, ctx)` while dragging (or updates `i2/p2/x2/y2` by default).
+- `hitTestDrawing()` now has a `default` case that calls `tool.onHitTest(drawing, x, y, helpers)`.
+
+No breaking changes from v2.1.0 — the `addDrawingTool()` API is the same, it just finally works.
 
 ---
 
@@ -74,7 +87,7 @@ const chart = new BadiCharts(canvas, { /* options */ });
 <body>
   <canvas id="chart"></canvas>
   <!-- Load from CDN (headless, no built-in UI or indicators) -->
-  <script src="https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@v2.1.0/chart.js"></script>
+  <script src="https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@v2.1.1/chart.js"></script>
   <script>
     const canvas = document.getElementById('chart');
     const chart = new BadiCharts(canvas, {
@@ -188,14 +201,49 @@ chart.removeDrawing(id);       // remove one drawing, returns the removed drawin
 chart.getSelectedDrawing();    // currently selected drawing (or null)
 chart.selectDrawingById(id);   // programmatically select a drawing
 
-// Register a CUSTOM drawing tool (advanced):
+// Register a CUSTOM drawing tool (v2.1.1+ — fully functional):
 chart.addDrawingTool({
-  id: 'myTool',
-  label: 'My Tool',
-  icon: '◆',
-  onDraw: function (ctx, drawing) { /* render */ },
-  onHitTest: function (drawing, x, y) { return boolean; },
-  defaultStyle: { color: '#2962ff', lineWidth: 1.5 }
+  id: 'circle',
+  label: 'Circle',
+  icon: '○',
+  defaultStyle: { color: '#ff9800', lineWidth: 1.5 },
+  // onStart: called when the user clicks to start drawing.
+  // Should return a new drawing object (or null/undefined to cancel).
+  // If you omit onStart, the chart creates a generic click-and-drag drawing
+  // with {i1, p1, i2, p2, x1, y1, x2, y2, color, lineWidth, id}.
+  onStart: function (ctx) {
+    // ctx = { x, y, idx, price } — click position in pixels and chart coords
+    return {
+      type: 'circle',
+      cx: ctx.x, cy: ctx.y,        // center in pixels
+      i: ctx.idx, p: ctx.price,     // center in chart coords
+      radius: 0,
+      color: '#ff9800',
+      lineWidth: 1.5
+    };
+  },
+  // onUpdate: called while the user drags (optional).
+  // Update the drawing object in place. If omitted, the chart updates
+  // i2/p2/x2/y2 on the generic drawing object.
+  onUpdate: function (drawing, ctx) {
+    drawing.radius = Math.hypot(ctx.x - drawing.cx, ctx.y - drawing.cy);
+  },
+  // onDraw: called to render the drawing. Required.
+  onDraw: function (ctx, drawing, helpers) {
+    // helpers = { indexToX, priceToY, xToIndex, yToPrice, chartLeft, chartRight,
+    //             chartTop, chartBottom, priceTop, priceBottom, barSpacing, dpr, THEME }
+    ctx.strokeStyle = drawing.color;
+    ctx.lineWidth = drawing.lineWidth || 1.5;
+    ctx.beginPath();
+    ctx.arc(drawing.cx, drawing.cy, Math.max(1, drawing.radius), 0, Math.PI * 2);
+    ctx.stroke();
+  },
+  // onHitTest: return true if (x, y) is on the drawing. Required for
+  // selection and the eraser tool to work.
+  onHitTest: function (drawing, x, y, helpers) {
+    const dist = Math.hypot(x - drawing.cx, y - drawing.cy);
+    return Math.abs(dist - drawing.radius) < 8;
+  }
 });
 ```
 
