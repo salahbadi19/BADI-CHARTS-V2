@@ -4,10 +4,24 @@
 >
 > Pixel-perfect rendering, 14 drawing tools, fully custom indicators via API — you bring the data, the UI, and the indicators. BADI-CHARTS-V2 renders the chart.
 
-[![Version](https://img.shields.io/badge/version-2.1.1-2962ff.svg)](#)
+[![Version](https://img.shields.io/badge/version-2.2.0-2962ff.svg)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-26a69a.svg)](LICENSE)
 [![No Dependencies](https://img.shields.io/badge/dependencies-zero-ff9800.svg)](#)
 [![Headless](https://img.shields.io/badge/UI-headless-9c27b0.svg)](#)
+
+---
+
+## ⚠️ What changed in v2.2.0
+
+Three visual/rendering improvements:
+
+1. **Drawing properties panel moved to the top of the chart.** The floating panel (delete/lock/color/width/duplicate) used to appear next to the selected drawing. Now it always appears at the **top-center of the chart area**, in a predictable location that never overlaps the drawing or the axes.
+
+2. **Candle rendering at small zoom — no more blur.** When zoomed out (`barSpacing < 4` or candle body width ≤ 1 bitmap pixel), candles are now drawn as **single crisp vertical lines** from high to low (no separate body). This is the same approach Lightweight Charts uses at small barSpacing and eliminates the blurry anti-aliased look caused by overlapping sub-pixel-wide bodies and wicks.
+
+3. **Drawings are strictly clipped to the chart area.** Previously, `hline`, `fib`, and `band` drawings extended their labels onto the price axis, and `vline` extended into the pane/time axis. Now **ALL drawings** are clipped to `chartLeft..chartRight, chartTop..chartBottom`. Price labels for `hline`/`fib`/`band` are drawn **inside** the chart at the right edge instead of on the price axis.
+
+No breaking API changes from v2.1.1.
 
 ---
 
@@ -87,7 +101,7 @@ const chart = new BadiCharts(canvas, { /* options */ });
 <body>
   <canvas id="chart"></canvas>
   <!-- Load from CDN (headless, no built-in UI or indicators) -->
-  <script src="https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@v2.1.1/chart.js"></script>
+  <script src="https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@v2.2.0/chart.js"></script>
   <script>
     const canvas = document.getElementById('chart');
     const chart = new BadiCharts(canvas, {

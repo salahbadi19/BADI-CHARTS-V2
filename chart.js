@@ -30,7 +30,7 @@
 'use strict';
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.1.1';
+const VERSION = '2.2.0';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 
 /* ============================ THEME ========================================= */
@@ -2314,6 +2314,13 @@ class TradingChart {
     const bodyWidth = bodyWidthBmp / dpr;
     const wickWidth = wickWidthBmp / dpr;
 
+    // v2.2.0+: When very zoomed out (barSpacing < 4 OR body width <= 1 bitmap px),
+    // draw each candle as a single crisp vertical line from high to low —
+    // no separate body. This is exactly what Lightweight Charts does at small
+    // barSpacing and eliminates the "blurry" anti-aliased look caused by
+    // overlapping sub-pixel-wide bodies + wicks.
+    const drawAsLine = this.barSpacing < 4 || bodyWidthBmp <= 1;
+
     // Clip to price chart area so candles never overflow into toolbar/volume/axis
     ctx.save();
     ctx.beginPath();
@@ -2334,22 +2341,34 @@ class TradingChart {
       // Snap center to integer bitmap pixel for crisp wick
       const wickXBmp = Math.round(x * dpr);
       const wickX = wickXBmp / dpr;
-      const wickLeft = wickX - wickWidth / 2;
 
-      // Draw wick as a filled rectangle (LWC-style) for pixel-perfect crispness
       ctx.fillStyle = color;
-      const wickTop = Math.floor(yHigh * dpr) / dpr;
-      const wickBottom = Math.ceil(yLow * dpr) / dpr;
-      const wickH = Math.max(1 / dpr, wickBottom - wickTop);
-      ctx.fillRect(wickLeft, wickTop, wickWidth, wickH);
 
-      // Body — pixel-perfect rectangle
-      const bodyLeftBmp = wickXBmp - Math.floor(bodyWidthBmp / 2);
-      const bodyLeft = bodyLeftBmp / dpr;
-      const bodyTop = Math.round(Math.min(yOpen, yClose) * dpr) / dpr;
-      const bodyBottom = Math.round(Math.max(yOpen, yClose) * dpr) / dpr;
-      const bodyH = Math.max(1 / dpr, bodyBottom - bodyTop);
-      ctx.fillRect(bodyLeft, bodyTop, bodyWidth, bodyH);
+      if (drawAsLine) {
+        // ── LWC-style thin mode: single vertical line from high to low ──
+        // Use a crisp 1-bitmap-pixel-wide filled rectangle.
+        const lineLeft = wickX - wickWidth / 2;
+        const lineTop = Math.floor(yHigh * dpr) / dpr;
+        const lineBot = Math.ceil(yLow * dpr) / dpr;
+        const lineH = Math.max(1 / dpr, lineBot - lineTop);
+        ctx.fillRect(lineLeft, lineTop, wickWidth, lineH);
+      } else {
+        // ── Normal mode: wick + body ──
+        const wickLeft = wickX - wickWidth / 2;
+        // Draw wick as a filled rectangle (LWC-style) for pixel-perfect crispness
+        const wickTop = Math.floor(yHigh * dpr) / dpr;
+        const wickBottom = Math.ceil(yLow * dpr) / dpr;
+        const wickH = Math.max(1 / dpr, wickBottom - wickTop);
+        ctx.fillRect(wickLeft, wickTop, wickWidth, wickH);
+
+        // Body — pixel-perfect rectangle
+        const bodyLeftBmp = wickXBmp - Math.floor(bodyWidthBmp / 2);
+        const bodyLeft = bodyLeftBmp / dpr;
+        const bodyTop = Math.round(Math.min(yOpen, yClose) * dpr) / dpr;
+        const bodyBottom = Math.round(Math.max(yOpen, yClose) * dpr) / dpr;
+        const bodyH = Math.max(1 / dpr, bodyBottom - bodyTop);
+        ctx.fillRect(bodyLeft, bodyTop, bodyWidth, bodyH);
+      }
     }
     ctx.restore();
   }
@@ -2552,16 +2571,16 @@ class TradingChart {
       if (isHover && !isSelected) { ctx.lineWidth = (d.lineWidth || 1.5) + 1; ctx.strokeStyle = THEME.drawingActive; }
       if (isSelected) { ctx.lineWidth = (d.lineWidth || 1.5) + 0.5; }
 
-      // For drawings that stay inside the chart area, apply clip.
-      // hline and fib draw labels on the price axis, so they need special handling.
-      const needsClip = d.type !== 'hline' && d.type !== 'fib';
+      // v2.2.0+: ALL drawings are clipped to the chart area (chartLeft..chartRight,
+      // chartTop..chartBottom). No drawing — including hline, fib, band — is allowed
+      // to extend onto the price axis or time axis. Price labels for hline/fib/band
+      // are drawn INSIDE the chart at the right edge instead of on the price axis.
+      const needsClip = true;
       if (needsClip) {
         ctx.save();
         ctx.beginPath();
-        // Clip to entire chart vertical range (price + volume + pane if present)
-        const clipTop = this.chartTop;
-        const clipBottom = this.layout.paneBottom || this.chartBottom;
-        ctx.rect(this.chartLeft, clipTop, this.chartRight - this.chartLeft, clipBottom - clipTop);
+        // Clip strictly to the price chart area (not into the pane/volume/time axis)
+        ctx.rect(this.chartLeft, this.chartTop, this.chartRight - this.chartLeft, this.chartBottom - this.chartTop);
         ctx.clip();
       }
 
@@ -2648,7 +2667,7 @@ class TradingChart {
           break;
         }
         case 'band': {
-          // Band/Zone: shaded horizontal zone between p1 and p2, spanning full width
+          // Band/Zone: shaded horizontal zone between p1 and p2, spanning chart width
           const y1 = this.priceToY(d.p1);
           const y2 = this.priceToY(d.p2);
           const yTop = Math.min(y1, y2), yBot = Math.max(y1, y2);
@@ -2663,19 +2682,20 @@ class TradingChart {
           ctx.lineTo(this.chartRight, Math.floor(yBot) + 0.5);
           ctx.stroke();
           ctx.setLineDash([]);
-          // Labels on price axis
+          // v2.2.0+: Labels INSIDE the chart at the right edge (not on price axis)
           ctx.font = '10px -apple-system, Segoe UI, Roboto, sans-serif';
-          ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+          ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
           const t1 = this.priceScale.formatLogical(d.p1);
           const t2 = this.priceScale.formatLogical(d.p2);
           const tw1 = ctx.measureText(t1).width + 8;
           const tw2 = ctx.measureText(t2).width + 8;
           ctx.fillStyle = color;
-          ctx.fillRect(this.chartRight + 1, Math.floor(y1) - 7, tw1, 14);
-          ctx.fillRect(this.chartRight + 1, Math.floor(y2) - 7, tw2, 14);
+          ctx.fillRect(this.chartRight - tw1 - 2, Math.floor(y1) - 7, tw1, 14);
+          ctx.fillRect(this.chartRight - tw2 - 2, Math.floor(y2) - 7, tw2, 14);
           ctx.fillStyle = THEME.bg;
-          ctx.fillText(t1, this.chartRight + 5, Math.floor(y1));
-          ctx.fillText(t2, this.chartRight + 5, Math.floor(y2));
+          ctx.fillText(t1, this.chartRight - 4, Math.floor(y1));
+          ctx.fillText(t2, this.chartRight - 4, Math.floor(y2));
+          ctx.textAlign = 'left';
           break;
         }
         case 'hline': {
@@ -2686,22 +2706,25 @@ class TradingChart {
           ctx.lineTo(this.chartRight, Math.floor(y) + 0.5);
           ctx.stroke();
           ctx.setLineDash([]);
+          // v2.2.0+: Price label INSIDE the chart at the right edge (not on price axis)
           const txt = this.priceScale.formatLogical(d.price);
           ctx.font = '10px -apple-system, Segoe UI, Roboto, sans-serif';
           const tw = ctx.measureText(txt).width + 8;
           ctx.fillStyle = color;
-          ctx.fillRect(this.chartRight + 1, Math.floor(y) - 7, tw, 14);
+          ctx.fillRect(this.chartRight - tw - 2, Math.floor(y) - 7, tw, 14);
           ctx.fillStyle = THEME.bg;
-          ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
-          ctx.fillText(txt, this.chartRight + 5, Math.floor(y));
+          ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+          ctx.fillText(txt, this.chartRight - 4, Math.floor(y));
+          ctx.textAlign = 'left';
           break;
         }
         case 'vline': {
           const x = this.indexToX(d.index);
           ctx.setLineDash([4, 4]);
           ctx.beginPath();
+          // v2.2.0+: clip vline to chartTop..chartBottom only (not into pane/time axis)
           ctx.moveTo(Math.floor(x) + 0.5, this.chartTop);
-          ctx.lineTo(Math.floor(x) + 0.5, this.layout.paneBottom || this.chartBottom);
+          ctx.lineTo(Math.floor(x) + 0.5, this.chartBottom);
           ctx.stroke();
           ctx.setLineDash([]);
           break;
@@ -2766,7 +2789,7 @@ class TradingChart {
           const levels = [0, 0.236, 0.382, 0.5, 0.618, 0.786, 1, 1.618];
           const colors = ['#787b86','#ef5350','#ff9800','#26a69a','#2962ff','#9c27b0','#ef5350','#26a69a'];
           ctx.font = '10px -apple-system, Segoe UI, Roboto, sans-serif';
-          ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+          ctx.textBaseline = 'middle'; ctx.textAlign = 'right';
           for (let i = 0; i < levels.length; i++) {
             const y = y1 + (y2 - y1) * levels[i];
             ctx.strokeStyle = colors[i]; ctx.lineWidth = 1;
@@ -2779,11 +2802,14 @@ class TradingChart {
             const p = d.p1 + (d.p2 - d.p1) * levels[i];
             const txt = (levels[i] * 100).toFixed(1) + '% ' + this.priceScale.formatLogical(p);
             const tw = ctx.measureText(txt).width + 6;
+            // v2.2.0+: Label INSIDE the chart at the right edge of the fib span
+            const labelX = Math.min(xR, this.chartRight - tw - 2);
             ctx.fillStyle = colors[i];
-            ctx.fillRect(xR + 1, Math.floor(y) - 7, tw, 14);
+            ctx.fillRect(labelX, Math.floor(y) - 7, tw, 14);
             ctx.fillStyle = THEME.bg;
-            ctx.fillText(txt, xR + 4, Math.floor(y));
+            ctx.fillText(txt, labelX + tw - 3, Math.floor(y));
           }
+          ctx.textAlign = 'left';
           break;
         }
         case 'brush': {
@@ -2843,32 +2869,15 @@ class TradingChart {
   }
 
   /* --------------------------- Drawing Properties Panel ------------------- */
-  // Floating rectangle (like Excalidraw/TradingView) that appears when a
-  // drawing is selected. Contains: delete, lock, color picker, stroke width.
+  // Floating rectangle that appears when a drawing is selected.
+  // v2.2.0+: The panel is ALWAYS positioned at the top of the chart (not next
+  // to the drawing) so it never overlaps the price/time axes and stays in a
+  // predictable location. Contains: delete, lock, color picker, stroke width.
   drawDrawingPanel() {
     if (!this.selectedDrawing) { this._drawPanelHits = []; return; }
     const d = this.selectedDrawing;
     const ctx = this.ctx;
     this._drawPanelHits = [];
-
-    // Position the panel near the drawing's first point
-    let anchorX, anchorY;
-    if (d.type === 'hline') {
-      anchorX = this.chartLeft + 60;
-      anchorY = this.priceToY(d.price) - 30;
-    } else if (d.type === 'vline') {
-      anchorX = this.indexToX(d.index) + 10;
-      anchorY = this.chartTop + 10;
-    } else if (d.points && d.points.length > 0) {
-      anchorX = this.indexToX(d.points[0].i);
-      anchorY = this.priceToY(d.points[0].p) - 30;
-    } else {
-      anchorX = this.indexToX(d.i1 || 0);
-      anchorY = this.priceToY(d.p1 || 0) - 30;
-    }
-    // Clamp to chart area
-    anchorX = clamp(anchorX, this.chartLeft + 4, this.chartRight - 280);
-    anchorY = clamp(anchorY, this.chartTop + 4, this.chartBottom - 40);
 
     // Panel dimensions
     const iconSize = 20;
@@ -2879,6 +2888,11 @@ class TradingChart {
     const widths = [1, 1.5, 2, 3, 5];
     const numIcons = 5 + colors.length + widths.length; // delete + lock + colorSwatches + widthButtons + duplicate
     const panelW = 8 + numIcons * (iconSize - 6) + 8;
+
+    // v2.2.0+: Always position at the top-center of the chart area.
+    const anchorX = clamp(this.chartLeft + (this.chartRight - this.chartLeft - panelW) / 2,
+                          this.chartLeft + 4, this.chartRight - panelW - 4);
+    const anchorY = this.chartTop + 4;
 
     // Draw panel background
     ctx.fillStyle = 'rgba(26,30,42,0.95)';
