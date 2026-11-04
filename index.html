@@ -4,19 +4,17 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
 <meta name="theme-color" content="#0e1015">
-<title>BADI-CHARTS-V2 — Headless</title>
+<title>BADI-CHARTS-V2 — Headless + Custom Indicators</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   html, body { width: 100%; height: 100%; overflow: hidden; background: #0e1015; color: #e0e3eb; font-family: -apple-system, Segoe UI, Roboto, sans-serif; }
   #chart { display: block; width: 100vw; height: 100vh; cursor: crosshair; }
 
-  /* ── Custom toolbar (you build your own — this is just a tiny example) ── */
   #toolbar {
     position: fixed; top: 8px; left: 8px; z-index: 10;
-    display: flex; gap: 4px; padding: 4px;
+    display: flex; gap: 4px; padding: 4px; flex-wrap: wrap;
     background: rgba(26, 30, 42, 0.92);
-    border: 1px solid #2a2e39;
-    border-radius: 6px;
+    border: 1px solid #2a2e39; border-radius: 6px;
     backdrop-filter: blur(6px);
   }
   #toolbar button {
@@ -34,7 +32,7 @@
 <body>
 <canvas id="chart"></canvas>
 
-<!-- ── Custom UI toolbar (you own this — wire buttons to the chart API) ── -->
+<!-- Custom HTML toolbar — wire buttons to the chart API -->
 <div id="toolbar">
   <button data-tool="cursor" class="active" title="Cursor">↖</button>
   <div class="sep"></div>
@@ -47,48 +45,171 @@
   <button data-tool="text"    title="Text">T</button>
   <button data-tool="eraser"  title="Eraser">✕</button>
   <div class="sep"></div>
+  <button data-ind="sma20"   class="active">SMA20</button>
+  <button data-ind="sma50"   class="active">SMA50</button>
+  <button data-ind="rsi"     class="active">RSI</button>
+  <button data-ind="volume"  class="active">Vol</button>
+  <div class="sep"></div>
   <button data-action="reset"    title="Reset view">Rst</button>
   <button data-action="clear"    title="Clear drawings">Clr</button>
-  <button data-action="addRsi"   title="Toggle RSI">RSI</button>
 </div>
 
-<!-- BADI-CHARTS-V2 v2.0.0 from CDN (HEADLESS — no built-in toolbar) -->
-<script src="https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@v2.0.0/chart.js"></script>
+<!-- BADI-CHARTS-V2 v2.1.0 from CDN -->
+<script src="https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@v2.1.0/chart.js"></script>
 <script>
-  // 1) Create a headless chart instance.
-  //    The library no longer ships a toolbar — `toolbar: false` is the default
-  //    and the option is ignored (kept only for backward compatibility).
+  // ─── 1. Create a headless chart instance (no built-in indicators) ──
   const chart = new BadiCharts(document.getElementById('chart'), {
-    symbol:    { label: 'SYMBOL', priceScale: 100, decimals: 2 },
-    timeframe: { label: '1H', ms: 3600000 },
-    indicators: [],        // start with no indicators
-    statusBar:  false      // headless — no built-in status bar either
+    symbol:    { label: 'BTCUSDT', priceScale: 100, decimals: 2 },
+    timeframe: { label: '1H', ms: 3600000 }
+    // No `indicators` option here — we add them below via addIndicator(def).
   });
   chart.start();
 
-  // 2) Wire your custom toolbar buttons to the chart API.
+  // ─── 2. Register custom indicators (all user-defined) ──────────────
+  // Each definition has: id, label, type ('overlay'|'pane'|'volume'),
+  // color, settings, calculate(candles, settings), render(ctx, values, helpers, settings, state).
+  // Optional: formatValue(value, settings), getRange(values, settings) for pane indicators.
+
+  // SMA 20 — overlay line
+  chart.addIndicator({
+    id: 'sma20',
+    label: 'SMA 20',
+    type: 'overlay',
+    color: '#2962ff',
+    settings: { period: 20 },
+    calculate: function (candles, s) {
+      const out = new Array(candles.length).fill(null);
+      let sum = 0; const p = s.period || 20;
+      for (let i = 0; i < candles.length; i++) {
+        sum += candles[i].close;
+        if (i >= p) sum -= candles[i - p].close;
+        if (i >= p - 1) out[i] = sum / p;
+      }
+      return out;
+    },
+    render: function (ctx, v, h, s) {
+      ctx.strokeStyle = s.color; ctx.lineWidth = 1.5; ctx.beginPath();
+      let started = false;
+      for (let i = h.firstIdx; i <= h.lastIdx; i++) {
+        if (v[i] === null) { started = false; continue; }
+        const x = h.indexToX(i), y = h.priceToY(v[i]);
+        if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+    }
+  });
+
+  // SMA 50 — overlay line
+  chart.addIndicator({
+    id: 'sma50', label: 'SMA 50', type: 'overlay', color: '#ff9800',
+    settings: { period: 50 },
+    calculate: function (c, s) {
+      const out = new Array(c.length).fill(null);
+      let sum = 0; const p = s.period || 50;
+      for (let i = 0; i < c.length; i++) {
+        sum += c[i].close;
+        if (i >= p) sum -= c[i - p].close;
+        if (i >= p - 1) out[i] = sum / p;
+      }
+      return out;
+    },
+    render: function (ctx, v, h, s) {
+      ctx.strokeStyle = s.color; ctx.lineWidth = 1.5; ctx.beginPath();
+      let started = false;
+      for (let i = h.firstIdx; i <= h.lastIdx; i++) {
+        if (v[i] === null) { started = false; continue; }
+        const x = h.indexToX(i), y = h.priceToY(v[i]);
+        if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+    }
+  });
+
+  // Volume — type='volume' with no calculate/render: the chart draws bars automatically
+  chart.addIndicator({ id: 'volume', label: 'Volume', type: 'volume', color: '#26a69a' });
+
+  // RSI 14 — pane indicator (renders in a separate pane below the chart)
+  chart.addIndicator({
+    id: 'rsi', label: 'RSI 14', type: 'pane', color: '#d32f53',
+    settings: { period: 14 },
+    calculate: function (c, s) {
+      const p = s.period || 14;
+      const out = new Array(c.length).fill(null);
+      let avgGain = 0, avgLoss = 0;
+      for (let i = 0; i < c.length; i++) {
+        if (i === 0) { out[i] = 50; continue; }
+        const ch = c[i].close - c[i - 1].close;
+        const gain = ch > 0 ? ch : 0;
+        const loss = ch < 0 ? -ch : 0;
+        if (i <= p) {
+          avgGain += gain; avgLoss += loss;
+          if (i === p) {
+            avgGain /= p; avgLoss /= p;
+            const rs = avgLoss === 0 ? 100 : avgGain / avgLoss;
+            out[i] = 100 - 100 / (1 + rs);
+          }
+        } else {
+          avgGain = (avgGain * (p - 1) + gain) / p;
+          avgLoss = (avgLoss * (p - 1) + loss) / p;
+          const rs = avgLoss === 0 ? 100 : avgGain / avgLoss;
+          out[i] = 100 - 100 / (1 + rs);
+        }
+      }
+      return out;
+    },
+    getRange: function () { return { min: 0, max: 100 }; },
+    render: function (ctx, v, h, s) {
+      ctx.setLineDash([3, 3]); ctx.lineWidth = 1;
+      const y70 = h.paneToY(70), y30 = h.paneToY(30);
+      ctx.strokeStyle = '#ef5350';
+      ctx.beginPath(); ctx.moveTo(h.chartLeft, y70); ctx.lineTo(h.chartRight, y70); ctx.stroke();
+      ctx.strokeStyle = '#26a69a';
+      ctx.beginPath(); ctx.moveTo(h.chartLeft, y30); ctx.lineTo(h.chartRight, y30); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.strokeStyle = s.color; ctx.lineWidth = 1.5; ctx.beginPath();
+      let started = false;
+      for (let i = h.firstIdx; i <= h.lastIdx; i++) {
+        if (v[i] === null) { started = false; continue; }
+        const x = h.indexToX(i), y = h.paneToY(v[i]);
+        if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+    }
+  });
+
+  // ─── 3. Feed your data ─────────────────────────────────────────────
+  // chart.setData([{time, open, high, low, close, volume}, ...]);
+  // chart.update(latestCandle);
+
+  // ─── 4. Wire your custom toolbar ───────────────────────────────────
   const buttons = document.querySelectorAll('#toolbar button');
   buttons.forEach(function (btn) {
     btn.addEventListener('click', function () {
-      const tool   = btn.getAttribute('data-tool');
+      const tool = btn.getAttribute('data-tool');
+      const ind = btn.getAttribute('data-ind');
       const action = btn.getAttribute('data-action');
-
       if (tool) {
-        chart.setTool(tool);  // ← programmatic tool control
+        chart.setTool(tool);
+      } else if (ind) {
+        // Toggle the indicator on/off
+        if (chart.getActiveIndicators().indexOf(ind) >= 0) {
+          chart.removeIndicator(ind);
+          btn.classList.remove('active');
+        } else {
+          btn.classList.add('active');
+          // For this demo, re-adding by id is not supported (we'd need to re-call
+          // addIndicator with the full definition). In a real app, store the
+          // definitions in a lookup object.
+        }
       } else if (action === 'reset') {
         chart.resetView();
       } else if (action === 'clear') {
         chart.clearDrawings();
-      } else if (action === 'addRsi') {
-        // Toggle RSI indicator programmatically
-        const active = chart.getActiveIndicators();
-        if (active.indexOf('rsi') >= 0) chart.removeIndicator('rsi');
-        else                            chart.addIndicator('rsi');
       }
     });
   });
 
-  // 3) Subscribe to tool changes so your custom UI stays in sync.
+  // Keep toolbar in sync with tool changes
   chart.onToolChange(function (toolId) {
     buttons.forEach(function (btn) {
       const t = btn.getAttribute('data-tool');
@@ -96,25 +217,36 @@
     });
   });
 
-  // 4) Feed your data here:
-  // chart.setData([{time, open, high, low, close, volume}, ...]);
-  // chart.update(latestCandle);
-
-  // ─── Available API (v2.0.0+) ───────────────────────────────────
-  // chart.getTools();              → [{id, label, icon, custom}, ...]
-  // chart.setTool('trend');        → activate a tool
-  // chart.getActiveTool();        → 'trend'
-  // chart.clearTool();             → back to 'cursor'
-  // chart.onToolChange(cb);        → subscribe to tool changes
-  // chart.getDrawings();           → all drawings on the chart
-  // chart.getDrawing(id);          → one drawing by id
-  // chart.removeDrawing(id);       → remove one drawing
-  // chart.getSelectedDrawing();    → currently selected
-  // chart.getIndicators();         → [{id, label, type, active}, ...]
-  // chart.getActiveIndicators();   → ['ma20', 'rsi', ...]
-  // chart.addIndicator('rsi');     chart.removeIndicator('rsi');
-  // chart.addDrawing({type:'hline', price:65000, color:'#2962ff'});
-  // chart.clearDrawings();         chart.resetView();
+  // ─── 5. Available API (v2.1.0+) ───────────────────────────────────
+  // TOOLS:
+  //   chart.getTools();              → [{id, label, icon, custom}, ...]
+  //   chart.setTool('trend');        → activate a tool
+  //   chart.getActiveTool();        → 'trend'
+  //   chart.clearTool();             → back to 'cursor'
+  //   chart.onToolChange(cb);        → subscribe to tool changes
+  //   chart.addDrawingTool(def);     → register a custom drawing tool
+  //
+  // INDICATORS (all custom — no built-ins in v2.1.0+):
+  //   chart.addIndicator(def);       → register + activate
+  //     def = { id, label, type, color, settings, calculate, render, formatValue?, getRange? }
+  //   chart.registerIndicator(def);  → register without activating
+  //   chart.removeIndicator(id);     → deactivate + remove
+  //   chart.getIndicators();         → [{id, label, type, color, active}, ...]
+  //   chart.getActiveIndicators();   → ['sma20', 'rsi', ...]
+  //   chart.getIndicatorDef(id);     → the definition object
+  //   chart.setIndicatorVisible(id, bool);
+  //   chart.setIndicatorSettings(id, {period: 50});
+  //
+  // DRAWINGS:
+  //   chart.getDrawings();           → all drawings on the chart
+  //   chart.getDrawing(id);          → one drawing by id
+  //   chart.removeDrawing(id);       → remove one drawing
+  //   chart.addDrawing({type:'hline', price:65000, color:'#2962ff'});
+  //   chart.clearDrawings();
+  //
+  // VIEW:
+  //   chart.resetView();             chart.start();
+  //   chart.setData(candles);        chart.update(candle);
 </script>
 </body>
 </html>

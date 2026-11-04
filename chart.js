@@ -30,7 +30,7 @@
 'use strict';
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.0.0';
+const VERSION = '2.1.0';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 
 /* ============================ THEME ========================================= */
@@ -420,19 +420,33 @@ function formatTickMark(timeSec, weight, tf) {
 // Timeframes and symbols are now USER-PROVIDED via the chart constructor options.
 // The chart library itself is data-source-agnostic.
 
-const INDICATOR_LIST = [
-  {id:'volume', label:'Volume',       type:'volume',   color:THEME.ma1},
-  {id:'ma20',   label:'MA 20',       type:'overlay',  color:THEME.ma1},
-  {id:'ma50',   label:'MA 50',       type:'overlay',  color:THEME.ma2},
-  {id:'ma200',  label:'MA 200',      type:'overlay',  color:THEME.ma3},
-  {id:'ema20',  label:'EMA 20',      type:'overlay',  color:THEME.ma1},
-  {id:'ema50',  label:'EMA 50',      type:'overlay',  color:THEME.ma2},
-  {id:'bb',     label:'Bollinger',   type:'overlay',  color:THEME.bollingerMid},
-  {id:'volsma', label:'Vol SMA 20',  type:'volume',   color:THEME.ma2},
-  {id:'rsi',    label:'RSI 14',      type:'pane',     color:THEME.rsi},
-  {id:'macd',   label:'MACD',        type:'pane',     color:THEME.macd},
-  {id:'vprof',  label:'Volume Profile', type:'overlay', color:THEME.ma1}
-];
+// HEADLESS v2.1.0+: No built-in indicators. The library ships with ZERO
+// pre-coded indicators (no MA, EMA, BB, RSI, MACD, volsma, vprof). Users register
+// their own indicators via chart.addIndicator(definition).
+//
+// A custom indicator definition looks like:
+//   {
+//     id:        'mySMA',                 // unique id
+//     label:     'My SMA',                // display label
+//     type:      'overlay' | 'pane' | 'volume',  // where it renders
+//     color:     '#2962ff',               // color used in legend/cards
+//     settings:  { period: 20 },          // default settings (cloned per instance)
+//     calculate: function(candles, settings) -> array of values (or null entries)
+//     render:    function(ctx, values, helpers, settings, state) -> draws on canvas
+//     formatValue: function(value, settings) -> string,        // optional
+//     getRange:    function(values, settings) -> {min, max}     // optional, for pane indicators
+//   }
+//
+// `helpers` passed to render() includes:
+//   firstIdx, lastIdx, indexToX(i), priceToY(p), volToY(v), paneToY(v),
+//   chartLeft, chartRight, priceTop, priceBottom, volTop, volBottom,
+//   paneTop, paneBottom, barSpacing, dpr, candles, THEME,
+//   optimalCandlestickWidth(barSpacing, dpr)
+const INDICATOR_LIST = [];
+// `Indicators` is kept as a public math utility (SMA, EMA, Bollinger, RSI, MACD,
+// VolumeProfile) — useful when writing your own indicator definitions.
+// It is no longer wired to anything inside the chart; you call it from your own
+// calculate() functions if you want to reuse the math.
 
 const DRAW_TOOLS = [
   {id:'cursor',   label:'Cursor',           icon:'cursor'},
@@ -787,19 +801,24 @@ class TradingChart {
     this._customTools = {};       // custom drawing tool renderers
     this._drawPanelHits = [];     // hit-test for drawing properties panel
 
-    // Indicators — default includes volume so the volume pane always has a card.
-    // User can remove via removeIndicator('volume') if desired.
-    const defaultIndicators = opts.indicators && opts.indicators.length > 0
-      ? opts.indicators
-      : ['volume'];
-    this.activeIndicators = new Set(defaultIndicators);
-    this.indCache = {};
-    // Per-indicator state: { visible, settings, customIcons, onSettings, onEdit }
-    // Each active indicator gets a state entry on addIndicator().
-    this.indicatorStates = new Map();
-    // Initialize states for indicators passed in constructor options
-    for (const id of this.activeIndicators) {
-      this.indicatorStates.set(id, this._defaultIndicatorState(id));
+    // Indicators — HEADLESS v2.1.0+: no built-in indicators, no default 'volume'.
+    // User registers custom indicators via addIndicator(definition), or by
+    // passing definition objects in opts.indicators.
+    this._customIndicators = new Map();              // id -> definition
+    this.indicatorStates = new Map();                // id -> state
+    this.indCache = {};                              // id -> calculated values
+    this.activeIndicators = new Set();
+    // Process opts.indicators — each item must be a definition object.
+    // (String ids are no longer supported since there are no built-in ids.)
+    if (Array.isArray(opts.indicators)) {
+      for (const item of opts.indicators) {
+        if (item && typeof item === 'object' && item.id) {
+          // Register + activate
+          this._customIndicators.set(item.id, item);
+          this.activeIndicators.add(item.id);
+          this.indicatorStates.set(item.id, this._defaultIndicatorState(item.id));
+        }
+      }
     }
     // Active indicator card (which card's icons are currently shown expanded)
     this.activeIndicatorCard = null;
@@ -873,36 +892,48 @@ class TradingChart {
   }
   // Default state for an indicator (visible, default settings, default icons)
   _defaultIndicatorState(id) {
-    const meta = INDICATOR_LIST.find(i => i.id === id);
-    const defaults = {
-      volume:{color: THEME.ma1},
-      ma20:  {period: 20,  color: THEME.ma1},
-      ma50:  {period: 50,  color: THEME.ma2},
-      ma200: {period: 200, color: THEME.ma3},
-      ema20: {period: 20,  color: THEME.ma1},
-      ema50: {period: 50,  color: THEME.ma2},
-      bb:    {period: 20,  mult: 2, color: THEME.bollingerMid},
-      volsma:{period: 20,  color: THEME.ma2},
-      rsi:   {period: 14,  color: THEME.rsi},
-      macd:  {fast: 12, slow: 26, signal: 9, color: THEME.macd},
-      vprof: {bins: 24, color: THEME.ma1}
-    };
+    const def = this._customIndicators.get(id) || {};
     return {
       visible: true,
-      settings: defaults[id] || {},
+      settings: Object.assign({}, def.settings || {}),
       // Default 4 icons (TradingView-style): hide/show, edit, settings, delete
       icons: ['hide', 'edit', 'settings', 'delete'],
       // Custom icons added by user (array of {id, label, icon, onClick})
       customIcons: [],
       // Callbacks
       onSettings: null,  // function(settings) — called when settings change
-      onEdit: null       // function() — called when edit/code button clicked
+      onEdit: null,      // function() — called when edit/code button clicked
+      def: def           // reference to the indicator definition (v2.1.0+)
     };
   }
-  // Add an indicator by id with optional config
-  // config: { settings, icons, customIcons, onSettings, onEdit }
-  addIndicator(id, config) {
+  // Add a custom indicator. Accepts either a definition object (recommended):
+  //   chart.addIndicator({ id:'mySMA', label:'My SMA', type:'overlay',
+  //                       color:'#2962ff', settings:{period:20},
+  //                       calculate: function(candles, s) {...},
+  //                       render:    function(ctx, values, helpers, s, state) {...} });
+  // or a previously-registered id (rare; only useful if you registered a
+  // definition separately and later want to re-activate it):
+  //   chart.addIndicator('mySMA');
+  // config (2nd arg, optional): { settings, icons, customIcons, onSettings, onEdit }
+  addIndicator(idOrDef, config) {
     config = config || {};
+    let id, def;
+    if (typeof idOrDef === 'string') {
+      id = idOrDef;
+      def = this._customIndicators.get(id);
+      if (!def) {
+        if (BADI_DEBUG) console.warn('[BadiCharts] Unknown indicator id:', id,
+          '(in v2.1.0+, pass a definition object instead)');
+        return;
+      }
+    } else if (idOrDef && typeof idOrDef === 'object' && idOrDef.id) {
+      def = idOrDef;
+      id = def.id;
+      this._customIndicators.set(id, def);
+    } else {
+      if (BADI_DEBUG) console.warn('[BadiCharts] addIndicator: expected definition object or id');
+      return;
+    }
     this.activeIndicators.add(id);
     const state = this._defaultIndicatorState(id);
     if (config.settings) state.settings = Object.assign({}, state.settings, config.settings);
@@ -914,6 +945,16 @@ class TradingChart {
     this.updateLayout();
     this.computeIndicators();
     this.autoScale();
+  }
+  // Register a custom indicator definition WITHOUT activating it.
+  // Useful for defining indicators once and toggling them by id later.
+  registerIndicator(def) {
+    if (!def || !def.id) return;
+    this._customIndicators.set(def.id, def);
+  }
+  // Get the definition of a registered indicator (or null).
+  getIndicatorDef(id) {
+    return this._customIndicators.get(id) || null;
   }
   // Remove an indicator by id
   removeIndicator(id) {
@@ -1051,12 +1092,20 @@ class TradingChart {
   // Programmatically select a drawing by id.
   selectDrawingById(id) { this.selectedDrawing = this.getDrawing(id); }
   // List all available indicators with their active state.
-  // Returns: [ { id, label, type, active } ]
+  // Returns: [ { id, label, type, color, active } ]
   getIndicators() {
     const self = this;
-    return INDICATOR_LIST.map(function (i) {
-      return { id: i.id, label: i.label, type: i.type, active: self.activeIndicators.has(i.id) };
+    const out = [];
+    this._customIndicators.forEach(function (def, id) {
+      out.push({
+        id: id,
+        label: def.label || id,
+        type: def.type || 'overlay',
+        color: def.color || THEME.ma1,
+        active: self.activeIndicators.has(id)
+      });
     });
+    return out;
   }
   // Get the array of currently active indicator ids.
   getActiveIndicators() { return Array.from(this.activeIndicators); }
@@ -1175,11 +1224,15 @@ class TradingChart {
 
     const paneTop = this.layout.toolbarH;
     const bottomStart = this.H - this.layout.statusH - this.layout.timeAxisH;
-    const hasPane = this.activeIndicators.has('rsi') || this.activeIndicators.has('macd');
-    // Increased pane height so the indicator card + line are both clearly visible
+    // HEADLESS v2.1.0+: scan custom indicators for type='pane' and type='volume'
+    let hasPane = false, hasVolume = false;
+    for (const id of this.activeIndicators) {
+      const state = this.indicatorStates.get(id);
+      if (!state || !state.def) continue;
+      if (state.def.type === 'pane') hasPane = true;
+      else if (state.def.type === 'volume') hasVolume = true;
+    }
     this.layout.paneH = hasPane ? (isMobile ? 110 : 140) : 0;
-    // Volume area: only show if 'volume' indicator is active (or volsma)
-    const hasVolume = this.activeIndicators.has('volume') || this.activeIndicators.has('volsma');
     const volH = hasVolume ? this.layout.volumeH : 0;
 
     this.chartLeft = this.layout.leftPad;
@@ -1799,12 +1852,24 @@ class TradingChart {
       if (c.volume < minVol) minVol = c.volume;
       if (c.volume > maxVol) maxVol = c.volume;
     }
-    if (this.activeIndicators.has('bb') && this.indCache.bb) {
-      const bb = this.indCache.bb;
-      for (let i = firstIdx; i <= lastIdx; i++) {
-        if (bb.upper[i] !== null) {
-          if (bb.upper[i] > max) max = bb.upper[i];
-          if (bb.lower[i] < min) min = bb.lower[i];
+    // HEADLESS v2.1.0+: include overlay indicator values in price scaling
+    for (const id of this.activeIndicators) {
+      const state = this.indicatorStates.get(id);
+      if (!state || !state.def || state.def.type !== 'overlay') continue;
+      if (state.visible === false) continue;
+      const values = this.indCache[id];
+      if (!values) continue;
+      // If the indicator returns an array of numbers, include them in the range.
+      // If it returns an object (e.g., {upper, lower, mid}), skip — the indicator's
+      // render() should stay within the candle range, or it should provide its own
+      // autoScale contribution via a future hook.
+      if (Array.isArray(values)) {
+        for (let i = firstIdx; i <= lastIdx; i++) {
+          const v = values[i];
+          if (v !== null && v !== undefined && typeof v === 'number') {
+            if (v > max) max = v;
+            if (v < min) min = v;
+          }
         }
       }
     }
@@ -1828,50 +1893,96 @@ class TradingChart {
       this.volScale.rebuildMarks();
     }
 
-    // Pane scale (RSI: 0-100, MACD: auto)
-    // Use larger top margin (0.18) to leave room for the indicator card at the top of the pane
-    if (this.activeIndicators.has('rsi')) {
-      this.paneScale = new PriceScale({scaleMargins: {top: 0.18, bottom: 0.1}, base: 100});
-      this.paneScale.setHeight(this.paneBottom - this.paneTop);
-      this.paneScale.setRange(0, 100);
-      this.paneScale.setFormatter(new PriceFormatter(100, 1));
-      this.paneScale.rebuildMarks();
-    } else if (this.activeIndicators.has('macd')) {
-      // Auto-scale MACD
-      const macd = this.indCache.macd;
-      if (macd) {
-        let mMin = Infinity, mMax = -Infinity;
+    // HEADLESS v2.1.0+: pane scale based on the FIRST active pane-type indicator.
+    // Uses def.getRange(values, settings) if provided, else auto-range from values.
+    let paneId = null;
+    for (const id of this.activeIndicators) {
+      const state = this.indicatorStates.get(id);
+      if (state && state.def && state.def.type === 'pane' && state.visible !== false) {
+        paneId = id;
+        break;
+      }
+    }
+    if (paneId) {
+      const state = this.indicatorStates.get(paneId);
+      const values = this.indCache[paneId];
+      let pMin, pMax;
+      if (typeof state.def.getRange === 'function') {
+        try {
+          const r = state.def.getRange(values, state.settings);
+          pMin = r.min; pMax = r.max;
+        } catch (e) { pMin = 0; pMax = 100; }
+      } else if (Array.isArray(values)) {
+        // Auto-range from values
+        pMin = Infinity; pMax = -Infinity;
         for (let i = firstIdx; i <= lastIdx; i++) {
-          if (macd.macd[i] !== null) {
-            mMin = Math.min(mMin, macd.macd[i], macd.signal[i], macd.hist[i]);
-            mMax = Math.max(mMax, macd.macd[i], macd.signal[i], macd.hist[i]);
+          const v = values[i];
+          if (v !== null && v !== undefined && typeof v === 'number') {
+            if (v < pMin) pMin = v;
+            if (v > pMax) pMax = v;
           }
         }
-        if (!isFinite(mMin)) { mMin = -1; mMax = 1; }
-        const pad = (mMax - mMin) * 0.1;
-        this.paneScale = new PriceScale({scaleMargins: {top: 0.18, bottom: 0.1}, base: 1000});
-        this.paneScale.setHeight(this.paneBottom - this.paneTop);
-        this.paneScale.setRange(mMin - pad, mMax + pad);
-        this.paneScale.setFormatter(new PriceFormatter(1000, 1));
-        this.paneScale.rebuildMarks();
+      } else {
+        pMin = 0; pMax = 100;
       }
+      if (!isFinite(pMin)) { pMin = -1; pMax = 1; }
+      if (pMin === pMax) { pMin -= 1; pMax += 1; }
+      const pad = (pMax - pMin) * 0.1;
+      this.paneScale = new PriceScale({scaleMargins: {top: 0.18, bottom: 0.1}, base: 100});
+      this.paneScale.setHeight(this.paneBottom - this.paneTop);
+      this.paneScale.setRange(pMin - pad, pMax + pad);
+      this.paneScale.setFormatter(new PriceFormatter(100, 1));
+      this.paneScale.rebuildMarks();
+    } else {
+      this.paneScale = null;
     }
   }
 
   /* --------------------------- Indicator Cache --------------------------- */
+  // Calls each active indicator's calculate(candles, settings) function and
+  // stores the result in indCache[id]. Indicators without calculate() are skipped.
   computeIndicators() {
-    const closes = this.sim.candles.map(c => c.close);
-    const vols = this.sim.candles.map(c => c.volume);
     this.indCache = {};
-    if (this.activeIndicators.has('ma20'))  this.indCache.ma20  = Indicators.sma(closes, 20);
-    if (this.activeIndicators.has('ma50'))  this.indCache.ma50  = Indicators.sma(closes, 50);
-    if (this.activeIndicators.has('ma200')) this.indCache.ma200 = Indicators.sma(closes, 200);
-    if (this.activeIndicators.has('ema20')) this.indCache.ema20 = Indicators.ema(closes, 20);
-    if (this.activeIndicators.has('ema50')) this.indCache.ema50 = Indicators.ema(closes, 50);
-    if (this.activeIndicators.has('bb'))    this.indCache.bb    = Indicators.bollinger(closes, 20, 2);
-    if (this.activeIndicators.has('volsma'))this.indCache.volsma= Indicators.sma(vols, 20);
-    if (this.activeIndicators.has('rsi'))   this.indCache.rsi   = Indicators.rsi(closes, 14);
-    if (this.activeIndicators.has('macd'))  this.indCache.macd  = Indicators.macd(closes, 12, 26, 9);
+    const candles = this.sim.candles;
+    for (const id of this.activeIndicators) {
+      const state = this.indicatorStates.get(id);
+      if (!state || !state.def || typeof state.def.calculate !== 'function') continue;
+      try {
+        this.indCache[id] = state.def.calculate(candles, state.settings);
+      } catch (e) {
+        if (BADI_DEBUG) console.error('[BadiCharts] Indicator calculate error (' + id + '):', e);
+        this.indCache[id] = null;
+      }
+    }
+  }
+
+  // Build the helpers object passed to each indicator's render() function.
+  // Contains coordinate-conversion functions and current chart geometry.
+  _indicatorHelpers(firstIdx, lastIdx) {
+    const self = this;
+    return {
+      firstIdx: firstIdx,
+      lastIdx:  lastIdx,
+      indexToX: function (i) { return self.indexToX(i); },
+      priceToY: function (p) { return self.priceToY(p); },
+      volToY:   function (v) { return self.volToY(v); },
+      paneToY:  function (v) {
+        return self.paneTop + (self.paneScale ? self.paneScale.logicalToCoordinate(v, 0) : 0);
+      },
+      chartLeft:   this.chartLeft,
+      chartRight:  this.chartRight,
+      priceTop:    this.priceTop,
+      priceBottom: this.priceBottom,
+      volTop:      this.volTop,
+      volBottom:   this.volBottom,
+      paneTop:     this.paneTop,
+      paneBottom:  this.paneBottom,
+      barSpacing:  this.barSpacing,
+      dpr:         this.dpr,
+      candles:     this.sim.candles,
+      THEME:       THEME,
+      optimalCandlestickWidth: optimalCandlestickWidth
+    };
   }
 
   /* --------------------------- Drawing Tools ----------------------------- */
@@ -2196,66 +2307,68 @@ class TradingChart {
     const lastIdx = Math.min(candles.length - 1, Math.ceil(this.xToIndex(this.chartRight)) + 1);
     if (firstIdx > lastIdx) return;
 
+    // Find all active, visible volume-type indicators
+    const volIndicators = [];
+    for (const id of this.activeIndicators) {
+      const state = this.indicatorStates.get(id);
+      if (state && state.def && state.def.type === 'volume' && state.visible !== false) {
+        volIndicators.push(id);
+      }
+    }
+    // Volume bars use candle data directly — but only show if at least one
+    // volume-type indicator is active (so the user explicitly opted in).
+    if (volIndicators.length === 0) return;
+
     // Clip to volume area
     ctx.save();
     ctx.beginPath();
     ctx.rect(this.chartLeft, this.volTop, this.chartRight - this.chartLeft, this.volBottom - this.volTop);
     ctx.clip();
 
-    // Use LWC-style column width (slightly less than barSpacing)
+    // LWC-style column width
     const bodyWidthBmp = optimalCandlestickWidth(this.barSpacing, this.dpr);
     const bodyWidth = bodyWidthBmp / this.dpr;
 
-    // Only draw volume bars if 'volume' indicator is active AND visible
-    const volVisible = this.activeIndicators.has('volume') && this.isIndicatorVisible('volume');
-    if (volVisible) {
-      for (let i = firstIdx; i <= lastIdx; i++) {
-        const c = candles[i];
-        const x = this.indexToX(i);
-        if (x < this.chartLeft - bodyWidth || x > this.chartRight + bodyWidth) continue;
-        const isBull = c.close >= c.open;
-        const yTop = this.volToY(c.volume);
-        const yBot = this.volBottom;
-        ctx.fillStyle = isBull ? THEME.bullVol : THEME.bearVol;
-        const left = Math.round((x - bodyWidth / 2) * this.dpr) / this.dpr;
-        const top = Math.round(yTop * this.dpr) / this.dpr;
-        const h = Math.max(1 / this.dpr, yBot - yTop);
-        ctx.fillRect(left, top, bodyWidth, h);
+    // Draw volume bars from candle data (always drawn when a volume indicator is active)
+    for (let i = firstIdx; i <= lastIdx; i++) {
+      const c = candles[i];
+      const x = this.indexToX(i);
+      if (x < this.chartLeft - bodyWidth || x > this.chartRight + bodyWidth) continue;
+      const isBull = c.close >= c.open;
+      const yTop = this.volToY(c.volume);
+      const yBot = this.volBottom;
+      ctx.fillStyle = isBull ? THEME.bullVol : THEME.bearVol;
+      const left = Math.round((x - bodyWidth / 2) * this.dpr) / this.dpr;
+      const top = Math.round(yTop * this.dpr) / this.dpr;
+      const h = Math.max(1 / this.dpr, yBot - yTop);
+      ctx.fillRect(left, top, bodyWidth, h);
+    }
+
+    // Render each active volume indicator (e.g., volume SMA) via its render()
+    const helpers = this._indicatorHelpers(firstIdx, lastIdx);
+    for (const id of volIndicators) {
+      const state = this.indicatorStates.get(id);
+      if (typeof state.def.render !== 'function') continue;
+      try {
+        state.def.render(ctx, this.indCache[id], helpers, state.settings, state);
+      } catch (e) {
+        if (BADI_DEBUG) console.error('[BadiCharts] Volume indicator render error (' + id + '):', e);
       }
     }
 
-    // Vol SMA
-    if (this.activeIndicators.has('volsma') && this.isIndicatorVisible('volsma') && this.indCache.volsma) {
-      const sma = this.indCache.volsma;
-      ctx.strokeStyle = THEME.ma2;
-      ctx.lineWidth = 1.4;
-      ctx.beginPath();
-      let started = false;
-      for (let i = firstIdx; i <= lastIdx; i++) {
-        if (sma[i] === null) { started = false; continue; }
-        const x = this.indexToX(i);
-        const y = this.volToY(sma[i]);
-        if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
-      }
-      ctx.stroke();
-    }
     ctx.restore();
 
-    // Volume indicator card (TradingView-style, with icons) — drawn in the volume area
-    // Only draw if 'volume' indicator is active
-    if (this.activeIndicators.has('volume')) {
-      const volIdx = this.crosshairIndex !== null ?
-        clamp(Math.round(this.crosshairIndex), 0, this.sim.candles.length - 1) :
-        this.sim.candles.length - 1;
-      const volState = this.indicatorStates.get('volume') || {visible: true, settings: {color: THEME.ma1}, icons: ['hide','edit','settings','delete'], customIcons: []};
-      const volMeta = INDICATOR_LIST.find(i => i.id === 'volume');
-      const volVal = this._getIndicatorValueAt('volume', volIdx);
-      if (volMeta) {
-        this._drawIndicatorLine(this.chartLeft + 6, this.volTop + 2, 'volume', volMeta, volState, volVal);
-      }
+    // Volume indicator cards (TradingView-style, with icons)
+    const volIdx = this.crosshairIndex !== null ?
+      clamp(Math.round(this.crosshairIndex), 0, this.sim.candles.length - 1) :
+      this.sim.candles.length - 1;
+    let labelY = this.volTop + 2;
+    for (const id of volIndicators) {
+      const state = this.indicatorStates.get(id);
+      const val = this._getIndicatorValueAt(id, volIdx);
+      this._drawIndicatorLine(this.chartLeft + 6, labelY, id, state.def, state, val);
+      labelY += 22;
     }
-    // No fallback label — if volume indicator is removed, nothing shows in the volume area
-    // (volume bars are also hidden via the volVisible check above)
   }
   _fmtVol(n) {
     if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
@@ -2265,141 +2378,47 @@ class TradingChart {
   }
 
   /* --------------------------- Volume Profile ---------------------------- */
-  // Example of a custom indicator drawing on the chart (overlay).
-  // Computes volume distribution by price level over visible candles,
-  // then draws horizontal bars from the right side of the chart going left.
-  drawVolumeProfile() {
-    if (!this.activeIndicators.has('vprof') || !this.isIndicatorVisible('vprof')) return;
-    const ctx = this.ctx;
-    const firstIdx = Math.max(0, Math.floor(this.xToIndex(this.chartLeft)));
-    const lastIdx = Math.min(this.sim.candles.length - 1, Math.ceil(this.xToIndex(this.chartRight)));
-    if (firstIdx >= lastIdx) return;
-    const prof = Indicators.volumeProfile(this.sim.candles, firstIdx, lastIdx, 24);
-    if (!prof) return;
-    // Clip to price chart area
-    ctx.save();
-    ctx.beginPath();
-    ctx.rect(this.chartLeft, this.priceTop, this.chartRight - this.chartLeft, this.priceBottom - this.priceTop);
-    ctx.clip();
-    const maxW = (this.chartRight - this.chartLeft) * 0.30; // bars take up to 30% of chart width from right
-    const binH = (prof.maxP - prof.minP) / prof.bins.length;
-    for (let i = 0; i < prof.bins.length; i++) {
-      const b = prof.bins[i];
-      const y = this.priceToY(b.priceHigh);
-      const yLow = this.priceToY(b.priceLow);
-      const w = (b.volume / prof.maxVol) * maxW;
-      const x = this.chartRight - w;
-      const barH = Math.max(1, yLow - y);
-      // Color: green for up-volume, red for down-volume
-      const upRatio = b.upVol / Math.max(1, b.volume);
-      const color = upRatio >= 0.5 ? 'rgba(38,166,154,0.55)' : 'rgba(239,83,80,0.55)';
-      ctx.fillStyle = color;
-      ctx.fillRect(x, y, w, barH);
-      // Highlight POC (Point of Control) — the bin with highest volume
-      if (i === prof.pocIdx) {
-        ctx.strokeStyle = '#ffb74d';
-        ctx.lineWidth = 1.5;
-        ctx.strokeRect(x, y, w, barH);
-      }
-    }
-    // Draw POC line across the chart
-    const pocY = this.priceToY(prof.pocPrice);
-    ctx.strokeStyle = 'rgba(255,183,77,0.8)';
-    ctx.lineWidth = 1;
-    ctx.setLineDash([4, 4]);
-    ctx.beginPath();
-    ctx.moveTo(this.chartLeft, Math.floor(pocY) + 0.5);
-    ctx.lineTo(this.chartRight, Math.floor(pocY) + 0.5);
-    ctx.stroke();
-    ctx.setLineDash([]);
-    // Draw VWAP line
-    const vwapY = this.priceToY(prof.vwap);
-    ctx.strokeStyle = 'rgba(156,39,176,0.9)';
-    ctx.lineWidth = 1.2;
-    ctx.setLineDash([6, 3]);
-    ctx.beginPath();
-    ctx.moveTo(this.chartLeft, Math.floor(vwapY) + 0.5);
-    ctx.lineTo(this.chartRight, Math.floor(vwapY) + 0.5);
-    ctx.stroke();
-    ctx.setLineDash([]);
-    ctx.restore();
-    // Labels (drawn after restore so visible on price axis)
-    ctx.font = '10px -apple-system, Segoe UI, Roboto, sans-serif';
-    ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
-    // POC label
-    const pocTxt = 'POC ' + this.priceScale.formatLogical(prof.pocPrice);
-    const pw = ctx.measureText(pocTxt).width + 8;
-    ctx.fillStyle = '#ffb74d';
-    ctx.fillRect(this.chartRight + 1, Math.floor(pocY) - 7, pw, 14);
-    ctx.fillStyle = THEME.bg;
-    ctx.fillText(pocTxt, this.chartRight + 5, Math.floor(pocY));
-    // VWAP label
-    const vwapTxt = 'VWAP ' + this.priceScale.formatLogical(prof.vwap);
-    const vw = ctx.measureText(vwapTxt).width + 8;
-    ctx.fillStyle = '#9c27b0';
-    ctx.fillRect(this.chartRight + 1, Math.floor(vwapY) - 7, vw, 14);
-    ctx.fillStyle = THEME.bg;
-    ctx.fillText(vwapTxt, this.chartRight + 5, Math.floor(vwapY));
-  }
+  // HEADLESS v2.1.0+: The built-in Volume Profile indicator has been removed.
+  // If you want volume profile, register it as a custom indicator via addIndicator().
+  drawVolumeProfile() { /* no-op — built-in vprof removed in v2.1.0 */ }
 
   /* --------------------------- Indicators -------------------------------- */
+  // Renders all active overlay-type custom indicators. Each indicator's
+  // render(ctx, values, helpers, settings, state) is called inside a clip
+  // to the price chart area.
   drawIndicators() {
     const ctx = this.ctx;
     const firstIdx = Math.max(0, Math.floor(this.xToIndex(this.chartLeft)));
     const lastIdx = Math.min(this.sim.candles.length - 1, Math.ceil(this.xToIndex(this.chartRight)));
 
-    // Clip to price chart area so indicator lines stay inside the chart
     ctx.save();
     ctx.beginPath();
     ctx.rect(this.chartLeft, this.priceTop, this.chartRight - this.chartLeft, this.priceBottom - this.priceTop);
     ctx.clip();
 
-    const drawLine = (arr, color, lw = 1.4) => {
-      if (!arr) return;
-      ctx.strokeStyle = color;
-      ctx.lineWidth = lw;
-      ctx.beginPath();
-      let started = false;
-      for (let i = firstIdx; i <= lastIdx; i++) {
-        if (arr[i] === null) { started = false; continue; }
-        const x = this.indexToX(i);
-        const y = this.priceToY(arr[i]);
-        if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
+    const helpers = this._indicatorHelpers(firstIdx, lastIdx);
+
+    for (const id of this.activeIndicators) {
+      const state = this.indicatorStates.get(id);
+      if (!state || !state.def) continue;
+      if (state.def.type !== 'overlay') continue;
+      if (state.visible === false) continue;
+      if (typeof state.def.render !== 'function') continue;
+      try {
+        state.def.render(ctx, this.indCache[id], helpers, state.settings, state);
+      } catch (e) {
+        if (BADI_DEBUG) console.error('[BadiCharts] Overlay indicator render error (' + id + '):', e);
       }
-      ctx.stroke();
-    };
-    if (this.activeIndicators.has('ma20') && this.isIndicatorVisible('ma20'))  drawLine(this.indCache.ma20,  THEME.ma1);
-    if (this.activeIndicators.has('ma50') && this.isIndicatorVisible('ma50'))  drawLine(this.indCache.ma50,  THEME.ma2);
-    if (this.activeIndicators.has('ma200') && this.isIndicatorVisible('ma200')) drawLine(this.indCache.ma200, THEME.ma3);
-    if (this.activeIndicators.has('ema20') && this.isIndicatorVisible('ema20')) drawLine(this.indCache.ema20, THEME.ma1, 1.6);
-    if (this.activeIndicators.has('ema50') && this.isIndicatorVisible('ema50')) drawLine(this.indCache.ema50, THEME.ma2, 1.6);
-    if (this.activeIndicators.has('bb') && this.isIndicatorVisible('bb') && this.indCache.bb) {
-      const bb = this.indCache.bb;
-      ctx.fillStyle = THEME.bollingerBand;
-      ctx.beginPath();
-      let started = false;
-      for (let i = firstIdx; i <= lastIdx; i++) {
-        if (bb.upper[i] === null) { started = false; continue; }
-        const x = this.indexToX(i);
-        const y = this.priceToY(bb.upper[i]);
-        if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
-      }
-      for (let i = lastIdx; i >= firstIdx; i--) {
-        if (bb.lower[i] === null) continue;
-        const x = this.indexToX(i);
-        const y = this.priceToY(bb.lower[i]);
-        ctx.lineTo(x, y);
-      }
-      ctx.closePath();
-      ctx.fill();
-      drawLine(bb.upper, THEME.ma3, 1);
-      drawLine(bb.lower, THEME.ma3, 1);
-      drawLine(bb.mid,   THEME.bollingerMid, 1);
     }
+
     ctx.restore();
   }
 
-  /* --------------------------- Pane (RSI/MACD) --------------------------- */
+  /* --------------------------- Pane (custom pane indicators) ------------- */
+  // Renders all active pane-type custom indicators. Each indicator's
+  // render(ctx, values, helpers, settings, state) is called inside a clip
+  // to the pane area. Pane scaling is set up in autoScale() based on the first
+  // active pane indicator's getRange() (or auto-range from values).
   drawPane() {
     if (this.layout.paneH === 0 || !this.paneScale) return;
     const ctx = this.ctx;
@@ -2407,7 +2426,7 @@ class TradingChart {
     const firstIdx = Math.max(0, Math.floor(this.xToIndex(this.chartLeft)));
     const lastIdx = Math.min(this.sim.candles.length - 1, Math.ceil(this.xToIndex(this.chartRight)));
 
-    // Grid (use pane scale marks) — drawn without clip so grid extends full width
+    // Grid (use pane scale marks)
     ctx.strokeStyle = THEME.grid;
     ctx.lineWidth = 1;
     const pmarks = this.paneScale.marks();
@@ -2420,104 +2439,45 @@ class TradingChart {
       ctx.stroke();
     }
 
-    // Clip to pane area for indicator drawings (lines/histograms)
+    // Clip to pane area for indicator drawings
     ctx.save();
     ctx.beginPath();
     ctx.rect(left, top, right - left, bot - top);
     ctx.clip();
 
-    if (this.activeIndicators.has('rsi') && this.isIndicatorVisible('rsi') && this.indCache.rsi) {
-      const rsi = this.indCache.rsi;
-      // 30/70 dashed lines
-      ctx.setLineDash([3, 3]);
-      ctx.lineWidth = 1;
-      const y70 = top + this.paneScale.logicalToCoordinate(70, 0);
-      const y30 = top + this.paneScale.logicalToCoordinate(30, 0);
-      ctx.strokeStyle = THEME.rsiOver;
-      ctx.beginPath(); ctx.moveTo(left, Math.floor(y70) + 0.5); ctx.lineTo(right, Math.floor(y70) + 0.5); ctx.stroke();
-      ctx.strokeStyle = THEME.rsiUnder;
-      ctx.beginPath(); ctx.moveTo(left, Math.floor(y30) + 0.5); ctx.lineTo(right, Math.floor(y30) + 0.5); ctx.stroke();
-      ctx.setLineDash([]);
+    const helpers = this._indicatorHelpers(firstIdx, lastIdx);
 
-      ctx.strokeStyle = THEME.rsi;
-      ctx.lineWidth = 1.5;
-      ctx.beginPath();
-      let started = false;
-      for (let i = firstIdx; i <= lastIdx; i++) {
-        if (rsi[i] === null) { started = false; continue; }
-        const x = this.indexToX(i);
-        const y = top + this.paneScale.logicalToCoordinate(rsi[i], 0);
-        if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
+    // Render each active pane indicator
+    for (const id of this.activeIndicators) {
+      const state = this.indicatorStates.get(id);
+      if (!state || !state.def) continue;
+      if (state.def.type !== 'pane') continue;
+      if (state.visible === false) continue;
+      if (typeof state.def.render !== 'function') continue;
+      try {
+        state.def.render(ctx, this.indCache[id], helpers, state.settings, state);
+      } catch (e) {
+        if (BADI_DEBUG) console.error('[BadiCharts] Pane indicator render error (' + id + '):', e);
       }
-      ctx.stroke();
-    } else if (this.activeIndicators.has('macd') && this.isIndicatorVisible('macd') && this.indCache.macd) {
-      const macd = this.indCache.macd;
-      const midY = (top + bot) / 2;
-      // Zero line
-      ctx.strokeStyle = THEME.gridStrong;
-      ctx.beginPath();
-      ctx.moveTo(left, Math.floor(midY) + 0.5);
-      ctx.lineTo(right, Math.floor(midY) + 0.5);
-      ctx.stroke();
-
-      // Histogram (use LWC-style column width)
-      const bodyWidthBmp = optimalCandlestickWidth(this.barSpacing, this.dpr);
-      const bodyWidth = bodyWidthBmp / this.dpr;
-      for (let i = firstIdx; i <= lastIdx; i++) {
-        if (macd.hist[i] === null) continue;
-        const x = this.indexToX(i);
-        const y = top + this.paneScale.logicalToCoordinate(macd.hist[i], 0);
-        const h = Math.abs(y - midY);
-        ctx.fillStyle = macd.hist[i] >= 0 ? THEME.macdHistBull : THEME.macdHistBear;
-        const left2 = Math.round((x - bodyWidth / 2) * this.dpr) / this.dpr;
-        if (macd.hist[i] >= 0) ctx.fillRect(left2, Math.floor(y), bodyWidth, Math.ceil(h));
-        else ctx.fillRect(left2, Math.floor(midY), bodyWidth, Math.ceil(h));
-      }
-
-      // MACD and signal lines
-      const drawML = (arr, color) => {
-        ctx.strokeStyle = color; ctx.lineWidth = 1.4;
-        ctx.beginPath();
-        let started = false;
-        for (let i = firstIdx; i <= lastIdx; i++) {
-          if (arr[i] === null) { started = false; continue; }
-          const x = this.indexToX(i);
-          const y = top + this.paneScale.logicalToCoordinate(arr[i], 0);
-          if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
-        }
-        ctx.stroke();
-      };
-      drawML(macd.macd, THEME.macd);
-      drawML(macd.signal, THEME.macdSignal);
     }
+
     ctx.restore();
 
-    // Indicator labels for the pane — stacked vertically like the main legend.
-    // Drawn INSIDE the pane (not as separate cards), same style as TradingView.
+    // Indicator labels inside the pane — stacked vertically like the main legend.
     ctx.font = '11px -apple-system, Segoe UI, Roboto, sans-serif';
     ctx.textBaseline = 'top';
     const paneIdx = this.crosshairIndex !== null ?
       clamp(Math.round(this.crosshairIndex), 0, this.sim.candles.length - 1) :
       this.sim.candles.length - 1;
-    const pcy = top + 4;
-    // RSI line (inside the pane)
-    if (this.activeIndicators.has('rsi')) {
-      const state = this.indicatorStates.get('rsi') || {visible: true, settings: {}, icons: ['hide','edit','settings','delete'], customIcons: []};
-      const meta = INDICATOR_LIST.find(i => i.id === 'rsi');
-      if (meta) {
-        const val = this._getIndicatorValueAt('rsi', paneIdx);
-        this._drawIndicatorLine(left + 6, pcy, 'rsi', meta, state, val);
-      }
+    let labelY = top + 4;
+    for (const id of this.activeIndicators) {
+      const state = this.indicatorStates.get(id);
+      if (!state || !state.def || state.def.type !== 'pane') continue;
+      const val = this._getIndicatorValueAt(id, paneIdx);
+      this._drawIndicatorLine(left + 6, labelY, id, state.def, state, val);
+      labelY += 22;
     }
-    // MACD line (inside the pane)
-    if (this.activeIndicators.has('macd')) {
-      const state = this.indicatorStates.get('macd') || {visible: true, settings: {}, icons: ['hide','edit','settings','delete'], customIcons: []};
-      const meta = INDICATOR_LIST.find(i => i.id === 'macd');
-      if (meta) {
-        const val = this._getIndicatorValueAt('macd', paneIdx);
-        this._drawIndicatorLine(left + 6, pcy, 'macd', meta, state, val);
-      }
-    }
+
     // Right axis labels (price scale of the pane)
     ctx.font = '10px -apple-system, Segoe UI, Roboto, sans-serif';
     ctx.fillStyle = THEME.textDim; ctx.textAlign = 'left';
@@ -3294,9 +3254,12 @@ class TradingChart {
     // Lines 2+: Indicator labels stacked VERTICALLY (TradingView-style)
     // Each indicator on its own line, with icons shown when active (clicked).
     if (isMobile) return;
-    // Get overlay/volume indicators (pane indicators rsi/macd are drawn in drawPane,
-    // volume is drawn in drawVolume — exclude both from the main legend)
-    const overlayIds = Array.from(this.activeIndicators).filter(id => id !== 'rsi' && id !== 'macd' && id !== 'volume');
+    // HEADLESS v2.1.0+: legend lists only overlay-type indicators.
+    // (Pane indicators are drawn inside drawPane, volume indicators inside drawVolume.)
+    const overlayIds = Array.from(this.activeIndicators).filter(id => {
+      const s = this.indicatorStates.get(id);
+      return s && s.def && s.def.type === 'overlay';
+    });
     if (overlayIds.length === 0) return;
     // If collapsed, draw only the expand arrow (downward) and return
     let lineY = y + 20;
@@ -3309,8 +3272,7 @@ class TradingChart {
     // Draw each indicator on its own line
     for (const id of overlayIds) {
       const state = this.indicatorStates.get(id) || {visible: true, settings: {}, icons: ['hide','edit','settings','delete'], customIcons: []};
-      const meta = INDICATOR_LIST.find(i => i.id === id);
-      if (!meta) continue;
+      const meta = state.def || {label: id, color: THEME.ma1};
       const val = this._getIndicatorValueAt(id, idx);
       this._drawIndicatorLine(this.chartLeft + 6, lineY, id, meta, state, val);
       lineY += lineH;
@@ -3403,44 +3365,42 @@ class TradingChart {
 
   // Get formatted value for an indicator at a given candle index
   _getIndicatorValueAt(id, idx) {
-    if (id === 'volume') {
+    const state = this.indicatorStates.get(id);
+    if (!state || !state.def) return '—';
+    const def = state.def;
+    const values = this.indCache[id];
+
+    // For volume-type indicators with no calculate(): use the candle's volume directly.
+    if (def.type === 'volume' && typeof def.calculate !== 'function') {
       const c = this.sim.candles[idx];
       if (c) return this._fmtVol(c.volume);
       return '—';
     }
-    // For all other indicators, check that idx is within bounds and value is not null/undefined
-    const safeGet = function (arr) {
-      if (!arr || idx < 0 || idx >= arr.length) return null;
-      return arr[idx];
-    };
-    if (id === 'ma20') { const v = safeGet(this.indCache.ma20); if (v !== null && v !== undefined) return this.priceScale.formatLogical(v); }
-    if (id === 'ma50') { const v = safeGet(this.indCache.ma50); if (v !== null && v !== undefined) return this.priceScale.formatLogical(v); }
-    if (id === 'ma200') { const v = safeGet(this.indCache.ma200); if (v !== null && v !== undefined) return this.priceScale.formatLogical(v); }
-    if (id === 'ema20') { const v = safeGet(this.indCache.ema20); if (v !== null && v !== undefined) return this.priceScale.formatLogical(v); }
-    if (id === 'ema50') { const v = safeGet(this.indCache.ema50); if (v !== null && v !== undefined) return this.priceScale.formatLogical(v); }
-    if (id === 'bb') {
-      if (this.indCache.bb && this.indCache.bb.mid) {
-        const v = safeGet(this.indCache.bb.mid);
-        if (v !== null && v !== undefined) return this.priceScale.formatLogical(v);
+
+    if (!values || idx < 0 || idx >= values.length) return '—';
+    const v = values[idx];
+    if (v === null || v === undefined) return '—';
+
+    // Custom formatValue() hook
+    if (typeof def.formatValue === 'function') {
+      try { return def.formatValue(v, state.settings); } catch (e) { return '—'; }
+    }
+
+    // Default formatting based on type/indicator
+    if (def.type === 'volume') return this._fmtVol(v);
+    if (typeof v === 'number') {
+      // For price-like values, use the price formatter if available
+      if (def.type === 'overlay') return this.priceScale.formatLogical(v);
+      return v.toFixed(2);
+    }
+    if (typeof v === 'object' && v !== null) {
+      // Some indicators return objects (e.g., MACD {macd, signal, hist})
+      // Show the first numeric property
+      for (const k in v) {
+        if (typeof v[k] === 'number') return v[k].toFixed(2);
       }
     }
-    if (id === 'volsma') { const v = safeGet(this.indCache.volsma); if (v !== null && v !== undefined) return this._fmtVol(v); }
-    if (id === 'rsi') { const v = safeGet(this.indCache.rsi); if (v !== null && v !== undefined) return v.toFixed(2); }
-    if (id === 'macd') {
-      if (this.indCache.macd && this.indCache.macd.macd) {
-        const v = safeGet(this.indCache.macd.macd);
-        if (v !== null && v !== undefined) return v.toFixed(3);
-      }
-    }
-    if (id === 'vprof') {
-      // Show POC price for Volume Profile
-      const firstIdx = Math.max(0, Math.floor(this.xToIndex(this.chartLeft)));
-      const lastIdx = Math.min(this.sim.candles.length - 1, Math.ceil(this.xToIndex(this.chartRight)));
-      const prof = Indicators.volumeProfile(this.sim.candles, firstIdx, lastIdx, 24);
-      if (prof) return 'POC ' + this.priceScale.formatLogical(prof.pocPrice);
-      return 'VP';
-    }
-    return '—';
+    return String(v);
   }
 
   // Draw a single indicator card with label + value + icons
@@ -3602,8 +3562,8 @@ class TradingChart {
 
   // Open a settings card popup for an indicator
   _openSettingsCard(id, state) {
-    // Build default fields based on indicator type
-    const meta = INDICATOR_LIST.find(i => i.id === id);
+    // HEADLESS v2.1.0+: settings fields are auto-generated from the indicator's
+    // settings object (any key present becomes an editable field).
     const fields = [];
     const s = state.settings;
     if (s.period !== undefined) fields.push({key: 'period', label: 'Period', type: 'number', value: s.period});

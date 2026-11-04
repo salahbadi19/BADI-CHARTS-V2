@@ -2,25 +2,26 @@
 
 > **A lightweight, dependency-free, HEADLESS candlestick charting library built entirely with the HTML5 Canvas API.**
 >
-> Pixel-perfect rendering, 14 drawing tools, 10 indicators, full programmatic API — you bring the data **and** the UI, BADI-CHARTS-V2 renders the chart.
+> Pixel-perfect rendering, 14 drawing tools, fully custom indicators via API — you bring the data, the UI, and the indicators. BADI-CHARTS-V2 renders the chart.
 
-[![Version](https://img.shields.io/badge/version-2.0.0-2962ff.svg)](#)
+[![Version](https://img.shields.io/badge/version-2.1.0-2962ff.svg)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-26a69a.svg)](LICENSE)
 [![No Dependencies](https://img.shields.io/badge/dependencies-zero-ff9800.svg)](#)
 [![Headless](https://img.shields.io/badge/UI-headless-9c27b0.svg)](#)
 
 ---
 
-## ⚠️ What changed in v2.0.0 (breaking)
+## ⚠️ What changed in v2.1.0 (breaking)
 
-The built-in **toolbar** and **status bar** have been **REMOVED** from the library. The library is now **fully headless** — there is no built-in UI whatsoever. All chart actions (drawing tools, indicators, view reset, etc.) are now controlled **programmatically** through the public API.
+**All built-in indicators have been REMOVED.** The library now ships with ZERO pre-coded indicators (no MA, EMA, BB, RSI, MACD, volsma, vprof). You register your own indicators via the new `addIndicator(definition)` API.
 
-**Why?** So you can build your own UI in plain HTML/CSS that exactly matches your application's look and feel, and wire it to the chart through clean method calls. No more fighting the library's built-in toolbar styles.
+**Why?** So you have full control over indicator math, rendering, and styling. No more fighting the library's built-in indicator implementations — you write exactly the calculation and rendering you need.
 
-**Migration from v1.x:**
-- The `toolbar: false` option is now the default and is silently ignored (kept only for backward compatibility).
-- The `statusBar` option now defaults to `false`. Pass `statusBar: true` if you still want the optional status bar.
-- Replace any code that relied on the toolbar's buttons with direct API calls (`setTool`, `addIndicator`, `resetView`, …).
+**Migration from v2.0.0:**
+- `chart.addIndicator('rsi')` no longer works (string ids aren't supported since there are no built-in ids).
+- Instead, pass a **definition object**: `chart.addIndicator({ id:'myRSI', label:'RSI', type:'pane', calculate: ..., render: ... })`.
+- The `Indicators` math class (SMA, EMA, Bollinger, RSI, MACD, VolumeProfile) is kept as a public utility — you can call it from your custom `calculate()` functions if you want to reuse the math.
+- The `opts.indicators` array in the constructor now expects **definition objects**, not strings.
 
 ---
 
@@ -28,10 +29,11 @@ The built-in **toolbar** and **status bar** have been **REMOVED** from the libra
 
 - **100% Pure JavaScript** — No HTML/CSS for UI, no dependencies, no frameworks
 - **Fully Headless (v2.0.0+)** — No built-in toolbar or status bar; you build your own UI
+- **Custom Indicators (v2.1.0+)** — No built-in indicators; register your own via `addIndicator(def)`
 - **Pixel-Perfect Rendering** — HiDPI-aware, algorithms ported 1:1 from TradingView Lightweight Charts
 - **User-Provided Data** — No fake/mock data; you feed candles via `setData()`
 - **14 Drawing Tools** — trend line, parallel channel, band/zone, arrow, fib retracement, brush, polygon, text, ray, rectangle, horizontal/vertical lines, eraser
-- **10 Indicators** — MA (20/50/200), EMA (20/50), Bollinger Bands, RSI, MACD, Volume SMA, Volume Profile (with POC & VWAP)
+- **Custom Drawing Tools** — register your own via `addDrawingTool(def)`
 - **Responsive** — works on desktop and mobile (touch + pinch zoom)
 - **Crosshair** with price/time labels
 - **Current Price Line** with colored label on the price axis
@@ -71,14 +73,13 @@ const chart = new BadiCharts(canvas, { /* options */ });
 </head>
 <body>
   <canvas id="chart"></canvas>
-  <!-- Load from CDN (headless, no built-in UI) -->
-  <script src="https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@v2.0.0/chart.js"></script>
+  <!-- Load from CDN (headless, no built-in UI or indicators) -->
+  <script src="https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@v2.1.0/chart.js"></script>
   <script>
     const canvas = document.getElementById('chart');
     const chart = new BadiCharts(canvas, {
       symbol:    { label: 'BTCUSDT', priceScale: 100, decimals: 2 },
-      timeframe: { label: '1H', ms: 60 * 60 * 1000 },
-      indicators: ['ma20', 'ma50', 'volsma']
+      timeframe: { label: '1H', ms: 60 * 60 * 1000 }
     });
 
     // Feed your candle data
@@ -90,14 +91,40 @@ const chart = new BadiCharts(canvas, { /* options */ });
 
     chart.start();
 
-    // Programmatic tool control — no toolbar needed
-    chart.setTool('trend');
+    // Add a custom indicator (SMA 20 overlay)
+    chart.addIndicator({
+      id: 'sma20',
+      label: 'SMA 20',
+      type: 'overlay',
+      color: '#2962ff',
+      settings: { period: 20 },
+      calculate: function (candles, s) {
+        const out = new Array(candles.length).fill(null);
+        let sum = 0; const p = s.period || 20;
+        for (let i = 0; i < candles.length; i++) {
+          sum += candles[i].close;
+          if (i >= p) sum -= candles[i - p].close;
+          if (i >= p - 1) out[i] = sum / p;
+        }
+        return out;
+      },
+      render: function (ctx, values, h, s) {
+        ctx.strokeStyle = s.color; ctx.lineWidth = 1.5; ctx.beginPath();
+        let started = false;
+        for (let i = h.firstIdx; i <= h.lastIdx; i++) {
+          if (values[i] === null) { started = false; continue; }
+          const x = h.indexToX(i), y = h.priceToY(values[i]);
+          if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+      }
+    });
   </script>
 </body>
 </html>
 ```
 
-See `index.html` for a complete example with a custom-built HTML toolbar wired to the chart API.
+See `index.html` for a complete example with multiple custom indicators (SMA, RSI, Volume) and a custom HTML toolbar.
 
 ## 📖 API Reference
 
@@ -112,7 +139,7 @@ const chart = new BadiCharts(canvas, options);
 |---|---|---|---|
 | `symbol` | `{label, priceScale, decimals}` | `{label:'SYMBOL', priceScale:100, decimals:2}` | Symbol configuration (priceScale: 100 for 2 decimals, 100000 for 5) |
 | `timeframe` | `{label, ms}` | `{label:'1H', ms:3600000}` | Timeframe label and duration in milliseconds |
-| `indicators` | `string[]` | `['volume']` | Initial active indicators (e.g. `['ma20', 'rsi']`) |
+| `indicators` | `Array<IndicatorDef>` | `[]` | Custom indicator definitions to activate at startup (v2.1.0+; strings no longer accepted) |
 | `statusBar` | `boolean` | `false` | Show the optional status bar (Bid/Ask/24h High/Low/Vol). Toolbar is always OFF. |
 | `background` | `string\|null` | `null` | Background image or video URL drawn behind the chart |
 | `backgroundOpacity` | `number` | `0.15` | Opacity of the background image/video |
@@ -134,8 +161,6 @@ chart.append(candles);       // Batch append
 ```js
 chart.setSymbol({label, priceScale, decimals});
 chart.setTimeframe({label, ms});
-chart.addIndicator('rsi');       // Add indicator by id
-chart.removeIndicator('rsi');    // Remove indicator by id
 chart.setTool('trend');          // Set active drawing tool
 chart.clearTool();               // Reset to 'cursor'
 chart.addDrawing({type:'hline', price: 65000, color:'#2962ff'});
@@ -163,9 +188,125 @@ chart.removeDrawing(id);       // remove one drawing, returns the removed drawin
 chart.getSelectedDrawing();    // currently selected drawing (or null)
 chart.selectDrawingById(id);   // programmatically select a drawing
 
-chart.getIndicators();         // → [{id, label, type, active}, ...]
-chart.getActiveIndicators();   // → ['ma20', 'rsi', ...]
+// Register a CUSTOM drawing tool (advanced):
+chart.addDrawingTool({
+  id: 'myTool',
+  label: 'My Tool',
+  icon: '◆',
+  onDraw: function (ctx, drawing) { /* render */ },
+  onHitTest: function (drawing, x, y) { return boolean; },
+  defaultStyle: { color: '#2962ff', lineWidth: 1.5 }
+});
 ```
+
+### Indicator Programming API (v2.1.0+)
+
+The library ships with **NO built-in indicators**. Register your own via `addIndicator(def)`:
+
+```js
+// Register + activate a custom indicator in one call:
+chart.addIndicator({
+  id: 'mySMA',                  // unique id
+  label: 'My SMA',              // display label
+  type: 'overlay',              // 'overlay' | 'pane' | 'volume'
+  color: '#2962ff',             // color used in legend/cards
+  settings: { period: 20 },     // default settings (cloned per instance)
+  calculate: function (candles, settings) {
+    // Returns an array of values (same length as candles).
+    // Use null for entries that don't have a value yet (e.g., before period is reached).
+    const out = new Array(candles.length).fill(null);
+    let sum = 0; const p = settings.period || 20;
+    for (let i = 0; i < candles.length; i++) {
+      sum += candles[i].close;
+      if (i >= p) sum -= candles[i - p].close;
+      if (i >= p - 1) out[i] = sum / p;
+    }
+    return out;
+  },
+  render: function (ctx, values, helpers, settings, state) {
+    // Draw the indicator on the canvas.
+    // `helpers` contains coordinate-conversion functions and chart geometry:
+    //   helpers.firstIdx, helpers.lastIdx
+    //   helpers.indexToX(i), helpers.priceToY(p), helpers.volToY(v), helpers.paneToY(v)
+    //   helpers.chartLeft, helpers.chartRight, helpers.priceTop, helpers.priceBottom
+    //   helpers.volTop, helpers.volBottom, helpers.paneTop, helpers.paneBottom
+    //   helpers.barSpacing, helpers.dpr, helpers.candles, helpers.THEME
+    //   helpers.optimalCandlestickWidth(barSpacing, dpr)
+    ctx.strokeStyle = settings.color;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    let started = false;
+    for (let i = helpers.firstIdx; i <= helpers.lastIdx; i++) {
+      if (values[i] === null) { started = false; continue; }
+      const x = helpers.indexToX(i);
+      const y = helpers.priceToY(values[i]);
+      if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  },
+  formatValue: function (value, settings) {
+    // Optional: format the value shown in the legend. Default uses priceScale.formatLogical.
+    return value.toFixed(2);
+  },
+  getRange: function (values, settings) {
+    // Optional (pane indicators only): return {min, max} for the pane scale.
+    // If omitted, the chart auto-ranges from the values.
+    return { min: 0, max: 100 };  // e.g., for RSI
+  }
+});
+
+// Other indicator methods:
+chart.registerIndicator(def);    // register without activating
+chart.removeIndicator(id);       // deactivate + remove
+chart.getIndicators();           // → [{id, label, type, color, active}, ...]
+chart.getActiveIndicators();     // → ['sma20', 'rsi', ...]
+chart.getIndicatorDef(id);       // → the definition object (or null)
+chart.setIndicatorVisible(id, bool);
+chart.setIndicatorSettings(id, { period: 50 });
+chart.getIndicatorSettings(id);
+chart.addIndicatorIcon(id, { id:'alert', label:'Alert', icon:'🔔', onClick: function() {} });
+```
+
+#### Indicator types
+
+| type | Where it renders | Notes |
+|---|---|---|
+| `'overlay'` | On the main price chart | e.g., MA, EMA, Bollinger Bands |
+| `'pane'` | In a separate pane below the chart | e.g., RSI, MACD. Use `getRange()` to fix the scale. |
+| `'volume'` | In the volume pane (below the price chart, above the pane) | If you omit `calculate()` and `render()`, the chart draws volume bars from candle data automatically. |
+
+#### Reusing the built-in math utility
+
+The `Indicators` object is kept as a public utility. You can call its methods from your custom `calculate()` functions:
+
+```js
+chart.addIndicator({
+  id: 'ema20', label: 'EMA 20', type: 'overlay', color: '#2962ff',
+  settings: { period: 20 },
+  calculate: function (candles, s) {
+    const closes = candles.map(function (c) { return c.close; });
+    return Indicators.ema(closes, s.period || 20);
+  },
+  render: function (ctx, v, h, s) {
+    ctx.strokeStyle = s.color; ctx.lineWidth = 1.6; ctx.beginPath();
+    let started = false;
+    for (let i = h.firstIdx; i <= h.lastIdx; i++) {
+      if (v[i] === null) { started = false; continue; }
+      const x = h.indexToX(i), y = h.priceToY(v[i]);
+      if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  }
+});
+```
+
+Available math functions on `Indicators`:
+- `Indicators.sma(values, period)`
+- `Indicators.ema(values, period)`
+- `Indicators.bollinger(values, period, mult)` → `{upper, mid, lower}`
+- `Indicators.rsi(values, period)`
+- `Indicators.macd(values, fast, slow, signal)` → `{macd, signal, hist}`
+- `Indicators.volumeProfile(candles, firstIdx, lastIdx, bins)` → `{bins, pocIdx, pocPrice, vwap, maxVol, minP, maxP}`
 
 A minimal custom toolbar wired to the API:
 
@@ -252,21 +393,6 @@ When the user clicks the ⚙️ icon, a settings popup appears with fields auto-
 
 The `onSettings(settings)` callback is invoked when the user saves, so you can persist changes or trigger custom logic.
 
-### Available Indicators
-
-| ID | Label | Type |
-|---|---|---|
-| `ma20` | MA 20 | Overlay |
-| `ma50` | MA 50 | Overlay |
-| `ma200` | MA 200 | Overlay |
-| `ema20` | EMA 20 | Overlay |
-| `ema50` | EMA 50 | Overlay |
-| `bb` | Bollinger Bands | Overlay |
-| `volsma` | Volume SMA 20 | Volume |
-| `rsi` | RSI 14 | Pane |
-| `macd` | MACD | Pane |
-| `vprof` | Volume Profile | Overlay (with POC & VWAP) |
-
 ### Available Drawing Tools
 
 | ID | Label |
@@ -285,6 +411,14 @@ The `onSettings(settings)` callback is invoked when the user saves, so you can p
 | `text` | Text |
 | `ray` | Ray |
 | `eraser` | Delete Drawing |
+
+> Register your own custom drawing tools via `chart.addDrawingTool(def)`.
+
+### Indicators
+
+The library ships with **no built-in indicators** (v2.1.0+). Register your own via `chart.addIndicator(def)`. See the **Indicator Programming API** section above.
+
+The `Indicators` math utility (SMA, EMA, Bollinger, RSI, MACD, Volume Profile) is available globally for reuse in your custom `calculate()` functions.
 
 ## 🎨 Examples
 
