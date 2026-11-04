@@ -1,18 +1,33 @@
 # BADI-CHARTS-V2
 
-> **A lightweight, dependency-free candlestick charting library built entirely with the HTML5 Canvas API.**
+> **A lightweight, dependency-free, HEADLESS candlestick charting library built entirely with the HTML5 Canvas API.**
 >
-> Pixel-perfect rendering, 14 drawing tools, 10 indicators, mobile-responsive, no fake data — you bring the data, BADI-CHARTS-V2 renders it.
+> Pixel-perfect rendering, 14 drawing tools, 10 indicators, full programmatic API — you bring the data **and** the UI, BADI-CHARTS-V2 renders the chart.
 
-[![Version](https://img.shields.io/badge/version-1.0.0-2962ff.svg)](#)
+[![Version](https://img.shields.io/badge/version-2.0.0-2962ff.svg)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-26a69a.svg)](LICENSE)
 [![No Dependencies](https://img.shields.io/badge/dependencies-zero-ff9800.svg)](#)
+[![Headless](https://img.shields.io/badge/UI-headless-9c27b0.svg)](#)
+
+---
+
+## ⚠️ What changed in v2.0.0 (breaking)
+
+The built-in **toolbar** and **status bar** have been **REMOVED** from the library. The library is now **fully headless** — there is no built-in UI whatsoever. All chart actions (drawing tools, indicators, view reset, etc.) are now controlled **programmatically** through the public API.
+
+**Why?** So you can build your own UI in plain HTML/CSS that exactly matches your application's look and feel, and wire it to the chart through clean method calls. No more fighting the library's built-in toolbar styles.
+
+**Migration from v1.x:**
+- The `toolbar: false` option is now the default and is silently ignored (kept only for backward compatibility).
+- The `statusBar` option now defaults to `false`. Pass `statusBar: true` if you still want the optional status bar.
+- Replace any code that relied on the toolbar's buttons with direct API calls (`setTool`, `addIndicator`, `resetView`, …).
 
 ---
 
 ## ✨ Features
 
 - **100% Pure JavaScript** — No HTML/CSS for UI, no dependencies, no frameworks
+- **Fully Headless (v2.0.0+)** — No built-in toolbar or status bar; you build your own UI
 - **Pixel-Perfect Rendering** — HiDPI-aware, algorithms ported 1:1 from TradingView Lightweight Charts
 - **User-Provided Data** — No fake/mock data; you feed candles via `setData()`
 - **14 Drawing Tools** — trend line, parallel channel, band/zone, arrow, fib retracement, brush, polygon, text, ray, rectangle, horizontal/vertical lines, eraser
@@ -56,7 +71,8 @@ const chart = new BadiCharts(canvas, { /* options */ });
 </head>
 <body>
   <canvas id="chart"></canvas>
-  <script src="chart.js"></script>
+  <!-- Load from CDN (headless, no built-in UI) -->
+  <script src="https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@v2.0.0/chart.js"></script>
   <script>
     const canvas = document.getElementById('chart');
     const chart = new BadiCharts(canvas, {
@@ -73,10 +89,15 @@ const chart = new BadiCharts(canvas, { /* options */ });
     ]);
 
     chart.start();
+
+    // Programmatic tool control — no toolbar needed
+    chart.setTool('trend');
   </script>
 </body>
 </html>
 ```
+
+See `index.html` for a complete example with a custom-built HTML toolbar wired to the chart API.
 
 ## 📖 API Reference
 
@@ -87,11 +108,16 @@ const chart = new BadiCharts(canvas, options);
 ```
 
 **Options:**
-| Option | Type | Description |
-|---|---|---|
-| `symbol` | `{label, priceScale, decimals}` | Symbol configuration (priceScale: 100 for 2 decimals, 100000 for 5) |
-| `timeframe` | `{label, ms}` | Timeframe label and duration in milliseconds |
-| `indicators` | `string[]` | Initial active indicators (e.g. `['ma20', 'rsi']`) |
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `symbol` | `{label, priceScale, decimals}` | `{label:'SYMBOL', priceScale:100, decimals:2}` | Symbol configuration (priceScale: 100 for 2 decimals, 100000 for 5) |
+| `timeframe` | `{label, ms}` | `{label:'1H', ms:3600000}` | Timeframe label and duration in milliseconds |
+| `indicators` | `string[]` | `['volume']` | Initial active indicators (e.g. `['ma20', 'rsi']`) |
+| `statusBar` | `boolean` | `false` | Show the optional status bar (Bid/Ask/24h High/Low/Vol). Toolbar is always OFF. |
+| `background` | `string\|null` | `null` | Background image or video URL drawn behind the chart |
+| `backgroundOpacity` | `number` | `0.15` | Opacity of the background image/video |
+
+> **Note:** The `toolbar` option is accepted but silently ignored (always `false`). Kept only for backward compatibility with v1.x code.
 
 ### Data Methods
 
@@ -111,8 +137,53 @@ chart.setTimeframe({label, ms});
 chart.addIndicator('rsi');       // Add indicator by id
 chart.removeIndicator('rsi');    // Remove indicator by id
 chart.setTool('trend');          // Set active drawing tool
+chart.clearTool();               // Reset to 'cursor'
 chart.addDrawing({type:'hline', price: 65000, color:'#2962ff'});
+chart.removeDrawing(id);         // Remove one drawing by id
 chart.clearDrawings();
+chart.resetView();
+```
+
+### Tool Programming API (v2.0.0+)
+
+The library is headless — there is no built-in toolbar. Use these methods to build your own UI:
+
+```js
+chart.getTools();              // → [{id, label, icon, custom}, ...]
+chart.setTool('trend');        // activate a drawing tool
+chart.getActiveTool();        // → 'trend'
+chart.clearTool();             // back to 'cursor' (no drawing)
+chart.onToolChange(function (toolId) {
+  console.log('User/program switched tool to:', toolId);
+});                            // returns an unsubscribe function
+
+chart.getDrawings();           // → all drawings on the chart
+chart.getDrawing(id);          // → one drawing by id (or null)
+chart.removeDrawing(id);       // remove one drawing, returns the removed drawing
+chart.getSelectedDrawing();    // currently selected drawing (or null)
+chart.selectDrawingById(id);   // programmatically select a drawing
+
+chart.getIndicators();         // → [{id, label, type, active}, ...]
+chart.getActiveIndicators();   // → ['ma20', 'rsi', ...]
+```
+
+A minimal custom toolbar wired to the API:
+
+```html
+<button data-tool="trend">Trend</button>
+<button data-tool="hline">H-Line</button>
+<script>
+  document.querySelectorAll('[data-tool]').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      chart.setTool(btn.getAttribute('data-tool'));
+    });
+  });
+  chart.onToolChange(function (id) {
+    document.querySelectorAll('[data-tool]').forEach(function (b) {
+      b.classList.toggle('active', b.getAttribute('data-tool') === id);
+    });
+  });
+</script>
 ```
 
 ### View Methods

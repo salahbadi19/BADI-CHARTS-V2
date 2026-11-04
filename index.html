@@ -4,32 +4,117 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
 <meta name="theme-color" content="#0e1015">
-<title>BADI-CHARTS-V2</title>
+<title>BADI-CHARTS-V2 — Headless</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
-  html, body { width: 100%; height: 100%; overflow: hidden; background: #0e1015; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #0e1015; color: #e0e3eb; font-family: -apple-system, Segoe UI, Roboto, sans-serif; }
   #chart { display: block; width: 100vw; height: 100vh; cursor: crosshair; }
+
+  /* ── Custom toolbar (you build your own — this is just a tiny example) ── */
+  #toolbar {
+    position: fixed; top: 8px; left: 8px; z-index: 10;
+    display: flex; gap: 4px; padding: 4px;
+    background: rgba(26, 30, 42, 0.92);
+    border: 1px solid #2a2e39;
+    border-radius: 6px;
+    backdrop-filter: blur(6px);
+  }
+  #toolbar button {
+    min-width: 36px; height: 30px; padding: 0 8px;
+    background: #2a2e39; color: #d1d4dc; border: 1px solid #2a2e39;
+    border-radius: 4px; cursor: pointer; font-size: 13px;
+    display: inline-flex; align-items: center; justify-content: center;
+    transition: background 0.12s, color 0.12s, border-color 0.12s;
+  }
+  #toolbar button:hover { background: #363a45; color: #fff; }
+  #toolbar button.active { background: #2962ff; color: #fff; border-color: #2962ff; }
+  #toolbar .sep { width: 1px; background: #2a2e39; margin: 4px 2px; }
 </style>
 </head>
 <body>
 <canvas id="chart"></canvas>
 
-<!-- BADI-CHARTS-V2 from CDN -->
-<script src="https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@v1.1.4/chart.js"></script>
+<!-- ── Custom UI toolbar (you own this — wire buttons to the chart API) ── -->
+<div id="toolbar">
+  <button data-tool="cursor" class="active" title="Cursor">↖</button>
+  <div class="sep"></div>
+  <button data-tool="trend"   title="Trend Line">╱</button>
+  <button data-tool="hline"   title="Horizontal Line">─</button>
+  <button data-tool="vline"   title="Vertical Line">│</button>
+  <button data-tool="rect"    title="Rectangle">▭</button>
+  <button data-tool="fib"     title="Fib Retracement">Fib</button>
+  <button data-tool="brush"   title="Brush">~</button>
+  <button data-tool="text"    title="Text">T</button>
+  <button data-tool="eraser"  title="Eraser">✕</button>
+  <div class="sep"></div>
+  <button data-action="reset"    title="Reset view">Rst</button>
+  <button data-action="clear"    title="Clear drawings">Clr</button>
+  <button data-action="addRsi"   title="Toggle RSI">RSI</button>
+</div>
+
+<!-- BADI-CHARTS-V2 v2.0.0 from CDN (HEADLESS — no built-in toolbar) -->
+<script src="https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@v2.0.0/chart.js"></script>
 <script>
-  // EMPTY chart — no toolbar, no status bar, no indicators, no data
+  // 1) Create a headless chart instance.
+  //    The library no longer ships a toolbar — `toolbar: false` is the default
+  //    and the option is ignored (kept only for backward compatibility).
   const chart = new BadiCharts(document.getElementById('chart'), {
-    symbol: { label: 'SYMBOL', priceScale: 100, decimals: 2 },
+    symbol:    { label: 'SYMBOL', priceScale: 100, decimals: 2 },
     timeframe: { label: '1H', ms: 3600000 },
-    indicators: [],        // no indicators
-    toolbar: false,        // no toolbar
-    statusBar: false       // no status bar
+    indicators: [],        // start with no indicators
+    statusBar:  false      // headless — no built-in status bar either
   });
   chart.start();
 
-  // Feed your data here:
+  // 2) Wire your custom toolbar buttons to the chart API.
+  const buttons = document.querySelectorAll('#toolbar button');
+  buttons.forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      const tool   = btn.getAttribute('data-tool');
+      const action = btn.getAttribute('data-action');
+
+      if (tool) {
+        chart.setTool(tool);  // ← programmatic tool control
+      } else if (action === 'reset') {
+        chart.resetView();
+      } else if (action === 'clear') {
+        chart.clearDrawings();
+      } else if (action === 'addRsi') {
+        // Toggle RSI indicator programmatically
+        const active = chart.getActiveIndicators();
+        if (active.indexOf('rsi') >= 0) chart.removeIndicator('rsi');
+        else                            chart.addIndicator('rsi');
+      }
+    });
+  });
+
+  // 3) Subscribe to tool changes so your custom UI stays in sync.
+  chart.onToolChange(function (toolId) {
+    buttons.forEach(function (btn) {
+      const t = btn.getAttribute('data-tool');
+      btn.classList.toggle('active', t === toolId);
+    });
+  });
+
+  // 4) Feed your data here:
   // chart.setData([{time, open, high, low, close, volume}, ...]);
   // chart.update(latestCandle);
+
+  // ─── Available API (v2.0.0+) ───────────────────────────────────
+  // chart.getTools();              → [{id, label, icon, custom}, ...]
+  // chart.setTool('trend');        → activate a tool
+  // chart.getActiveTool();        → 'trend'
+  // chart.clearTool();             → back to 'cursor'
+  // chart.onToolChange(cb);        → subscribe to tool changes
+  // chart.getDrawings();           → all drawings on the chart
+  // chart.getDrawing(id);          → one drawing by id
+  // chart.removeDrawing(id);       → remove one drawing
+  // chart.getSelectedDrawing();    → currently selected
+  // chart.getIndicators();         → [{id, label, type, active}, ...]
+  // chart.getActiveIndicators();   → ['ma20', 'rsi', ...]
+  // chart.addIndicator('rsi');     chart.removeIndicator('rsi');
+  // chart.addDrawing({type:'hline', price:65000, color:'#2962ff'});
+  // chart.clearDrawings();         chart.resetView();
 </script>
 </body>
 </html>

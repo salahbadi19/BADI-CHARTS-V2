@@ -30,7 +30,7 @@
 'use strict';
 
 /* ============================ VERSION ====================================== */
-const VERSION = '1.0.0';
+const VERSION = '2.0.0';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 
 /* ============================ THEME ========================================= */
@@ -709,12 +709,17 @@ class TradingChart {
     this.ctx = canvas.getContext('2d');
     this.dpr = window.devicePixelRatio || 1;
 
-    // Layout
-    // User can hide the toolbar and/or status bar via opts (for embedding in custom UIs)
-    this._showToolbar = opts.toolbar !== false;   // default: true
-    this._showStatusBar = opts.statusBar !== false; // default: true
+    // Layout — HEADLESS MODE (v2.0.0+)
+    // The built-in toolbar has been REMOVED entirely. The library is now fully
+    // headless: tool/indicator/view actions are controlled programmatically via
+    // the public API (setTool, addIndicator, resetView, etc.). Build your own
+    // UI in HTML/CSS and wire it to the chart through these methods.
+    // The optional status bar defaults to OFF for clean embedding.
+    this._showToolbar = false;                    // always false (toolbar removed)
+    this._showStatusBar = opts.statusBar === true; // default: false
+    this._toolChangeCallbacks = [];
     this.layout = {
-      toolbarH: this._showToolbar ? 44 : 0,
+      toolbarH: 0,                                 // HEADLESS: no toolbar
       statusH: this._showStatusBar ? 26 : 0,
       priceAxisW: 64,
       timeAxisH: 28,
@@ -977,8 +982,84 @@ class TradingChart {
   }
   // Clear all drawings
   clearDrawings() { this.drawings = []; }
-  // Set the active drawing tool by id
-  setTool(toolId) { this.activeTool = toolId; }
+  // Set the active drawing tool by id.
+  // Accepts built-in tool ids (see getTools()) or any custom tool registered
+  // via addDrawingTool(). Calling setTool() fires onToolChange callbacks.
+  setTool(toolId) {
+    const known = DRAW_TOOLS.find(function (t) { return t.id === toolId; })
+      || (this._customTools && this._customTools[toolId]);
+    if (!known) {
+      if (BADI_DEBUG) console.warn('[BadiCharts] Unknown tool:', toolId);
+      return;
+    }
+    this.activeTool = toolId;
+    for (let i = 0; i < this._toolChangeCallbacks.length; i++) {
+      try { this._toolChangeCallbacks[i](toolId); } catch (e) { if (BADI_DEBUG) console.error(e); }
+    }
+  }
+  // Get the currently active drawing tool id.
+  getActiveTool() { return this.activeTool; }
+  // Reset the active tool to the default 'cursor' (no drawing).
+  clearTool() { this.setTool('cursor'); }
+  // List all available drawing tools (built-in + custom registered via addDrawingTool()).
+  // Returns an array of: { id, label, icon, custom }
+  getTools() {
+    const self = this;
+    return DRAW_TOOLS.map(function (t) {
+      return {
+        id: t.id,
+        label: t.label,
+        icon: TOOL_SHORTCUTS[t.id] || '◆',
+        custom: !!(self._customTools && self._customTools[t.id])
+      };
+    });
+  }
+  // Subscribe to active tool changes. Returns an unsubscribe function.
+  //   chart.onToolChange(function (toolId) { console.log('Tool:', toolId); });
+  onToolChange(cb) {
+    if (typeof cb !== 'function') return function () {};
+    this._toolChangeCallbacks.push(cb);
+    const subs = this._toolChangeCallbacks;
+    return function () {
+      const i = subs.indexOf(cb);
+      if (i >= 0) subs.splice(i, 1);
+    };
+  }
+  // Get a snapshot of all drawings on the chart (each drawing object).
+  getDrawings() { return this.drawings.slice(); }
+  // Get a specific drawing by id (or null if not found).
+  getDrawing(id) {
+    for (let i = 0; i < this.drawings.length; i++) {
+      if (this.drawings[i].id === id) return this.drawings[i];
+    }
+    return null;
+  }
+  // Remove a specific drawing by id. Returns the removed drawing or null.
+  removeDrawing(id) {
+    for (let i = 0; i < this.drawings.length; i++) {
+      if (this.drawings[i].id === id) {
+        const removed = this.drawings.splice(i, 1)[0];
+        if (this.selectedDrawing === removed) this.selectedDrawing = null;
+        if (this.hoverDrawing === removed) this.hoverDrawing = null;
+        return removed;
+      }
+    }
+    return null;
+  }
+  // Get the currently selected drawing (clicked by the user), or null.
+  getSelectedDrawing() { return this.selectedDrawing; }
+  // Programmatically select a drawing by id.
+  selectDrawingById(id) { this.selectedDrawing = this.getDrawing(id); }
+  // List all available indicators with their active state.
+  // Returns: [ { id, label, type, active } ]
+  getIndicators() {
+    const self = this;
+    return INDICATOR_LIST.map(function (i) {
+      return { id: i.id, label: i.label, type: i.type, active: self.activeIndicators.has(i.id) };
+    });
+  }
+  // Get the array of currently active indicator ids.
+  getActiveIndicators() { return Array.from(this.activeIndicators); }
 
   // ─── Background image / video ─────────────────────────────────────────────
   // url: string (image URL or video URL), or null to clear
@@ -1077,14 +1158,14 @@ class TradingChart {
     // Responsive layout: smaller dimensions on mobile (width < 600px)
     const isMobile = this.W < 600;
     if (isMobile) {
-      this.layout.toolbarH = this._showToolbar ? 40 : 0;
+      this.layout.toolbarH = 0;                  // HEADLESS
       this.layout.statusH = this._showStatusBar ? 22 : 0;
       this.layout.priceAxisW = 56;
       this.layout.timeAxisH = 24;
       this.layout.volumeH = 50;
       this.layout.gap = 4;
     } else {
-      this.layout.toolbarH = this._showToolbar ? 44 : 0;
+      this.layout.toolbarH = 0;                  // HEADLESS
       this.layout.statusH = this._showStatusBar ? 26 : 0;
       this.layout.priceAxisW = 64;
       this.layout.timeAxisH = 28;
@@ -1958,7 +2039,7 @@ class TradingChart {
     this.drawCrosshair();
     this.drawLegend();
     this.drawSettingsCard();      // Settings popup (drawn last so it overlays everything)
-    if (this._showToolbar) this.drawToolbar();
+    // HEADLESS (v2.0.0+): built-in toolbar removed — drawToolbar() is now a no-op.
     if (this._showStatusBar) this.drawStatusBar();
     this.drawDropdown();
     this.drawToast(now);
@@ -2003,18 +2084,17 @@ class TradingChart {
       ctx.drawImage(this._bgVideo, dx, dy, dw, dh);
       ctx.restore();
     }
-    // Toolbar and status bar backgrounds
-    ctx.fillStyle = THEME.toolbarBg;
-    ctx.fillRect(0, 0, this.W, this.layout.toolbarH);
-    ctx.fillRect(0, this.H - this.layout.statusH, this.W, this.layout.statusH);
-    ctx.strokeStyle = THEME.toolbarBorder;
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(0, this.layout.toolbarH + 0.5);
-    ctx.lineTo(this.W, this.layout.toolbarH + 0.5);
-    ctx.moveTo(0, this.H - this.layout.statusH - 0.5);
-    ctx.lineTo(this.W, this.H - this.layout.statusH - 0.5);
-    ctx.stroke();
+    // Status bar background only (toolbar removed in v2.0.0 — headless mode)
+    if (this._showStatusBar && this.layout.statusH > 0) {
+      ctx.fillStyle = THEME.toolbarBg;
+      ctx.fillRect(0, this.H - this.layout.statusH, this.W, this.layout.statusH);
+      ctx.strokeStyle = THEME.toolbarBorder;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(0, this.H - this.layout.statusH - 0.5);
+      ctx.lineTo(this.W, this.H - this.layout.statusH - 0.5);
+      ctx.stroke();
+    }
   }
 
   /* --------------------------- Grid (price marks) ------------------------ */
@@ -3634,65 +3714,18 @@ class TradingChart {
   }
 
   /* --------------------------- Toolbar ----------------------------------- */
-  drawToolbar() {
-    const ctx = this.ctx;
-    const isMobile = this.W < 600;
-    let x = isMobile ? 4 : 8;
-    const y = isMobile ? 5 : 7;
-    const h = isMobile ? 30 : 30;
-    const gap = isMobile ? 3 : 6;
-
-    if (isMobile) {
-      // Mobile: compact. Symbol + TF shown as static label (no dropdown).
-      // Buttons: Indicators, Tool, Reset.
-      const label = this.symbol.label + ' · ' + this.timeframe.label;
-      ctx.font = 'bold 11px -apple-system, Segoe UI, Roboto, sans-serif';
-      ctx.fillStyle = THEME.textBright;
-      ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
-      ctx.fillText(label, x, y + h / 2);
-      x += ctx.measureText(label).width + gap + 4;
-      x = this.drawButton({id:'ind', action:'indicator', x, y, w:36, h, label:'Ind', icon:'plus'});
-      x += gap;
-      const toolShort = TOOL_SHORTCUTS[this.activeTool] || '↖';
-      x = this.drawButton({id:'tool', action:'tool', x, y, w:38, h, label:toolShort, icon:'caret'});
-      x += gap;
-      x = this.drawButton({id:'reset', action:'reset', x, y, w:36, h, label:'Rst', icon:null});
-      // Right side: LIVE only
-      const rightX = this.W - 4;
-      ctx.font = '10px -apple-system, Segoe UI, Roboto, sans-serif';
-      ctx.fillStyle = THEME.bull;
-      ctx.textBaseline = 'middle'; ctx.textAlign = 'right';
-      ctx.fillText('● LIVE', rightX, y + h / 2);
-    } else {
-      // Desktop: Symbol + TF shown as static label (no dropdown).
-      // Buttons: Indicators, Tool, Reset, Settings.
-      const label = this.symbol.label + ' · ' + this.timeframe.label;
-      ctx.font = 'bold 12px -apple-system, Segoe UI, Roboto, sans-serif';
-      ctx.fillStyle = THEME.textBright;
-      ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
-      ctx.fillText(label, x, y + h / 2);
-      x += ctx.measureText(label).width + gap + 8;
-      x = this.drawButton({id:'ind', action:'indicator', x, y, w:110, h, label:'Indicators', icon:'plus'});
-      x += gap;
-      const toolLabel = DRAW_TOOLS.find(t => t.id === this.activeTool).label;
-      x = this.drawButton({id:'tool', action:'tool', x, y, w:130, h, label:toolLabel, icon:'caret'});
-      x += gap;
-      x = this.drawButton({id:'reset', action:'reset', x, y, w:60, h, label:'Reset', icon:null});
-      x += gap;
-      x = this.drawButton({id:'settings', action:'settings', x, y, w:70, h, label:'Settings', icon:null});
-      // Right side: LIVE + clock
-      const rightX = this.W - 8;
-      ctx.font = '11px -apple-system, Segoe UI, Roboto, sans-serif';
-      ctx.fillStyle = THEME.bull;
-      ctx.textBaseline = 'middle'; ctx.textAlign = 'right';
-      ctx.fillText('● LIVE', rightX, y + h / 2);
-      const now = new Date();
-      const pad2 = (n) => n < 10 ? '0' + n : '' + n;
-      const timeTxt = pad2(now.getUTCHours()) + ':' + pad2(now.getUTCMinutes()) + ':' + pad2(now.getUTCSeconds()) + ' UTC';
-      ctx.fillStyle = THEME.textDim;
-      ctx.fillText(timeTxt, rightX - 60, y + h / 2);
-    }
-  }
+  // HEADLESS MODE (v2.0.0+): The built-in toolbar has been REMOVED.
+  // All chart actions (tools, indicators, reset, settings) are now controlled
+  // programmatically through the public API:
+  //
+  //   chart.setTool('trend');          // activate a drawing tool
+  //   chart.addIndicator('rsi');       // add an indicator
+  //   chart.removeIndicator('rsi');    // remove an indicator
+  //   chart.resetView();               // reset zoom/pan
+  //   chart.clearDrawings();           // remove all drawings
+  //
+  // Build your own HTML/CSS toolbar and wire its buttons to these methods.
+  drawToolbar() { /* no-op — headless mode (v2.0.0+) */ }
   drawButton(btn) {
     const ctx = this.ctx;
     const isHover = this.hoverButton && this.hoverButton.id === btn.id;
