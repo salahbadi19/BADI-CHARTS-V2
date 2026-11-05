@@ -4,10 +4,33 @@
 >
 > Pixel-perfect rendering, 14 drawing tools, fully custom indicators via API — you bring the data, the UI, and the indicators. BADI-CHARTS-V2 renders the chart.
 
-[![Version](https://img.shields.io/badge/version-2.3.1-2962ff.svg)](#)
+[![Version](https://img.shields.io/badge/version-2.4.0-2962ff.svg)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-26a69a.svg)](LICENSE)
 [![No Dependencies](https://img.shields.io/badge/dependencies-zero-ff9800.svg)](#)
 [![Headless](https://img.shields.io/badge/UI-headless-9c27b0.svg)](#)
+
+---
+
+## ⚠️ What changed in v2.4.0
+
+Two improvements:
+
+1. **Dedicated axis theme colors.** New THEME keys: `axisBg`, `axisBorder`, `axisText`. Override them to control the price/time axis appearance independently of the rest of the chart:
+   ```js
+   new BadiCharts(canvas, {
+     theme: {
+       bg:      '#0e1015',  // chart background
+       axisBg:  '#131722',  // axis background (defaults to panelBg)
+       axisBorder: '#2a2e39', // axis border line
+       axisText:'#787b86'   // axis tick labels
+     }
+   });
+   ```
+   The axes now "follow the chart color" — change `axisBg` to match or contrast with `bg`.
+
+2. **Momentum scrolling (inertia).** After the user releases the mouse/touch after panning, the chart continues to move with decreasing speed, like TradingView / Binance. Velocity is tracked during the drag (weighted average of recent samples), then applied with friction (`× 0.94` per frame) until it falls below threshold. Works for both mouse drag and touch pan. Any new interaction (click/touch) instantly cancels the momentum.
+
+No breaking API changes from v2.3.1.
 
 ---
 
@@ -140,7 +163,7 @@ const chart = new BadiCharts(canvas, { /* options */ });
 <body>
   <canvas id="chart"></canvas>
   <!-- Load from CDN (headless, no built-in UI or indicators) -->
-  <script src="https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@v2.3.1/chart.js"></script>
+  <script src="https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@v2.4.0/chart.js"></script>
   <script>
     const canvas = document.getElementById('chart');
     const chart = new BadiCharts(canvas, {

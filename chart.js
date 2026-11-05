@@ -30,7 +30,7 @@
 'use strict';
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.3.1';
+const VERSION = '2.4.0';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 
 /* ============================ THEME ========================================= */
@@ -46,6 +46,12 @@ let THEME = {
   grid:          '#1c2030',
   gridStrong:    '#2a2e39',
   axis:          '#1c2030',
+  // v2.4.0+: Dedicated axis colors — override these to change axis appearance
+  // independently of the rest of the chart. Default to panelBg/toolbarBorder/textDim
+  // so existing themes keep working.
+  axisBg:        '#131722',   // background of the price + time axis area
+  axisBorder:    '#2a2e39',   // border line between chart and axes
+  axisText:      '#787b86',   // tick label color on both axes
   text:          '#cfd2da',
   textDim:       '#787b86',
   textBright:    '#f0f3fa',
@@ -746,6 +752,17 @@ class TradingChart {
     this._renderThrottleMs = isMobileDevice ? 33 : 0;  // ~30fps on mobile, uncapped on desktop
     this._lastRenderTime = 0;
 
+    // v2.4.0+: Momentum scrolling (inertia) — after the user releases the mouse/touch
+    // after panning, the chart continues to move with decreasing speed, like
+    // TradingView / Binance. Velocity is tracked in pixels/ms during drag, then
+    // applied with friction in the render loop until it falls below threshold.
+    this._momentum = null;          // { velocity: px/ms, lastTime: ms }
+    this._panVelocity = 0;          // current tracked velocity during active drag
+    this._lastPanX = 0;             // last X position during drag (for velocity calc)
+    this._lastPanTime = 0;          // last timestamp during drag
+    this._momentumFriction = 0.94;  // velocity multiplier per frame (~60fps → stops in ~1s)
+    this._momentumThreshold = 0.02; // px/ms — below this, momentum stops
+
     // Layout — HEADLESS MODE (v2.0.0+)
     // The built-in toolbar has been REMOVED entirely. The library is now fully
     // headless: tool/indicator/view actions are controlled programmatically via
@@ -1318,6 +1335,10 @@ class TradingChart {
     e.preventDefault();
     const r = this.canvas.getBoundingClientRect();
     const touches = e.touches;
+    // v2.4.0+: Cancel any active momentum when the user starts a new touch
+    this._momentum = null;
+    this._panVelocity = 0;
+    this._lastPanTime = 0;
     if (touches.length === 1) {
       // Single touch = pan (like drag)
       const t = touches[0];
@@ -1397,6 +1418,15 @@ class TradingChart {
       this.rightOffset = this.touchStartRightOffset - barsMoved;
       this.constrainRightOffset();
       this.autoScale();
+      // v2.4.0+: Track velocity for momentum scrolling (touch)
+      const now = performance.now();
+      const dt = now - this._lastPanTime;
+      if (dt > 0 && this._lastPanTime > 0) {
+        const instV = (x - this._lastPanX) / dt;
+        this._panVelocity = this._panVelocity * 0.4 + instV * 0.6;
+      }
+      this._lastPanX = x;
+      this._lastPanTime = now;
       if (this.inChartArea(x, y)) {
         const idx = this.xToIndex(x);
         this.crosshairIndex = idx;
@@ -1414,8 +1444,14 @@ class TradingChart {
     if (this.isPinching) {
       this.isPinching = false;
     }
+    // v2.4.0+: Start momentum scrolling on touch release (if panning velocity is significant)
     if (this.isDragging) {
       this.isDragging = false;
+      if (Math.abs(this._panVelocity) > this._momentumThreshold) {
+        this._momentum = { velocity: this._panVelocity, lastTime: performance.now() };
+      }
+      this._panVelocity = 0;
+      this._lastPanTime = 0;
     }
     if (this.currentDrawing) {
       this.finishDrawing();
@@ -1453,6 +1489,16 @@ class TradingChart {
       this.rightOffset = this.dragStartRightOffset - barsMoved;
       this.constrainRightOffset();
       this.autoScale();
+      // v2.4.0+: Track velocity for momentum scrolling
+      const now = performance.now();
+      const dt = now - this._lastPanTime;
+      if (dt > 0 && this._lastPanTime > 0) {
+        const instV = (x - this._lastPanX) / dt;  // px/ms
+        // Smooth: weighted average of previous velocity and instantaneous
+        this._panVelocity = this._panVelocity * 0.4 + instV * 0.6;
+      }
+      this._lastPanX = x;
+      this._lastPanTime = now;
     } else if (this.currentDrawing) {
       this.updateCurrentDrawing(x, y);
     }
@@ -1556,6 +1602,11 @@ class TradingChart {
     const x = e.clientX - r.left;
     const y = e.clientY - r.top;
 
+    // v2.4.0+: Cancel any active momentum when the user starts a new interaction
+    this._momentum = null;
+    this._panVelocity = 0;
+    this._lastPanTime = 0;
+
     // 1. Check settings card first (topmost overlay)
     const scHit = this._hitSettingsCard(x, y);
     if (scHit) {
@@ -1651,7 +1702,15 @@ class TradingChart {
   }
 
   onMouseUp() {
-    if (this.isDragging) this.isDragging = false;
+    if (this.isDragging) {
+      this.isDragging = false;
+      // v2.4.0+: Start momentum scrolling if the pan velocity is significant
+      if (Math.abs(this._panVelocity) > this._momentumThreshold) {
+        this._momentum = { velocity: this._panVelocity, lastTime: performance.now() };
+      }
+      this._panVelocity = 0;
+      this._lastPanTime = 0;
+    }
     if (this.currentDrawing) this.finishDrawing();
   }
 
@@ -3217,20 +3276,20 @@ class TradingChart {
   /* --------------------------- Price Axis -------------------------------- */
   drawPriceAxis() {
     const ctx = this.ctx;
-    // Fill the entire right column (price axis + corner with time axis) with panelBg
-    // so there's no empty gap at the bottom-right corner.
+    // v2.4.0+: Use dedicated axis colors (axisBg, axisBorder, axisText)
+    // Fill the entire right column (price axis + corner with time axis) with axisBg
     const axisTop = this.chartTop;
     const axisBottom = (this.layout.paneBottom || this.chartBottom) + this.layout.timeAxisH;
-    ctx.fillStyle = THEME.panelBg;
+    ctx.fillStyle = THEME.axisBg;
     ctx.fillRect(this.chartRight + 1, axisTop, this.W - this.chartRight - 1, axisBottom - axisTop);
-    ctx.strokeStyle = THEME.toolbarBorder;
+    ctx.strokeStyle = THEME.axisBorder;
     ctx.beginPath();
     ctx.moveTo(this.chartRight + 0.5, this.chartTop);
     ctx.lineTo(this.chartRight + 0.5, this.chartBottom);
     ctx.stroke();
 
     ctx.font = '11px -apple-system, Segoe UI, Roboto, sans-serif';
-    ctx.fillStyle = THEME.textDim;
+    ctx.fillStyle = THEME.axisText;
     ctx.textBaseline = 'middle';
     ctx.textAlign = 'left';
     const marks = this.priceScale.marks();
@@ -3260,16 +3319,17 @@ class TradingChart {
   drawTimeAxis() {
     const ctx = this.ctx;
     const axisTop = this.layout.paneBottom || this.chartBottom;
-    ctx.fillStyle = THEME.panelBg;
+    // v2.4.0+: Use dedicated axis colors (axisBg, axisBorder, axisText)
+    ctx.fillStyle = THEME.axisBg;
     ctx.fillRect(0, axisTop, this.chartRight + 1, this.layout.timeAxisH);
-    ctx.strokeStyle = THEME.toolbarBorder;
+    ctx.strokeStyle = THEME.axisBorder;
     ctx.beginPath();
     ctx.moveTo(0, axisTop + 0.5);
     ctx.lineTo(this.chartRight, axisTop + 0.5);
     ctx.stroke();
 
     ctx.font = '11px -apple-system, Segoe UI, Roboto, sans-serif';
-    ctx.fillStyle = THEME.textDim;
+    ctx.fillStyle = THEME.axisText;
     ctx.textBaseline = 'middle';
     ctx.textAlign = 'center';
     const marks = this.getTimeMarks();
@@ -4007,11 +4067,14 @@ class TradingChart {
   // v2.3.0+: Mobile render throttle — on mobile devices, cap at ~30fps to
   // reduce CPU/battery usage. Desktop renders uncapped (60fps). Also pause
   // rendering when the tab is hidden (Page Visibility API) to save battery.
+  // v2.4.0+: Apply momentum scrolling (inertia) each frame.
   start() {
     const loop = (now) => {
       this.rafId = requestAnimationFrame(loop);
       // Pause when tab is hidden
       if (document.hidden) return;
+      // Apply momentum scrolling (inertia) — runs every frame regardless of throttle
+      this._applyMomentum(now);
       // Throttle on mobile
       if (this._renderThrottleMs > 0) {
         if (now - this._lastRenderTime < this._renderThrottleMs) return;
@@ -4020,6 +4083,29 @@ class TradingChart {
       this.render(now);
     };
     this.rafId = requestAnimationFrame(loop);
+  }
+  // v2.4.0+: Apply momentum scrolling. Called every frame from the render loop.
+  // Moves the chart by velocity * deltaTime, then applies friction. Stops when
+  // velocity falls below threshold or the user starts a new interaction.
+  _applyMomentum(now) {
+    if (!this._momentum) return;
+    const m = this._momentum;
+    const dt = now - m.lastTime;
+    if (dt <= 0) return;
+    // Convert px/ms to bars/ms and apply to rightOffset
+    const barsPerMs = m.velocity / this.barSpacing;
+    this.rightOffset -= barsPerMs * dt;
+    this.constrainRightOffset();
+    // Apply friction (per-frame, approximated for dt)
+    const frictionPerFrame = Math.pow(this._momentumFriction, dt / 16.67);
+    m.velocity *= frictionPerFrame;
+    m.lastTime = now;
+    // Stop when velocity is very small
+    if (Math.abs(m.velocity) < this._momentumThreshold) {
+      this._momentum = null;
+    }
+    this.invalidateTimeMarks();
+    this.autoScale();
   }
 }
 
