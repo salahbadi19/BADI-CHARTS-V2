@@ -30,7 +30,7 @@
 'use strict';
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.3.0';
+const VERSION = '2.3.1';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 
 /* ============================ THEME ========================================= */
@@ -3186,7 +3186,7 @@ class TradingChart {
     if (y < this.priceTop - 2 || y > this.priceBottom + 2) return;
     const isBull = last.close >= last.open;
     const color = isBull ? THEME.currentPriceBull : THEME.currentPriceBear;
-    // Dashed line across the chart (stops at chartRight — does NOT extend onto price axis)
+    // Dashed line across the chart (stops at chartRight)
     ctx.strokeStyle = color;
     ctx.lineWidth = 1;
     ctx.setLineDash([2, 3]);
@@ -3195,16 +3195,16 @@ class TradingChart {
     ctx.lineTo(this.chartRight, Math.floor(y) + 0.5);
     ctx.stroke();
     ctx.setLineDash([]);
-    // v2.3.0+: Price label INSIDE the chart at the right edge (not on the price axis).
-    // The price axis must remain clean — only axis tick labels belong there.
+    // v2.3.1: Price label ON the price axis (chartRight + 1) — this is where it
+    // belongs: the axis is "connected to the chart" and the price label sits on it.
     const txt = this.priceScale.formatLogical(last.close);
     ctx.font = 'bold 11px -apple-system, Segoe UI, Roboto, sans-serif';
     const tw = ctx.measureText(txt).width + 10;
-    const labelX = this.chartRight - tw - 2;
+    const labelX = this.chartRight + 1;
     const labelY = Math.floor(y) - 9;
-    // Clamp label Y so it stays within the chart area
+    // Clamp label Y so it stays within the price axis area
     const minY = this.chartTop;
-    const maxY = this.chartBottom - 18;
+    const maxY = (this.layout.paneBottom || this.chartBottom) - 18;
     const clampedY = clamp(labelY, minY, maxY);
     ctx.fillStyle = color;
     ctx.fillRect(labelX, clampedY, tw, 18);
@@ -3292,6 +3292,8 @@ class TradingChart {
 
   /* --------------------------- Crosshair --------------------------------- */
   drawCrosshair() {
+    // v2.3.1: On mobile/touch devices, don't show the crosshair (mouse axes) at all.
+    if (this._isMobile) return;
     if (!this.mouseInside || this.crosshairIndex === null) return;
     if (this.activeTool !== 'cursor') return;
     if (!this.inChartArea(this.mouseX, this.mouseY) &&
@@ -3339,17 +3341,17 @@ class TradingChart {
     ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
     ctx.fillText(timeStr, x, (this.layout.paneBottom || this.chartBottom) + this.layout.timeAxisH / 2);
 
-    // v2.3.0+: Price label INSIDE the chart at the right edge (not on the price axis).
-    // The price axis must remain clean — only axis tick labels belong there.
+    // v2.3.1: Price label ON the price axis (chartRight + 1) — the axis is
+    // connected to the chart and the crosshair price label sits on it.
     if (this.mouseX < this.chartRight && this.mouseY >= this.chartTop && this.mouseY <= this.chartBottom) {
       const price = this.yToPrice(y);
       const priceStr = this.priceScale.formatLogical(price);
       const pw = ctx.measureText(priceStr).width + 14;
       ctx.fillStyle = THEME.crosshairLabel;
-      ctx.fillRect(this.chartRight - pw - 2, Math.floor(y) - 9, pw, 18);
+      ctx.fillRect(this.chartRight + 1, Math.floor(y) - 9, pw, 18);
       ctx.fillStyle = THEME.textBright;
       ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-      ctx.fillText(priceStr, this.chartRight - pw / 2 - 2, Math.floor(y));
+      ctx.fillText(priceStr, this.chartRight + 1 + pw / 2, Math.floor(y));
       ctx.textAlign = 'left';
     }
   }

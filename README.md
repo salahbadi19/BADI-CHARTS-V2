@@ -4,10 +4,22 @@
 >
 > Pixel-perfect rendering, 14 drawing tools, fully custom indicators via API — you bring the data, the UI, and the indicators. BADI-CHARTS-V2 renders the chart.
 
-[![Version](https://img.shields.io/badge/version-2.3.0-2962ff.svg)](#)
+[![Version](https://img.shields.io/badge/version-2.3.1-2962ff.svg)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-26a69a.svg)](LICENSE)
 [![No Dependencies](https://img.shields.io/badge/dependencies-zero-ff9800.svg)](#)
 [![Headless](https://img.shields.io/badge/UI-headless-9c27b0.svg)](#)
+
+---
+
+## ⚠️ What changed in v2.3.1
+
+Two adjustments based on user feedback:
+
+1. **Price labels returned to the price axis.** In v2.3.0 I moved the current-price label and crosshair price label INSIDE the chart. v2.3.1 puts them back ON the price axis (`chartRight + 1`), where they belong — the axis is connected to the chart and the labels sit on it.
+
+2. **Crosshair disabled on mobile.** On touch devices, the crosshair (horizontal + vertical mouse lines, time label, price label) no longer appears at all. Touch still works for panning and pinch-zoom; the OHLC legend at the top still updates to the touched candle. This matches mobile trading app behavior (no mouse crosshair on touch screens).
+
+No other changes from v2.3.0.
 
 ---
 
@@ -128,7 +140,7 @@ const chart = new BadiCharts(canvas, { /* options */ });
 <body>
   <canvas id="chart"></canvas>
   <!-- Load from CDN (headless, no built-in UI or indicators) -->
-  <script src="https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@v2.3.0/chart.js"></script>
+  <script src="https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@v2.3.1/chart.js"></script>
   <script>
     const canvas = document.getElementById('chart');
     const chart = new BadiCharts(canvas, {
