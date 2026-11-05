@@ -30,11 +30,15 @@
 'use strict';
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.2.0';
+const VERSION = '2.3.0';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 
 /* ============================ THEME ========================================= */
-const THEME = {
+// v2.3.0+: THEME is now a `let` (mutable) so users can override any color
+// via the constructor `theme` option or via chart.setTheme(overrides).
+// All default colors are listed below — override any of them by passing
+// a partial object, e.g. new BadiCharts(canvas, { theme: { bull: '#00ff00', bear: '#ff0000', bg: '#ffffff' } })
+let THEME = {
   bg:            '#0e1015',
   panelBg:       '#131722',
   toolbarBg:     '#1a1e2a',
@@ -721,7 +725,26 @@ class TradingChart {
   constructor(canvas, opts = {}) {
     this.canvas = canvas;
     this.ctx = canvas.getContext('2d');
-    this.dpr = window.devicePixelRatio || 1;
+
+    // v2.3.0+: Mobile optimization — cap DPR at 2 on mobile to avoid the
+    // expensive 3x rendering (9x more pixels than 1x). On desktop, allow up to 3x.
+    const rawDpr = window.devicePixelRatio || 1;
+    const isMobileDevice = (typeof window !== 'undefined' &&
+      (navigator.maxTouchPoints > 1 || /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent)));
+    this.dpr = Math.min(rawDpr, isMobileDevice ? 2 : 3);
+
+    // v2.3.0+: Theme customization — merge user overrides into the global THEME.
+    // Pass a partial object: { theme: { bull: '#00ff00', bear: '#ff0000', bg: '#fff' } }
+    if (opts.theme && typeof opts.theme === 'object') {
+      Object.assign(THEME, opts.theme);
+    }
+
+    // v2.3.0+: Mobile render throttle — on mobile devices, cap the render loop
+    // at ~30fps instead of 60fps to reduce CPU/battery usage. The chart still
+    // looks smooth because candlestick charts don't need 60fps.
+    this._isMobile = isMobileDevice;
+    this._renderThrottleMs = isMobileDevice ? 33 : 0;  // ~30fps on mobile, uncapped on desktop
+    this._lastRenderTime = 0;
 
     // Layout — HEADLESS MODE (v2.0.0+)
     // The built-in toolbar has been REMOVED entirely. The library is now fully
@@ -1109,6 +1132,20 @@ class TradingChart {
   }
   // Get the array of currently active indicator ids.
   getActiveIndicators() { return Array.from(this.activeIndicators); }
+
+  // ─── Theme customization (v2.3.0+) ───────────────────────────────────────
+  // Override any THEME color at runtime. Pass a partial object — only the
+  // provided keys are overridden; the rest keep their current values.
+  //   chart.setTheme({ bull: '#00ff00', bear: '#ff0000', bg: '#ffffff' });
+  setTheme(overrides) {
+    if (overrides && typeof overrides === 'object') {
+      Object.assign(THEME, overrides);
+    }
+  }
+  // Get a copy of the current THEME (all colors currently in use).
+  getTheme() {
+    return Object.assign({}, THEME);
+  }
 
   // ─── Background image / video ─────────────────────────────────────────────
   // url: string (image URL or video URL), or null to clear
@@ -3149,7 +3186,7 @@ class TradingChart {
     if (y < this.priceTop - 2 || y > this.priceBottom + 2) return;
     const isBull = last.close >= last.open;
     const color = isBull ? THEME.currentPriceBull : THEME.currentPriceBear;
-    // Dashed line across the chart
+    // Dashed line across the chart (stops at chartRight — does NOT extend onto price axis)
     ctx.strokeStyle = color;
     ctx.lineWidth = 1;
     ctx.setLineDash([2, 3]);
@@ -3158,21 +3195,23 @@ class TradingChart {
     ctx.lineTo(this.chartRight, Math.floor(y) + 0.5);
     ctx.stroke();
     ctx.setLineDash([]);
-    // Price label on the price axis (drawn ON TOP of axis labels, like LWC)
+    // v2.3.0+: Price label INSIDE the chart at the right edge (not on the price axis).
+    // The price axis must remain clean — only axis tick labels belong there.
     const txt = this.priceScale.formatLogical(last.close);
     ctx.font = 'bold 11px -apple-system, Segoe UI, Roboto, sans-serif';
     const tw = ctx.measureText(txt).width + 10;
-    const labelX = this.chartRight + 1;
+    const labelX = this.chartRight - tw - 2;
     const labelY = Math.floor(y) - 9;
-    // Clamp label Y so it stays within the price axis area
+    // Clamp label Y so it stays within the chart area
     const minY = this.chartTop;
-    const maxY = (this.layout.paneBottom || this.chartBottom) - 18;
+    const maxY = this.chartBottom - 18;
     const clampedY = clamp(labelY, minY, maxY);
     ctx.fillStyle = color;
     ctx.fillRect(labelX, clampedY, tw, 18);
     ctx.fillStyle = THEME.textBright;
     ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
     ctx.fillText(txt, labelX + tw / 2, clampedY + 9);
+    ctx.textAlign = 'left';
   }
 
   /* --------------------------- Price Axis -------------------------------- */
@@ -3300,16 +3339,18 @@ class TradingChart {
     ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
     ctx.fillText(timeStr, x, (this.layout.paneBottom || this.chartBottom) + this.layout.timeAxisH / 2);
 
-    // Price label on axis
+    // v2.3.0+: Price label INSIDE the chart at the right edge (not on the price axis).
+    // The price axis must remain clean — only axis tick labels belong there.
     if (this.mouseX < this.chartRight && this.mouseY >= this.chartTop && this.mouseY <= this.chartBottom) {
       const price = this.yToPrice(y);
       const priceStr = this.priceScale.formatLogical(price);
       const pw = ctx.measureText(priceStr).width + 14;
       ctx.fillStyle = THEME.crosshairLabel;
-      ctx.fillRect(this.chartRight + 1, Math.floor(y) - 9, pw, 18);
+      ctx.fillRect(this.chartRight - pw - 2, Math.floor(y) - 9, pw, 18);
       ctx.fillStyle = THEME.textBright;
       ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-      ctx.fillText(priceStr, this.chartRight + 1 + pw / 2, Math.floor(y));
+      ctx.fillText(priceStr, this.chartRight - pw / 2 - 2, Math.floor(y));
+      ctx.textAlign = 'left';
     }
   }
 
@@ -3961,10 +4002,20 @@ class TradingChart {
   }
 
   /* --------------------------- Main Loop --------------------------------- */
+  // v2.3.0+: Mobile render throttle — on mobile devices, cap at ~30fps to
+  // reduce CPU/battery usage. Desktop renders uncapped (60fps). Also pause
+  // rendering when the tab is hidden (Page Visibility API) to save battery.
   start() {
     const loop = (now) => {
-      this.render(now);
       this.rafId = requestAnimationFrame(loop);
+      // Pause when tab is hidden
+      if (document.hidden) return;
+      // Throttle on mobile
+      if (this._renderThrottleMs > 0) {
+        if (now - this._lastRenderTime < this._renderThrottleMs) return;
+      }
+      this._lastRenderTime = now;
+      this.render(now);
     };
     this.rafId = requestAnimationFrame(loop);
   }

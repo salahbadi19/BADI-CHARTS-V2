@@ -4,10 +4,37 @@
 >
 > Pixel-perfect rendering, 14 drawing tools, fully custom indicators via API — you bring the data, the UI, and the indicators. BADI-CHARTS-V2 renders the chart.
 
-[![Version](https://img.shields.io/badge/version-2.2.0-2962ff.svg)](#)
+[![Version](https://img.shields.io/badge/version-2.3.0-2962ff.svg)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-26a69a.svg)](LICENSE)
 [![No Dependencies](https://img.shields.io/badge/dependencies-zero-ff9800.svg)](#)
 [![Headless](https://img.shields.io/badge/UI-headless-9c27b0.svg)](#)
+
+---
+
+## ⚠️ What changed in v2.3.0
+
+Three improvements:
+
+1. **Theme customization.** Pass a `theme` option to the constructor to override any color, or call `chart.setTheme(overrides)` at runtime:
+   ```js
+   new BadiCharts(canvas, {
+     theme: { bull: '#00ff00', bear: '#ff0000', bg: '#ffffff', accent: '#ff00ff' }
+   });
+   // or at runtime:
+   chart.setTheme({ bull: '#26a69a' });
+   chart.getTheme();  // → copy of current THEME
+   ```
+   All 30+ THEME colors can be overridden (bg, bull, bear, grid, text, crosshair, etc.).
+
+2. **Mobile optimization.** On mobile devices (detected via touch + UA):
+   - DPR is capped at 2 (was unlimited — 3x devices rendered 9x more pixels)
+   - Render loop throttled to ~30fps (was 60fps) — charts don't need 60fps
+   - Rendering pauses when the tab is hidden (Page Visibility API)
+   - Result: ~50% less CPU/battery usage on phones
+
+3. **Price axis is now clean.** The current-price label and crosshair price label used to be drawn ON the price axis (over the tick labels). Now they're drawn INSIDE the chart at the right edge. The price axis only contains its own tick labels — nothing else.
+
+No breaking API changes from v2.2.0.
 
 ---
 
@@ -101,7 +128,7 @@ const chart = new BadiCharts(canvas, { /* options */ });
 <body>
   <canvas id="chart"></canvas>
   <!-- Load from CDN (headless, no built-in UI or indicators) -->
-  <script src="https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@v2.2.0/chart.js"></script>
+  <script src="https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@v2.3.0/chart.js"></script>
   <script>
     const canvas = document.getElementById('chart');
     const chart = new BadiCharts(canvas, {
@@ -167,11 +194,57 @@ const chart = new BadiCharts(canvas, options);
 | `symbol` | `{label, priceScale, decimals}` | `{label:'SYMBOL', priceScale:100, decimals:2}` | Symbol configuration (priceScale: 100 for 2 decimals, 100000 for 5) |
 | `timeframe` | `{label, ms}` | `{label:'1H', ms:3600000}` | Timeframe label and duration in milliseconds |
 | `indicators` | `Array<IndicatorDef>` | `[]` | Custom indicator definitions to activate at startup (v2.1.0+; strings no longer accepted) |
+| `theme` | `object` | `{}` (defaults) | v2.3.0+: Override any THEME color (e.g. `{bull:'#00ff00', bear:'#ff0000', bg:'#fff'}`) |
 | `statusBar` | `boolean` | `false` | Show the optional status bar (Bid/Ask/24h High/Low/Vol). Toolbar is always OFF. |
 | `background` | `string\|null` | `null` | Background image or video URL drawn behind the chart |
 | `backgroundOpacity` | `number` | `0.15` | Opacity of the background image/video |
 
 > **Note:** The `toolbar` option is accepted but silently ignored (always `false`). Kept only for backward compatibility with v1.x code.
+
+### Theme (v2.3.0+)
+
+All chart colors come from the `THEME` object. Override any of them via the constructor `theme` option or `chart.setTheme()`:
+
+```js
+// At construction:
+const chart = new BadiCharts(canvas, {
+  theme: {
+    bull: '#00ff00',
+    bear: '#ff0000',
+    bg: '#ffffff',
+    text: '#333333',
+    grid: '#eeeeee',
+    accent: '#ff00ff'
+  }
+});
+
+// At runtime:
+chart.setTheme({ bull: '#26a69a', bear: '#ef5350' });
+chart.getTheme();  // → { bull:'#26a69a', bear:'#ef5350', ... }
+```
+
+Available theme colors:
+
+| Key | Default | What it controls |
+|---|---|---|
+| `bg` | `#0e1015` | Chart background |
+| `panelBg` | `#131722` | Price/time axis background |
+| `grid` | `#1c2030` | Grid lines |
+| `text` | `#cfd2da` | Body text |
+| `textDim` | `#787b86` | Axis tick labels, dim labels |
+| `textBright` | `#f0f3fa` | Bright labels (OHLC, symbol) |
+| `bull` | `#26a69a` | Bullish candles |
+| `bear` | `#ef5350` | Bearish candles |
+| `bullVol` | `rgba(38,166,154,0.50)` | Bullish volume bars |
+| `bearVol` | `rgba(239,83,80,0.50)` | Bearish volume bars |
+| `accent` | `#2962ff` | Accent color (selections, highlights) |
+| `crosshair` | `#787b86` | Crosshair lines |
+| `crosshairLabel` | `#363a45` | Crosshair label background |
+| `drawing` | `#2962ff` | Default drawing color |
+| `drawingActive` | `#ffb74d` | Active drawing color |
+| `currentPriceBull` | `#26a69a` | Current price line (bullish) |
+| `currentPriceBear` | `#ef5350` | Current price line (bearish) |
+| `ma1` / `ma2` / `ma3` | `#2962ff` / `#ff9800` / `#e91e63` | Moving average colors (for your custom indicators) |
 
 ### Data Methods
 
