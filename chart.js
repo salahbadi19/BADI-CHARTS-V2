@@ -30,7 +30,7 @@
 'use strict';
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.4.0';
+const VERSION = '2.5.0';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 
 /* ============================ THEME ========================================= */
@@ -626,26 +626,61 @@ class DataLayer {
     this.candles = [];          // sorted array of candles
     this.timeframeMs = 60 * 60 * 1000; // default 1H, updated via setTimeframe
   }
+  // v2.5.0+: Normalize + clone a candle object.
+  // - Converts time to a number (and from ms to seconds if > 1e11)
+  // - Snaps time to the candle's open boundary using timeframeMs
+  // - Converts OHLCV to numbers
+  // - Validates that all values are finite
+  // - Ensures high >= max(open, close) and low <= min(open, close)
+  // - Returns a NEW object (never stores a reference to the input)
+  // Returns null if the input is invalid.
+  _norm(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    let t = +raw.time;
+    if (!Number.isFinite(t)) return null;
+    // Auto-convert millisecond timestamps to seconds (Binance uses ms; most APIs use s)
+    if (t > 1e11) t = Math.floor(t / 1000);
+    // Snap time to the candle's open boundary (align to timeframe)
+    const tf = this.timeframeMs / 1000;
+    if (tf > 0) t = Math.floor(t / tf) * tf;
+    const o = +raw.open, h = +raw.high, l = +raw.low, cl = +raw.close;
+    if (![o, h, l, cl].every(Number.isFinite)) return null;
+    const v = +raw.volume;
+    return {
+      time: t,
+      open: o,
+      high: Math.max(h, o, cl),
+      low:  Math.min(l, o, cl),
+      close: cl,
+      volume: Number.isFinite(v) ? v : 0
+    };
+  }
+  // v2.5.0+: Clear all stored candles (used on symbol/timeframe switch).
+  clear() { this.candles = []; }
   setData(candles) {
     if (!Array.isArray(candles)) throw new Error('setData: expected array of candles');
-    // Sort by time ascending and dedupe
+    // v2.5.0+: Normalize + clone every candle (no shared references).
     const map = new Map();
-    for (const c of candles) {
-      if (!c || typeof c.time !== 'number') continue;
-      map.set(c.time, c);
+    for (const raw of candles) {
+      const c = this._norm(raw);
+      if (c) map.set(c.time, c);
     }
     this.candles = Array.from(map.values()).sort((a, b) => a.time - b.time);
   }
-  // Append or update a single candle (real-time tick)
-  update(candle) {
-    if (!candle || typeof candle.time !== 'number') return;
+  // Append or update a single candle (real-time tick).
+  // v2.5.0+: Normalizes + clones the input. Stale ticks (older than the last
+  // candle) are silently ignored to prevent out-of-order data corruption.
+  update(raw) {
+    const c = this._norm(raw);
+    if (!c) return;
     const last = this.candles[this.candles.length - 1];
-    if (!last || candle.time > last.time) {
-      this.candles.push(candle);
+    if (!last || c.time > last.time) {
+      this.candles.push(c);
       if (this.candles.length > 50000) this.candles.shift();
-    } else if (last && candle.time === last.time) {
-      this.candles[this.candles.length - 1] = candle;
+    } else if (c.time === last.time) {
+      this.candles[this.candles.length - 1] = c;
     }
+    // else: stale tick (older than last candle) — ignored
   }
   // Append multiple candles (batch)
   append(candles) {
@@ -739,11 +774,12 @@ class TradingChart {
       (navigator.maxTouchPoints > 1 || /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent)));
     this.dpr = Math.min(rawDpr, isMobileDevice ? 2 : 3);
 
-    // v2.3.0+: Theme customization — merge user overrides into the global THEME.
-    // Pass a partial object: { theme: { bull: '#00ff00', bear: '#ff0000', bg: '#fff' } }
-    if (opts.theme && typeof opts.theme === 'object') {
-      Object.assign(THEME, opts.theme);
-    }
+    // v2.3.0+: Theme customization — merge user overrides into the global this.theme.
+    // v2.5.0+: Theme is now PER-INSTANCE. Each chart gets its own copy of THEME
+    // so multiple charts on the same page can have different colors without
+    // interfering with each other. During render(), the global THEME is swapped
+    // with this.theme so all drawing methods see the instance's colors.
+    this.theme = Object.assign({}, THEME, opts.theme || {});
 
     // v2.3.0+: Mobile render throttle — on mobile devices, cap the render loop
     // at ~30fps instead of 60fps to reduce CPU/battery usage. The chart still
@@ -838,7 +874,8 @@ class TradingChart {
     this.currentDrawing = null;
     this.hoverDrawing = null;
     this.selectedDrawing = null;  // currently selected drawing (shows properties panel)
-    this._customTools = {};       // custom drawing tool renderers
+    this._customTools = {};       // custom drawing tool renderers (per-instance)
+    this._instanceTools = [];     // v2.5.0+: per-instance tool metadata (don't pollute global DRAW_TOOLS)
     this._drawPanelHits = [];     // hit-test for drawing properties panel
 
     // Indicators — HEADLESS v2.1.0+: no built-in indicators, no default 'volume'.
@@ -911,7 +948,10 @@ class TradingChart {
     this.autoScale();
   }
   // Set symbol config (label, priceScale, decimals)
+  // v2.5.0+: Clears all stored candle data — the user must call setData()
+  // with the new symbol's data after switching. Prevents mixing old + new data.
   setSymbol(sym) {
+    this.sim.clear();
     this.symbol = Object.assign({}, this.symbol, sym);
     this.priceScale = new PriceScale({scaleMargins:{top:0.15,bottom:0.15}, base: this.symbol.priceScale});
     this.priceScale.setFormatter(new PriceFormatter(this.symbol.priceScale, 1));
@@ -922,7 +962,10 @@ class TradingChart {
     this.resetView();
   }
   // Set timeframe {label, ms}
+  // v2.5.0+: Clears all stored candle data — the user must call setData()
+  // with the new timeframe's data after switching.
   setTimeframe(tf) {
+    this.sim.clear();
     this.timeframe = tf;
     this.sim.setTimeframeMs(tf.ms);
     this.drawings = [];
@@ -1056,7 +1099,7 @@ class TradingChart {
   // Add a drawing programmatically
   addDrawing(drawing) {
     drawing.id = drawing.id || Date.now();
-    drawing.color = drawing.color || THEME.drawing;
+    drawing.color = drawing.color || this.theme.drawing;
     drawing.lineWidth = drawing.lineWidth || 1.5;
     drawing.locked = false;
     this.drawings.push(drawing);
@@ -1082,18 +1125,27 @@ class TradingChart {
   getActiveTool() { return this.activeTool; }
   // Reset the active tool to the default 'cursor' (no drawing).
   clearTool() { this.setTool('cursor'); }
-  // List all available drawing tools (built-in + custom registered via addDrawingTool()).
-  // Returns an array of: { id, label, icon, custom }
+  // List all available drawing tools (built-in + custom registered on THIS instance).
+  // v2.5.0+: Custom tools are per-instance — only tools registered via this
+  // chart's addDrawingTool() appear here. Built-in tools are shared.
   getTools() {
-    const self = this;
-    return DRAW_TOOLS.map(function (t) {
+    const builtin = DRAW_TOOLS.map(function (t) {
       return {
         id: t.id,
         label: t.label,
         icon: TOOL_SHORTCUTS[t.id] || '◆',
-        custom: !!(self._customTools && self._customTools[t.id])
+        custom: false
       };
     });
+    const custom = (this._instanceTools || []).map(function (t) {
+      return {
+        id: t.id,
+        label: t.label,
+        icon: t.icon || '◆',
+        custom: true
+      };
+    });
+    return builtin.concat(custom);
   }
   // Subscribe to active tool changes. Returns an unsubscribe function.
   //   chart.onToolChange(function (toolId) { console.log('Tool:', toolId); });
@@ -1141,7 +1193,7 @@ class TradingChart {
         id: id,
         label: def.label || id,
         type: def.type || 'overlay',
-        color: def.color || THEME.ma1,
+        color: def.color || this.theme.ma1,
         active: self.activeIndicators.has(id)
       });
     });
@@ -1150,18 +1202,17 @@ class TradingChart {
   // Get the array of currently active indicator ids.
   getActiveIndicators() { return Array.from(this.activeIndicators); }
 
-  // ─── Theme customization (v2.3.0+) ───────────────────────────────────────
-  // Override any THEME color at runtime. Pass a partial object — only the
-  // provided keys are overridden; the rest keep their current values.
+  // ─── Theme customization (v2.3.0+, per-instance v2.5.0+) ────────────────
+  // Override theme colors on THIS instance only (not global).
   //   chart.setTheme({ bull: '#00ff00', bear: '#ff0000', bg: '#ffffff' });
   setTheme(overrides) {
     if (overrides && typeof overrides === 'object') {
-      Object.assign(THEME, overrides);
+      Object.assign(this.theme, overrides);
     }
   }
-  // Get a copy of the current THEME (all colors currently in use).
+  // Get a copy of THIS instance's theme.
   getTheme() {
-    return Object.assign({}, THEME);
+    return Object.assign({}, this.theme);
   }
 
   // ─── Background image / video ─────────────────────────────────────────────
@@ -1197,13 +1248,14 @@ class TradingChart {
   // tool: { id, label, icon (emoji/short text), onDraw(ctx, drawing), onHitTest(drawing, x, y), defaultStyle }
   addDrawingTool(tool) {
     if (!tool || !tool.id) return;
-    // Add to DRAW_TOOLS list
-    const exists = DRAW_TOOLS.find(function (t) { return t.id === tool.id; });
+    // v2.5.0+: Per-instance tool list — don't push to the global DRAW_TOOLS array
+    // so multiple charts don't share custom tools.
+    if (!this._instanceTools) this._instanceTools = [];
+    const exists = this._instanceTools.find(function (t) { return t.id === tool.id; });
     if (!exists) {
-      DRAW_TOOLS.push({ id: tool.id, label: tool.label || tool.id, icon: 'custom' });
-      TOOL_SHORTCUTS[tool.id] = tool.icon || '◆';
+      this._instanceTools.push({ id: tool.id, label: tool.label || tool.id, icon: tool.icon || '◆' });
     }
-    // Store the custom tool renderer/hit-test
+    // Store the custom tool renderer/hit-test (per-instance)
     if (!this._customTools) this._customTools = {};
     this._customTools[tool.id] = tool;
   }
@@ -1240,13 +1292,15 @@ class TradingChart {
 
   /* --------------------------- Canvas Setup ------------------------------ */
   setupHiDPICanvas() {
+    // v2.5.0+: Use the canvas's actual bounding rect (not window.innerWidth/innerHeight)
+    // so multiple charts can coexist on the same page at different sizes.
     const resize = () => {
-      const w = window.innerWidth;
-      const h = window.innerHeight;
+      const rect = this.canvas.getBoundingClientRect();
+      const w = Math.max(1, Math.floor(rect.width));
+      const h = Math.max(1, Math.floor(rect.height));
       this.canvas.width = Math.floor(w * this.dpr);
       this.canvas.height = Math.floor(h * this.dpr);
-      this.canvas.style.width = w + 'px';
-      this.canvas.style.height = h + 'px';
+      // Don't override CSS width/height — let the user's CSS control the display size.
       this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
       this.W = w;
       this.H = h;
@@ -2087,14 +2141,14 @@ class TradingChart {
     const price = this.yToPrice(y);
     const tool = this.activeTool;
     if (tool === 'hline') {
-      this.drawings.push({type:'hline', price, color: THEME.drawing, id: Date.now()});
+      this.drawings.push({type:'hline', price, color: this.theme.drawing, id: Date.now()});
       this.activeTool = 'cursor';
       this.showToast('Horizontal line added');
       this.autoScale();
       return;
     }
     if (tool === 'vline') {
-      this.drawings.push({type:'vline', index: idx, color: THEME.drawing, id: Date.now()});
+      this.drawings.push({type:'vline', index: idx, color: this.theme.drawing, id: Date.now()});
       this.activeTool = 'cursor';
       this.showToast('Vertical line added');
       return;
@@ -2103,7 +2157,7 @@ class TradingChart {
       // For text, we use a prompt-like approach via toast; in real app use input.
       // Here we'll add a text drawing with a default label the user can change.
       const txt = 'Text ' + (this.drawings.length + 1);
-      this.drawings.push({type:'text', i: idx, p: price, text: txt, color: THEME.drawing, id: Date.now()});
+      this.drawings.push({type:'text', i: idx, p: price, text: txt, color: this.theme.drawing, id: Date.now()});
       this.activeTool = 'cursor';
       this.showToast('Text added (double-click to edit)');
       return;
@@ -2113,7 +2167,7 @@ class TradingChart {
         tool === 'rect' || tool === 'band' || tool === 'fib') {
       this.currentDrawing = {
         type: tool, i1: idx, p1: price, i2: idx, p2: price,
-        color: THEME.drawingActive, id: Date.now()
+        color: this.theme.drawingActive, id: Date.now()
       };
       return;
     }
@@ -2122,7 +2176,7 @@ class TradingChart {
       this.currentDrawing = {
         type: tool,
         points: [{i: idx, p: price, x, y}],
-        color: THEME.drawingActive, id: Date.now(),
+        color: this.theme.drawingActive, id: Date.now(),
         closed: false
       };
       return;
@@ -2148,7 +2202,7 @@ class TradingChart {
           type: tool,
           i1: idx, p1: price, i2: idx, p2: price,
           x1: x, y1: y, x2: x, y2: y,
-          color: ds.color || THEME.drawingActive,
+          color: ds.color || this.theme.drawingActive,
           lineWidth: ds.lineWidth || 1.5,
           id: Date.now()
         };
@@ -2157,7 +2211,7 @@ class TradingChart {
         // Ensure required fields
         newDrawing.type = newDrawing.type || tool;
         newDrawing.id = newDrawing.id || Date.now();
-        newDrawing.color = newDrawing.color || (customTool.defaultStyle && customTool.defaultStyle.color) || THEME.drawingActive;
+        newDrawing.color = newDrawing.color || (customTool.defaultStyle && customTool.defaultStyle.color) || this.theme.drawingActive;
         newDrawing.lineWidth = newDrawing.lineWidth || (customTool.defaultStyle && customTool.defaultStyle.lineWidth) || 1.5;
         this.currentDrawing = newDrawing;
       }
@@ -2212,7 +2266,7 @@ class TradingChart {
   }
   finishDrawing() {
     if (!this.currentDrawing) return;
-    this.currentDrawing.color = THEME.drawing;
+    this.currentDrawing.color = this.theme.drawing;
     // For polygon: mark as closed if 3+ vertices
     if (this.currentDrawing.type === 'poly' && this.currentDrawing.points.length >= 3) {
       this.currentDrawing.closed = true;
@@ -2279,42 +2333,51 @@ class TradingChart {
   showToast(text) { this.toast = {text, until: performance.now() + 2200}; }
 
   /* --------------------------- MAIN RENDER LOOP -------------------------- */
+  // v2.5.0+: Per-instance theme — swap the global THEME with this.theme during
+  // render so all drawing methods see this instance's colors. Restored in finally
+  // so multiple charts on the same page don't interfere with each other.
   render(now) {
     if (!now) now = performance.now();
-    // No auto-tick. User must call update() with real data.
-    const ctx = this.ctx;
-    ctx.clearRect(0, 0, this.W, this.H);
-    this.buttons = [];
-    this._iconHits = [];  // Reset icon hit registry once per frame (used by drawPane + drawLegend)
-    this.drawBackground();
-    this.drawGrid();
-    this.drawCandles();
-    this.drawVolume();
-    this.drawIndicators();
-    this.drawVolumeProfile();
-    this.drawPane();
-    this.drawDrawings();
-    this.drawDrawingPanel();  // Floating properties panel for selected drawing
-    this.drawPriceAxis();
-    this.drawTimeAxis();
-    this.drawCurrentPriceLine();  // After axes so the price label sits ON TOP
-    this.drawCrosshair();
-    this.drawLegend();
-    this.drawSettingsCard();      // Settings popup (drawn last so it overlays everything)
-    // HEADLESS (v2.0.0+): built-in toolbar removed — drawToolbar() is now a no-op.
-    if (this._showStatusBar) this.drawStatusBar();
-    this.drawDropdown();
-    this.drawToast(now);
-    if (!this.isDragging && this.activeTool === 'eraser') {
-      this.hoverDrawing = this.findDrawingAt(this.mouseX, this.mouseY);
-    } else this.hoverDrawing = null;
+    const savedTheme = THEME;
+    THEME = this.theme;
+    try {
+      // No auto-tick. User must call update() with real data.
+      const ctx = this.ctx;
+      ctx.clearRect(0, 0, this.W, this.H);
+      this.buttons = [];
+      this._iconHits = [];  // Reset icon hit registry once per frame (used by drawPane + drawLegend)
+      this.drawBackground();
+      this.drawGrid();
+      this.drawCandles();
+      this.drawVolume();
+      this.drawIndicators();
+      this.drawVolumeProfile();
+      this.drawPane();
+      this.drawDrawings();
+      this.drawDrawingPanel();  // Floating properties panel for selected drawing
+      this.drawPriceAxis();
+      this.drawTimeAxis();
+      this.drawCurrentPriceLine();  // After axes so the price label sits ON TOP
+      this.drawCrosshair();
+      this.drawLegend();
+      this.drawSettingsCard();      // Settings popup (drawn last so it overlays everything)
+      // HEADLESS (v2.0.0+): built-in toolbar removed — drawToolbar() is now a no-op.
+      if (this._showStatusBar) this.drawStatusBar();
+      this.drawDropdown();
+      this.drawToast(now);
+      if (!this.isDragging && this.activeTool === 'eraser') {
+        this.hoverDrawing = this.findDrawingAt(this.mouseX, this.mouseY);
+      } else this.hoverDrawing = null;
+    } finally {
+      THEME = savedTheme;
+    }
   }
 
   /* --------------------------- Background -------------------------------- */
   drawBackground() {
     const ctx = this.ctx;
     // Fill base background
-    ctx.fillStyle = THEME.bg;
+    ctx.fillStyle = this.theme.bg;
     ctx.fillRect(0, 0, this.W, this.H);
     // Draw background image or video (behind everything, with opacity)
     if (this._bgImage && this._bgImage.complete && this._bgImage.naturalWidth > 0) {
@@ -2348,9 +2411,9 @@ class TradingChart {
     }
     // Status bar background only (toolbar removed in v2.0.0 — headless mode)
     if (this._showStatusBar && this.layout.statusH > 0) {
-      ctx.fillStyle = THEME.toolbarBg;
+      ctx.fillStyle = this.theme.toolbarBg;
       ctx.fillRect(0, this.H - this.layout.statusH, this.W, this.layout.statusH);
-      ctx.strokeStyle = THEME.toolbarBorder;
+      ctx.strokeStyle = this.theme.toolbarBorder;
       ctx.lineWidth = 1;
       ctx.beginPath();
       ctx.moveTo(0, this.H - this.layout.statusH - 0.5);
@@ -2362,7 +2425,7 @@ class TradingChart {
   /* --------------------------- Grid (price marks) ------------------------ */
   drawGrid() {
     const ctx = this.ctx;
-    ctx.strokeStyle = THEME.grid;
+    ctx.strokeStyle = this.theme.grid;
     ctx.lineWidth = 1;
     // Use price tick marks for horizontal grid lines
     const marks = this.priceScale.marks();
@@ -2386,7 +2449,7 @@ class TradingChart {
     }
     // Pane separator
     if (this.layout.paneH > 0) {
-      ctx.strokeStyle = THEME.toolbarBorder;
+      ctx.strokeStyle = this.theme.toolbarBorder;
       ctx.beginPath();
       ctx.moveTo(0, this.paneTop - 0.5);
       ctx.lineTo(this.W, this.paneTop - 0.5);
@@ -2428,7 +2491,7 @@ class TradingChart {
       const x = this.indexToX(i);
       if (x < this.chartLeft - bodyWidth || x > this.chartRight + bodyWidth) continue;
       const isBull = c.close >= c.open;
-      const color = isBull ? THEME.bull : THEME.bear;
+      const color = isBull ? this.theme.bull : this.theme.bear;
       const yOpen = this.priceToY(c.open);
       const yClose = this.priceToY(c.close);
       const yHigh = this.priceToY(c.high);
@@ -2507,7 +2570,7 @@ class TradingChart {
       const isBull = c.close >= c.open;
       const yTop = this.volToY(c.volume);
       const yBot = this.volBottom;
-      ctx.fillStyle = isBull ? THEME.bullVol : THEME.bearVol;
+      ctx.fillStyle = isBull ? this.theme.bullVol : this.theme.bearVol;
       const left = Math.round((x - bodyWidth / 2) * this.dpr) / this.dpr;
       const top = Math.round(yTop * this.dpr) / this.dpr;
       const h = Math.max(1 / this.dpr, yBot - yTop);
@@ -2597,7 +2660,7 @@ class TradingChart {
     const lastIdx = Math.min(this.sim.candles.length - 1, Math.ceil(this.xToIndex(this.chartRight)));
 
     // Grid (use pane scale marks)
-    ctx.strokeStyle = THEME.grid;
+    ctx.strokeStyle = this.theme.grid;
     ctx.lineWidth = 1;
     const pmarks = this.paneScale.marks();
     for (const m of pmarks) {
@@ -2650,7 +2713,7 @@ class TradingChart {
 
     // Right axis labels (price scale of the pane)
     ctx.font = '10px -apple-system, Segoe UI, Roboto, sans-serif';
-    ctx.fillStyle = THEME.textDim; ctx.textAlign = 'left';
+    ctx.fillStyle = this.theme.textDim; ctx.textAlign = 'left';
     for (const m of pmarks) ctx.fillText(m.label, right + 4, top + m.coord - 5);
   }
 
@@ -2658,13 +2721,13 @@ class TradingChart {
   drawDrawings() {
     const ctx = this.ctx;
     const drawOne = (d, isActive = false) => {
-      const color = isActive ? THEME.drawingActive : (d.color || THEME.drawing);
+      const color = isActive ? this.theme.drawingActive : (d.color || this.theme.drawing);
       const isSelected = (d === this.selectedDrawing);
-      ctx.strokeStyle = isSelected ? THEME.drawingActive : color;
+      ctx.strokeStyle = isSelected ? this.theme.drawingActive : color;
       ctx.fillStyle = color;
       ctx.lineWidth = d.lineWidth || 1.5;
       const isHover = (d === this.hoverDrawing);
-      if (isHover && !isSelected) { ctx.lineWidth = (d.lineWidth || 1.5) + 1; ctx.strokeStyle = THEME.drawingActive; }
+      if (isHover && !isSelected) { ctx.lineWidth = (d.lineWidth || 1.5) + 1; ctx.strokeStyle = this.theme.drawingActive; }
       if (isSelected) { ctx.lineWidth = (d.lineWidth || 1.5) + 0.5; }
 
       // v2.2.0+: ALL drawings are clipped to the chart area (chartLeft..chartRight,
@@ -2788,7 +2851,7 @@ class TradingChart {
           ctx.fillStyle = color;
           ctx.fillRect(this.chartRight - tw1 - 2, Math.floor(y1) - 7, tw1, 14);
           ctx.fillRect(this.chartRight - tw2 - 2, Math.floor(y2) - 7, tw2, 14);
-          ctx.fillStyle = THEME.bg;
+          ctx.fillStyle = this.theme.bg;
           ctx.fillText(t1, this.chartRight - 4, Math.floor(y1));
           ctx.fillText(t2, this.chartRight - 4, Math.floor(y2));
           ctx.textAlign = 'left';
@@ -2808,7 +2871,7 @@ class TradingChart {
           const tw = ctx.measureText(txt).width + 8;
           ctx.fillStyle = color;
           ctx.fillRect(this.chartRight - tw - 2, Math.floor(y) - 7, tw, 14);
-          ctx.fillStyle = THEME.bg;
+          ctx.fillStyle = this.theme.bg;
           ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
           ctx.fillText(txt, this.chartRight - 4, Math.floor(y));
           ctx.textAlign = 'left';
@@ -2902,7 +2965,7 @@ class TradingChart {
             const labelX = Math.min(xR, this.chartRight - tw - 2);
             ctx.fillStyle = colors[i];
             ctx.fillRect(labelX, Math.floor(y) - 7, tw, 14);
-            ctx.fillStyle = THEME.bg;
+            ctx.fillStyle = this.theme.bg;
             ctx.fillText(txt, labelX + tw - 3, Math.floor(y));
           }
           ctx.textAlign = 'left';
@@ -2994,7 +3057,7 @@ class TradingChart {
     ctx.fillStyle = 'rgba(26,30,42,0.95)';
     this._roundRect(anchorX, anchorY, panelW, panelH, 5);
     ctx.fill();
-    ctx.strokeStyle = THEME.toolbarBorder;
+    ctx.strokeStyle = this.theme.toolbarBorder;
     ctx.lineWidth = 1;
     this._roundRect(anchorX + 0.5, anchorY + 0.5, panelW - 1, panelH - 1, 5);
     ctx.stroke();
@@ -3008,8 +3071,8 @@ class TradingChart {
         this._roundRect(ix - 2, iy - 1, iconSize + 2, iconSize + 2, 3);
         ctx.fill();
       }
-      ctx.strokeStyle = isHover ? THEME.textBright : THEME.textDim;
-      ctx.fillStyle = isHover ? THEME.textBright : THEME.textDim;
+      ctx.strokeStyle = isHover ? this.theme.textBright : this.theme.textDim;
+      ctx.fillStyle = isHover ? this.theme.textBright : this.theme.textDim;
       ctx.lineWidth = 1.3;
       ctx.lineCap = 'round'; ctx.lineJoin = 'round';
       iconFn(ix + iconSize / 2, iy + iconSize / 2);
@@ -3030,11 +3093,11 @@ class TradingChart {
     // 2. Lock icon
     drawIconBtn(function (cx, cy) {
       if (d.locked) {
-        ctx.fillStyle = THEME.accent;
+        ctx.fillStyle = this.theme.accent;
         ctx.beginPath();
         ctx.roundRect ? ctx.roundRect(cx - 4, cy - 1, 8, 6, 1) : ctx.rect(cx - 4, cy - 1, 8, 6);
         ctx.fill();
-        ctx.strokeStyle = THEME.accent;
+        ctx.strokeStyle = this.theme.accent;
         ctx.beginPath();
         ctx.arc(cx, cy - 1, 2.5, Math.PI, 0);
         ctx.stroke();
@@ -3049,7 +3112,7 @@ class TradingChart {
     }, 'lock', 'Lock');
 
     // 3. Divider
-    ctx.strokeStyle = THEME.toolbarBorder;
+    ctx.strokeStyle = this.theme.toolbarBorder;
     ctx.beginPath(); ctx.moveTo(ix, iy + 2); ctx.lineTo(ix, iy + iconSize - 4); ctx.stroke();
     ix += 4;
 
@@ -3061,7 +3124,7 @@ class TradingChart {
       ctx.arc(ix + 5, iy + iconSize / 2, isSelected ? 6 : 5, 0, Math.PI * 2);
       ctx.fill();
       if (isSelected) {
-        ctx.strokeStyle = THEME.textBright;
+        ctx.strokeStyle = this.theme.textBright;
         ctx.lineWidth = 1.5;
         ctx.beginPath();
         ctx.arc(ix + 5, iy + iconSize / 2, 7, 0, Math.PI * 2);
@@ -3072,14 +3135,14 @@ class TradingChart {
     }
 
     // 5. Divider
-    ctx.strokeStyle = THEME.toolbarBorder;
+    ctx.strokeStyle = this.theme.toolbarBorder;
     ctx.beginPath(); ctx.moveTo(ix, iy + 2); ctx.lineTo(ix, iy + iconSize - 4); ctx.stroke();
     ix += 4;
 
     // 6. Stroke width buttons
     for (let wi = 0; wi < widths.length; wi++) {
       const isSelected = (d.lineWidth || 1.5) === widths[wi];
-      ctx.strokeStyle = isSelected ? THEME.accent : THEME.textDim;
+      ctx.strokeStyle = isSelected ? this.theme.accent : this.theme.textDim;
       ctx.lineWidth = widths[wi];
       ctx.beginPath();
       ctx.moveTo(ix + 2, iy + iconSize / 2);
@@ -3091,7 +3154,7 @@ class TradingChart {
     }
 
     // 7. Divider
-    ctx.strokeStyle = THEME.toolbarBorder;
+    ctx.strokeStyle = this.theme.toolbarBorder;
     ctx.beginPath(); ctx.moveTo(ix, iy + 2); ctx.lineTo(ix, iy + iconSize - 4); ctx.stroke();
     ix += 4;
 
@@ -3244,7 +3307,7 @@ class TradingChart {
     // Only draw if the price line is within the visible price area
     if (y < this.priceTop - 2 || y > this.priceBottom + 2) return;
     const isBull = last.close >= last.open;
-    const color = isBull ? THEME.currentPriceBull : THEME.currentPriceBear;
+    const color = isBull ? this.theme.currentPriceBull : this.theme.currentPriceBear;
     // Dashed line across the chart (stops at chartRight)
     ctx.strokeStyle = color;
     ctx.lineWidth = 1;
@@ -3267,7 +3330,7 @@ class TradingChart {
     const clampedY = clamp(labelY, minY, maxY);
     ctx.fillStyle = color;
     ctx.fillRect(labelX, clampedY, tw, 18);
-    ctx.fillStyle = THEME.textBright;
+    ctx.fillStyle = this.theme.textBright;
     ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
     ctx.fillText(txt, labelX + tw / 2, clampedY + 9);
     ctx.textAlign = 'left';
@@ -3280,16 +3343,16 @@ class TradingChart {
     // Fill the entire right column (price axis + corner with time axis) with axisBg
     const axisTop = this.chartTop;
     const axisBottom = (this.layout.paneBottom || this.chartBottom) + this.layout.timeAxisH;
-    ctx.fillStyle = THEME.axisBg;
+    ctx.fillStyle = this.theme.axisBg;
     ctx.fillRect(this.chartRight + 1, axisTop, this.W - this.chartRight - 1, axisBottom - axisTop);
-    ctx.strokeStyle = THEME.axisBorder;
+    ctx.strokeStyle = this.theme.axisBorder;
     ctx.beginPath();
     ctx.moveTo(this.chartRight + 0.5, this.chartTop);
     ctx.lineTo(this.chartRight + 0.5, this.chartBottom);
     ctx.stroke();
 
     ctx.font = '11px -apple-system, Segoe UI, Roboto, sans-serif';
-    ctx.fillStyle = THEME.axisText;
+    ctx.fillStyle = this.theme.axisText;
     ctx.textBaseline = 'middle';
     ctx.textAlign = 'left';
     const marks = this.priceScale.marks();
@@ -3320,16 +3383,16 @@ class TradingChart {
     const ctx = this.ctx;
     const axisTop = this.layout.paneBottom || this.chartBottom;
     // v2.4.0+: Use dedicated axis colors (axisBg, axisBorder, axisText)
-    ctx.fillStyle = THEME.axisBg;
+    ctx.fillStyle = this.theme.axisBg;
     ctx.fillRect(0, axisTop, this.chartRight + 1, this.layout.timeAxisH);
-    ctx.strokeStyle = THEME.axisBorder;
+    ctx.strokeStyle = this.theme.axisBorder;
     ctx.beginPath();
     ctx.moveTo(0, axisTop + 0.5);
     ctx.lineTo(this.chartRight, axisTop + 0.5);
     ctx.stroke();
 
     ctx.font = '11px -apple-system, Segoe UI, Roboto, sans-serif';
-    ctx.fillStyle = THEME.axisText;
+    ctx.fillStyle = this.theme.axisText;
     ctx.textBaseline = 'middle';
     ctx.textAlign = 'center';
     const marks = this.getTimeMarks();
@@ -3364,7 +3427,7 @@ class TradingChart {
     const x = this.indexToX(idx);
     const y = this.mouseY;
 
-    ctx.strokeStyle = THEME.crosshair;
+    ctx.strokeStyle = this.theme.crosshair;
     ctx.lineWidth = 1;
     ctx.setLineDash([3, 3]);
     if (this.mouseY < (this.layout.paneBottom || this.chartBottom)) {
@@ -3395,9 +3458,9 @@ class TradingChart {
     }
     ctx.font = '11px -apple-system, Segoe UI, Roboto, sans-serif';
     const tw = ctx.measureText(timeStr).width + 14;
-    ctx.fillStyle = THEME.crosshairLabel;
+    ctx.fillStyle = this.theme.crosshairLabel;
     ctx.fillRect(x - tw / 2, (this.layout.paneBottom || this.chartBottom) + 2, tw, this.layout.timeAxisH - 4);
-    ctx.fillStyle = THEME.textBright;
+    ctx.fillStyle = this.theme.textBright;
     ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
     ctx.fillText(timeStr, x, (this.layout.paneBottom || this.chartBottom) + this.layout.timeAxisH / 2);
 
@@ -3407,9 +3470,9 @@ class TradingChart {
       const price = this.yToPrice(y);
       const priceStr = this.priceScale.formatLogical(price);
       const pw = ctx.measureText(priceStr).width + 14;
-      ctx.fillStyle = THEME.crosshairLabel;
+      ctx.fillStyle = this.theme.crosshairLabel;
       ctx.fillRect(this.chartRight + 1, Math.floor(y) - 9, pw, 18);
-      ctx.fillStyle = THEME.textBright;
+      ctx.fillStyle = this.theme.textBright;
       ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
       ctx.fillText(priceStr, this.chartRight + 1 + pw / 2, Math.floor(y));
       ctx.textAlign = 'left';
@@ -3423,7 +3486,7 @@ class TradingChart {
     // If no data, just show the symbol/timeframe label
     if (this.sim.candles.length === 0) {
       ctx.font = 'bold ' + (isMobile ? '11px' : '12px') + ' -apple-system, Segoe UI, Roboto, sans-serif';
-      ctx.fillStyle = THEME.textBright;
+      ctx.fillStyle = this.theme.textBright;
       ctx.textBaseline = 'top'; ctx.textAlign = 'left';
       const symTxt = this.symbol.label + ' · ' + this.timeframe.label;
       ctx.fillText(symTxt, this.chartLeft + 6, this.chartTop + 6);
@@ -3442,7 +3505,7 @@ class TradingChart {
     ctx.textBaseline = 'top'; ctx.textAlign = 'left';
     let x = this.chartLeft + 6;
     const y = this.chartTop + 6;
-    ctx.fillStyle = THEME.textBright;
+    ctx.fillStyle = this.theme.textBright;
     ctx.font = 'bold ' + (isMobile ? '11px' : '12px') + ' -apple-system, Segoe UI, Roboto, sans-serif';
     const symTxt = this.symbol.label + ' · ' + this.timeframe.label;
     ctx.fillText(symTxt, x, y);
@@ -3460,10 +3523,10 @@ class TradingChart {
     ];
     const gap = isMobile ? 8 : 12;
     for (const p of parts) {
-      ctx.fillStyle = THEME.textDim;
+      ctx.fillStyle = this.theme.textDim;
       ctx.fillText(p.label, x, y);
       x += ctx.measureText(p.label).width + 4;
-      ctx.fillStyle = isBull ? THEME.bull : THEME.bear;
+      ctx.fillStyle = isBull ? this.theme.bull : this.theme.bear;
       ctx.fillText(p.value, x, y);
       x += ctx.measureText(p.value).width + gap;
     }
@@ -3471,7 +3534,7 @@ class TradingChart {
     const changePct = (change / c.open) * 100;
     const changeTxt = (change >= 0 ? '+' : '') + this.priceScale.formatLogical(Math.abs(change)) +
                       ' (' + (change >= 0 ? '+' : '') + changePct.toFixed(2) + '%)';
-    ctx.fillStyle = isBull ? THEME.bull : THEME.bear;
+    ctx.fillStyle = isBull ? this.theme.bull : this.theme.bear;
     ctx.fillText(changeTxt, x, y);
 
     // Lines 2+: Indicator labels stacked VERTICALLY (TradingView-style)
@@ -3495,7 +3558,7 @@ class TradingChart {
     // Draw each indicator on its own line
     for (const id of overlayIds) {
       const state = this.indicatorStates.get(id) || {visible: true, settings: {}, icons: ['hide','edit','settings','delete'], customIcons: []};
-      const meta = state.def || {label: id, color: THEME.ma1};
+      const meta = state.def || {label: id, color: this.theme.ma1};
       const val = this._getIndicatorValueAt(id, idx);
       this._drawIndicatorLine(this.chartLeft + 6, lineY, id, meta, state, val);
       lineY += lineH;
@@ -3534,14 +3597,14 @@ class TradingChart {
       ctx.fill();
     }
     // Label (colored dot + name)
-    ctx.fillStyle = isVisible ? color : THEME.textDim;
+    ctx.fillStyle = isVisible ? color : this.theme.textDim;
     // Small colored dot before the label
     ctx.beginPath();
     ctx.arc(x + padX + 3, centerY, 3.5, 0, Math.PI * 2);
     ctx.fill();
     ctx.fillText(labelTxt, x + padX + 10, centerY);
     // Value
-    ctx.fillStyle = isVisible ? THEME.text : THEME.textDim;
+    ctx.fillStyle = isVisible ? this.theme.text : this.theme.textDim;
     ctx.fillText(valTxt, x + padX + 10 + labelW + 6, centerY);
     // Icons (only when active)
     if (isActive) {
@@ -3561,7 +3624,7 @@ class TradingChart {
   _drawCollapseArrow(x, y, isUp) {
     const ctx = this.ctx;
     const isHover = this.hoverIcon && this.hoverIcon.iconId === 'collapse';
-    const color = isHover ? THEME.textBright : THEME.textDim;
+    const color = isHover ? this.theme.textBright : this.theme.textDim;
     ctx.strokeStyle = color;
     ctx.fillStyle = color;
     ctx.lineWidth = 1.2;
@@ -3656,7 +3719,7 @@ class TradingChart {
     const isPaneCard = id === 'rsi' || id === 'macd';
     if (isActive || isPaneCard) {
       // Use solid panelBg for pane cards (fully opaque) so text is always readable
-      ctx.fillStyle = isActive ? 'rgba(42,46,57,0.95)' : (isPaneCard ? THEME.panelBg : 'rgba(19,23,34,0.85)');
+      ctx.fillStyle = isActive ? 'rgba(42,46,57,0.95)' : (isPaneCard ? this.theme.panelBg : 'rgba(19,23,34,0.85)');
       this._roundRect(x, y - 3, cardW, cardH + 4, 3);
       ctx.fill();
       // Subtle border for pane cards
@@ -3668,10 +3731,10 @@ class TradingChart {
       }
     }
     // Label (colored)
-    ctx.fillStyle = isVisible ? color : THEME.textDim;
+    ctx.fillStyle = isVisible ? color : this.theme.textDim;
     ctx.fillText(labelTxt, x + padX, y);
     // Value
-    ctx.fillStyle = isVisible ? THEME.text : THEME.textDim;
+    ctx.fillStyle = isVisible ? this.theme.text : this.theme.textDim;
     ctx.fillText(valTxt, x + padX + labelW + 4, y);
     // Icons (only when active)
     if (isActive) {
@@ -3701,8 +3764,8 @@ class TradingChart {
       this._roundRect(x, y - 1, size, size, 2);
       ctx.fill();
     }
-    ctx.strokeStyle = isHover ? THEME.textBright : THEME.textDim;
-    ctx.fillStyle = isHover ? THEME.textBright : THEME.textDim;
+    ctx.strokeStyle = isHover ? this.theme.textBright : this.theme.textDim;
+    ctx.fillStyle = isHover ? this.theme.textBright : this.theme.textDim;
     ctx.lineWidth = 1.2;
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
@@ -3822,25 +3885,25 @@ class TradingChart {
     ctx.fillStyle = 'rgba(0,0,0,0.3)';
     ctx.fillRect(0, 0, this.W, this.H);
     // Card background
-    ctx.fillStyle = THEME.panelBg;
+    ctx.fillStyle = this.theme.panelBg;
     this._roundRect(sc.x, sc.y, sc.w, sc.h, 6);
     ctx.fill();
-    ctx.strokeStyle = THEME.toolbarBorder;
+    ctx.strokeStyle = this.theme.toolbarBorder;
     ctx.lineWidth = 1;
     this._roundRect(sc.x + 0.5, sc.y + 0.5, sc.w - 1, sc.h - 1, 6);
     ctx.stroke();
     // Title bar
-    ctx.fillStyle = THEME.toolbarBg;
+    ctx.fillStyle = this.theme.toolbarBg;
     this._roundRect(sc.x, sc.y, sc.w, 28, 6);
     // Only round top corners — redraw bottom of title bar as straight
     ctx.fillRect(sc.x, sc.y + 20, sc.w, 8);
     ctx.fill();
     ctx.font = 'bold 12px -apple-system, Segoe UI, Roboto, sans-serif';
-    ctx.fillStyle = THEME.textBright;
+    ctx.fillStyle = this.theme.textBright;
     ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
     ctx.fillText(sc.title + ' Settings', sc.x + 10, sc.y + 14);
     // Close button (X)
-    ctx.strokeStyle = THEME.textDim;
+    ctx.strokeStyle = this.theme.textDim;
     ctx.lineWidth = 1.2;
     ctx.beginPath();
     ctx.moveTo(sc.x + sc.w - 18, sc.y + 10);
@@ -3852,19 +3915,19 @@ class TradingChart {
     let fy = sc.y + 36;
     ctx.font = '11px -apple-system, Segoe UI, Roboto, sans-serif';
     for (const f of sc.fields) {
-      ctx.fillStyle = THEME.text;
+      ctx.fillStyle = this.theme.text;
       ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
       ctx.fillText(f.label, sc.x + 10, fy + 8);
       // Input box
       const ix = sc.x + 90, iy = fy, iw = sc.w - 100, ih = 20;
-      ctx.fillStyle = THEME.bg;
+      ctx.fillStyle = this.theme.bg;
       this._roundRect(ix, iy, iw, ih, 3);
       ctx.fill();
-      ctx.strokeStyle = THEME.toolbarBorder;
+      ctx.strokeStyle = this.theme.toolbarBorder;
       this._roundRect(ix + 0.5, iy + 0.5, iw - 1, ih - 1, 3);
       ctx.stroke();
       // Value text
-      ctx.fillStyle = THEME.textBright;
+      ctx.fillStyle = this.theme.textBright;
       ctx.textAlign = 'left';
       const valStr = String(f.type === 'color' ? f.value : f.value);
       ctx.fillText(valStr, ix + 6, iy + ih / 2);
@@ -3878,20 +3941,20 @@ class TradingChart {
     // Save / Cancel buttons
     const btnY = sc.y + sc.h - 32;
     // Cancel
-    ctx.fillStyle = THEME.buttonBg;
+    ctx.fillStyle = this.theme.buttonBg;
     this._roundRect(sc.x + 10, btnY, 80, 24, 3);
     ctx.fill();
-    ctx.strokeStyle = THEME.toolbarBorder;
+    ctx.strokeStyle = this.theme.toolbarBorder;
     this._roundRect(sc.x + 10.5, btnY + 0.5, 79, 23, 3);
     ctx.stroke();
-    ctx.fillStyle = THEME.text;
+    ctx.fillStyle = this.theme.text;
     ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
     ctx.fillText('Cancel', sc.x + 50, btnY + 12);
     // Save
-    ctx.fillStyle = THEME.accent;
+    ctx.fillStyle = this.theme.accent;
     this._roundRect(sc.x + sc.w - 90, btnY, 80, 24, 3);
     ctx.fill();
-    ctx.fillStyle = THEME.textBright;
+    ctx.fillStyle = this.theme.textBright;
     ctx.fillText('Save', sc.x + sc.w - 50, btnY + 12);
     ctx.textAlign = 'left'; ctx.textBaseline = 'top';
   }
@@ -3912,12 +3975,12 @@ class TradingChart {
   drawButton(btn) {
     const ctx = this.ctx;
     const isHover = this.hoverButton && this.hoverButton.id === btn.id;
-    ctx.fillStyle = isHover ? THEME.buttonHover : THEME.buttonBg;
+    ctx.fillStyle = isHover ? this.theme.buttonHover : this.theme.buttonBg;
     this._roundRect(btn.x, btn.y, btn.w, btn.h, 4); ctx.fill();
-    ctx.strokeStyle = THEME.toolbarBorder; ctx.lineWidth = 1;
+    ctx.strokeStyle = this.theme.toolbarBorder; ctx.lineWidth = 1;
     this._roundRect(btn.x + 0.5, btn.y + 0.5, btn.w - 1, btn.h - 1, 4); ctx.stroke();
     ctx.font = '12px -apple-system, Segoe UI, Roboto, sans-serif';
-    ctx.fillStyle = THEME.buttonText;
+    ctx.fillStyle = this.theme.buttonText;
     ctx.textBaseline = 'middle'; ctx.textAlign = 'center';
     const cx = btn.x + btn.w / 2, cy = btn.y + btn.h / 2;
     const textW = ctx.measureText(btn.label).width;
@@ -3926,14 +3989,14 @@ class TradingChart {
     if (btn.icon === 'plus') labelX = cx - 6;
     ctx.fillText(btn.label, labelX, cy);
     if (btn.icon === 'caret') {
-      ctx.fillStyle = THEME.textDim;
+      ctx.fillStyle = this.theme.textDim;
       ctx.beginPath();
       ctx.moveTo(cx + textW / 2 + 4, cy - 3);
       ctx.lineTo(cx + textW / 2 + 9, cy);
       ctx.lineTo(cx + textW / 2 + 4, cy + 3);
       ctx.closePath(); ctx.fill();
     } else if (btn.icon === 'plus') {
-      ctx.strokeStyle = THEME.textDim; ctx.lineWidth = 1.2;
+      ctx.strokeStyle = this.theme.textDim; ctx.lineWidth = 1.2;
       ctx.beginPath();
       ctx.moveTo(cx + textW / 2 + 4, cy - 3);
       ctx.lineTo(cx + textW / 2 + 9, cy + 2);
@@ -3972,22 +4035,22 @@ class TradingChart {
     let x = isMobile ? 6 : 10;
     const gap = isMobile ? 10 : 16;
     const draw = (label, value, color) => {
-      ctx.fillStyle = THEME.textDim;
+      ctx.fillStyle = this.theme.textDim;
       ctx.fillText(label, x, y + this.layout.statusH / 2);
       x += ctx.measureText(label).width + 4;
-      ctx.fillStyle = color || THEME.text;
+      ctx.fillStyle = color || this.theme.text;
       ctx.fillText(value, x, y + this.layout.statusH / 2);
       x += ctx.measureText(value).width + gap;
     };
     if (isMobile) {
       // Compact status bar: only Bid, 24h High, 24h Vol
-      draw('B', this.priceScale.formatLogical(last.close), THEME.bear);
+      draw('B', this.priceScale.formatLogical(last.close), this.theme.bear);
       const last24 = this.sim.candles.slice(-24);
       draw('H', this.priceScale.formatLogical(last24.reduce((m, c) => Math.max(m, c.high), 0)));
       draw('Vol', this._fmtVol(last24.reduce((s, c) => s + c.volume, 0)));
     } else {
-      draw('Bid', this.priceScale.formatLogical(last.close - 0.5), THEME.bear);
-      draw('Ask', this.priceScale.formatLogical(last.close + 0.5), THEME.bull);
+      draw('Bid', this.priceScale.formatLogical(last.close - 0.5), this.theme.bear);
+      draw('Ask', this.priceScale.formatLogical(last.close + 0.5), this.theme.bull);
       draw('Spread', this.priceScale.formatLogical(0.5 * 2));
       const last24 = this.sim.candles.slice(-24);
       draw('24h High', this.priceScale.formatLogical(last24.reduce((m, c) => Math.max(m, c.high), 0)));
@@ -3995,7 +4058,7 @@ class TradingChart {
       draw('24h Vol', this._fmtVol(last24.reduce((s, c) => s + c.volume, 0)));
     }
     ctx.textAlign = 'right';
-    ctx.fillStyle = THEME.textDim;
+    ctx.fillStyle = this.theme.textDim;
     if (isMobile) {
       const toolShort = TOOL_SHORTCUTS[this.activeTool] || '↖';
       ctx.fillText(toolShort, this.W - 6, y + this.layout.statusH / 2);
@@ -4003,7 +4066,7 @@ class TradingChart {
       const toolTxt = 'Tool: ' + DRAW_TOOLS.find(t => t.id === this.activeTool).label;
       ctx.fillText(toolTxt, this.W - 10, y + this.layout.statusH / 2);
       if (this.drawings.length > 0) {
-        ctx.fillStyle = THEME.accent;
+        ctx.fillStyle = this.theme.accent;
         ctx.fillText(this.drawings.length + ' drawings', this.W - 10 - ctx.measureText(toolTxt).width - 16, y + this.layout.statusH / 2);
       }
     }
@@ -4014,25 +4077,25 @@ class TradingChart {
     if (!this.dropdown) return;
     const ctx = this.ctx;
     const d = this.dropdown;
-    ctx.fillStyle = THEME.panelBg;
+    ctx.fillStyle = this.theme.panelBg;
     this._roundRect(d.x, d.y, d.w, d.h, 4); ctx.fill();
-    ctx.strokeStyle = THEME.toolbarBorder; ctx.lineWidth = 1;
+    ctx.strokeStyle = this.theme.toolbarBorder; ctx.lineWidth = 1;
     this._roundRect(d.x + 0.5, d.y + 0.5, d.w - 1, d.h - 1, 4); ctx.stroke();
     ctx.font = '12px -apple-system, Segoe UI, Roboto, sans-serif';
     ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
     const mouseItem = this.mouseInside ? this.hitDropdown(this.mouseX, this.mouseY) : null;
     for (const it of d.items) {
       if (it === mouseItem) {
-        ctx.fillStyle = THEME.buttonHover;
+        ctx.fillStyle = this.theme.buttonHover;
         ctx.fillRect(d.x + 1, it.y, d.w - 2, it.h);
       }
       let xc = d.x + 12;
       if (it.checked !== undefined) {
-        ctx.strokeStyle = it.checked ? THEME.accent : THEME.textDim;
+        ctx.strokeStyle = it.checked ? this.theme.accent : this.theme.textDim;
         ctx.lineWidth = 1.2;
         ctx.strokeRect(xc, it.y + it.h / 2 - 6, 12, 12);
         if (it.checked) {
-          ctx.strokeStyle = THEME.accent;
+          ctx.strokeStyle = this.theme.accent;
           ctx.beginPath();
           ctx.moveTo(xc + 2, it.y + it.h / 2);
           ctx.lineTo(xc + 5, it.y + it.h / 2 + 3);
@@ -4041,7 +4104,7 @@ class TradingChart {
         }
         xc += 18;
       }
-      ctx.fillStyle = it.checked ? THEME.textBright : THEME.text;
+      ctx.fillStyle = it.checked ? this.theme.textBright : this.theme.text;
       ctx.fillText(it.label, xc, it.y + it.h / 2);
     }
   }
@@ -4058,7 +4121,7 @@ class TradingChart {
     const y = this.layout.toolbarH + 8;
     ctx.fillStyle = 'rgba(41,98,255,0.95)';
     this._roundRect(x, y, tw, th, 4); ctx.fill();
-    ctx.fillStyle = THEME.textBright;
+    ctx.fillStyle = this.theme.textBright;
     ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
     ctx.fillText(this.toast.text, x + tw / 2, y + th / 2);
   }

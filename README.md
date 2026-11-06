@@ -4,10 +4,40 @@
 >
 > Pixel-perfect rendering, 14 drawing tools, fully custom indicators via API — you bring the data, the UI, and the indicators. BADI-CHARTS-V2 renders the chart.
 
-[![Version](https://img.shields.io/badge/version-2.4.0-2962ff.svg)](#)
+[![Version](https://img.shields.io/badge/version-2.5.0-2962ff.svg)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-26a69a.svg)](LICENSE)
 [![No Dependencies](https://img.shields.io/badge/dependencies-zero-ff9800.svg)](#)
 [![Headless](https://img.shields.io/badge/UI-headless-9c27b0.svg)](#)
+
+---
+
+## ⚠️ What changed in v2.5.0
+
+Critical data-integrity fixes + per-instance isolation for multi-chart support.
+
+### Data integrity (fixes candle rendering bugs)
+
+1. **Candle objects are now cloned.** `setData()` and `update()` no longer store references to the input objects — they create fresh normalized copies. This fixes the bug where modifying the original candle object would corrupt already-stored candles.
+
+2. **Time is snapped to candle boundaries.** `update()` now aligns the incoming `time` to the candle's open boundary using `timeframeMs`. If you send a tick timestamp (not the candle open time), it's correctly bucketed into the right candle instead of creating a new candle per tick.
+
+3. **Millisecond timestamps auto-converted.** If `time > 1e11` (a millisecond timestamp), it's divided by 1000. Binance's `k.t` (ms) and most APIs' unix seconds both work.
+
+4. **Value validation.** `open/high/low/close` are coerced to numbers; non-finite values are rejected. `high` is clamped to `max(high, open, close)` and `low` to `min(low, open, close)` so wicks never appear below the body.
+
+5. **Stale ticks ignored.** `update()` silently ignores candles with `time < last candle time` (out-of-order data) instead of corrupting the array.
+
+6. **`setSymbol()` and `setTimeframe()` now clear all candle data.** Call `setData()` with the new symbol/timeframe data after switching. This prevents mixing old + new data when switching currencies or timeframes.
+
+### Per-instance isolation (multi-chart support)
+
+7. **Theme is now per-instance.** Each chart gets its own copy of `THEME`. Changing colors on one chart (via `theme` option or `setTheme()`) does NOT affect other charts on the same page. During `render()`, the global `THEME` is swapped with `this.theme` so all drawing methods see the instance's colors.
+
+8. **Custom drawing tools are per-instance.** `addDrawingTool()` no longer pushes to the global `DRAW_TOOLS` array. Each chart has its own `_instanceTools` list. A tool registered on chart A won't appear in chart B's `getTools()`.
+
+9. **`DataLayer.clear()` method added.** Clears all stored candles without creating a new `DataLayer` instance.
+
+No breaking API changes from v2.4.0.
 
 ---
 
@@ -163,7 +193,7 @@ const chart = new BadiCharts(canvas, { /* options */ });
 <body>
   <canvas id="chart"></canvas>
   <!-- Load from CDN (headless, no built-in UI or indicators) -->
-  <script src="https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@v2.4.0/chart.js"></script>
+  <script src="https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@v2.5.0/chart.js"></script>
   <script>
     const canvas = document.getElementById('chart');
     const chart = new BadiCharts(canvas, {
