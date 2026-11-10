@@ -30,7 +30,7 @@
 'use strict';
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.5.0';
+const VERSION = '2.5.1';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 
 /* ============================ THEME ========================================= */
@@ -3870,7 +3870,9 @@ class TradingChart {
       w: w,
       h: h,
       fields: fields,
-      title: meta ? meta.label : id,
+      // v2.5.1: Use state.def.label (the indicator definition) instead of the
+      // removed `meta` variable. Falls back to the id if no definition is found.
+      title: (state.def && state.def.label) ? state.def.label : id,
       // Editable field values (copied so user can cancel)
       draft: Object.assign({}, s)
     };

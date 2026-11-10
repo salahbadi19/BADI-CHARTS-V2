@@ -4,10 +4,20 @@
 >
 > Pixel-perfect rendering, 14 drawing tools, fully custom indicators via API — you bring the data, the UI, and the indicators. BADI-CHARTS-V2 renders the chart.
 
-[![Version](https://img.shields.io/badge/version-2.5.0-2962ff.svg)](#)
+[![Version](https://img.shields.io/badge/version-2.5.1-2962ff.svg)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-26a69a.svg)](LICENSE)
 [![No Dependencies](https://img.shields.io/badge/dependencies-zero-ff9800.svg)](#)
 [![Headless](https://img.shields.io/badge/UI-headless-9c27b0.svg)](#)
+
+---
+
+## ⚠️ What changed in v2.5.1
+
+Bug fix: `meta is not defined` error when opening an indicator's settings card.
+
+In v2.1.0, the `const meta = INDICATOR_LIST.find(...)` line was removed from `_openSettingsCard()` (since `INDICATOR_LIST` was emptied), but a reference to `meta.label` remained in the settings card title. This caused a `ReferenceError: meta is not defined` whenever `openIndicatorSettings(id)` was called.
+
+Fixed by using `state.def.label` (the indicator definition's label) instead, with a fallback to the indicator id.
 
 ---
 
@@ -193,7 +203,7 @@ const chart = new BadiCharts(canvas, { /* options */ });
 <body>
   <canvas id="chart"></canvas>
   <!-- Load from CDN (headless, no built-in UI or indicators) -->
-  <script src="https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@v2.5.0/chart.js"></script>
+  <script src="https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@v2.5.1/chart.js"></script>
   <script>
     const canvas = document.getElementById('chart');
     const chart = new BadiCharts(canvas, {
