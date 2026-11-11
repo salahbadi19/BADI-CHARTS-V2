@@ -4,12 +4,34 @@
 >
 > Pixel-perfect rendering, 14 drawing tools, fully custom indicators via API — you bring the data, the UI, and the indicators. BADI-CHARTS-V2 renders the chart.
 
-[![Version](https://img.shields.io/badge/version-2.9.0-2962ff.svg)](#)
+[![Version](https://img.shields.io/badge/version-2.10.0-2962ff.svg)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-26a69a.svg)](LICENSE)
 [![No Dependencies](https://img.shields.io/badge/dependencies-zero-ff9800.svg)](#)
 [![Headless](https://img.shields.io/badge/UI-headless-9c27b0.svg)](#)
 
 ---
+
+## ⚠️ What changed in v2.10.0
+
+**Drawing tools now understand the click → click gesture — and the chart can never freeze again.**
+
+1. **Two-step drawing (the tool "understands" you):**
+   - **Click once** → the anchor point is fixed (a small dot marks it), and a live preview **follows the mouse**.
+   - **Click again** → the drawing is **placed and stays exactly there**; the tool deactivates and the chart is fully interactive again.
+   - The classic **press → drag → release** gesture still works and places on release. Both patterns are supported for every two-point tool (trend, ray, channel, arrow, rect, band, fib) and custom tools.
+
+2. **Freeze bug fixed (custom tools):** with a tool registered via `addDrawingTool()` active, the status bar crashed on every frame (`DRAW_TOOLS.find(...).label` is `undefined` for custom tools), which aborted rendering — the chart appeared **frozen** while the preview followed the mouse. Labels are now looked up safely in both built-in and custom tool lists.
+
+3. **Never gets stuck:**
+   - `mouseup` is now tracked on the **window** — releasing outside the canvas finalizes/cancels properly instead of leaving a preview that follows the mouse forever.
+   - **Esc / right-click** cancels a pending preview (with a "Drawing cancelled" toast); switching tools discards it.
+   - A **tap without drag** on touch (or a brush click) no longer commits a degenerate zero-size drawing — it shows a "Drag to draw" hint instead.
+
+4. **Polygon is finally wired:** click adds vertices (last one follows the mouse), **double-click or Enter** closes the shape (trailing duplicate points are dropped, <3 points is discarded), double-tap on touch.
+
+5. **Better feedback:** the crosshair stays visible while a tool is active, an **anchor dot** marks point 1 while armed, and the status bar shows a short hint for the active tool, e.g. `Tool: Trend Line (click, then click again to place - or drag)`.
+
+6. **Custom tool hooks:** `addDrawingTool()` now also supports optional `onStart(ctx)`, `onUpdate(drawing, ctx)` and **`onFinish(drawing)`** — called when the drawing is finally placed.
 
 ## ⚠️ What changed in v2.9.0
 

@@ -62,7 +62,7 @@
 'use strict';
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.9.0';
+const VERSION = '2.10.0';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 
 /* ============================ THEME ========================================= */
@@ -922,6 +922,18 @@ class TradingChart {
     this._dragHandle = null;      // { d, key, ptIndex? } while dragging a handle
     this._dragWhole = null;       // { d, startIdx, startPrice, snapshot } while moving a drawing
 
+    // v2.10.0: Two-step drawing state machine ("click → move → click to place")
+    // A drawing tool now understands BOTH gestures:
+    //   1) press → drag → release  (classic, finalizes on release)
+    //   2) click (anchor) → move mouse (live preview follows) → 2nd click (places it)
+    // The chart can never get stuck: mouseup is tracked on the window, Esc /
+    // right-click / switching tools always cancels the pending preview.
+    this._mouseDown = false;      // left button currently held on canvas
+    this._drawAnchor = null;      // { x, y } where the current press started
+    this._drawMoved = false;      // pointer moved >4px since the press (real drag)
+    this._lastHint = 0;           // throttle for "how to draw" hint toasts
+    this._lastPolyTap = 0;        // touch: last tap time for polygon double-tap finish
+
     // Indicators — HEADLESS v2.1.0+: no built-in indicators, no default 'volume'.
     // User registers custom indicators via addIndicator(definition), or by
     // passing definition objects in opts.indicators.
@@ -1168,6 +1180,10 @@ class TradingChart {
       return;
     }
     this.activeTool = toolId;
+    // v2.10.0: switching (or re-picking) a tool always discards any un-placed
+    // preview drawing so the chart can never be left with a stuck overlay.
+    this.currentDrawing = null;
+    this._drawAnchor = null;
     for (let i = 0; i < this._toolChangeCallbacks.length; i++) {
       try { this._toolChangeCallbacks[i](toolId); } catch (e) { if (BADI_DEBUG) console.error(e); }
     }
@@ -1477,7 +1493,12 @@ class TradingChart {
   }
 
   // ─── Custom drawing tools ─────────────────────────────────────────────────
-  // tool: { id, label, icon (emoji/short text), onDraw(ctx, drawing), onHitTest(drawing, x, y), defaultStyle }
+  // tool: { id, label, icon (emoji/short text), onDraw(ctx, drawing),
+  //         onHitTest(drawing, x, y), onStart(ctx)?, onUpdate(drawing, ctx)?,
+  //         onFinish(drawing)?, defaultStyle }
+  // v2.10.0: custom two-point tools follow the same "click → move → click to
+  // place / drag → release" flow as built-ins; onFinish fires once the
+  // drawing is finally placed.
   addDrawingTool(tool) {
     if (!tool || !tool.id) return;
     // v2.5.0+: Per-instance tool list — don't push to the global DRAW_TOOLS array
@@ -1622,11 +1643,17 @@ class TradingChart {
     // Mouse events (desktop)
     this.canvas.addEventListener('mousemove', (e) => { act(); this.onMouseMove(e); });
     this.canvas.addEventListener('mousedown', (e) => { act(); this.onMouseDown(e); });
-    this.canvas.addEventListener('mouseup', (e) => { act(); this.onMouseUp(e); });
+    // v2.10.0: mouseup is tracked on the WINDOW, not only the canvas — if the
+    // user presses inside the chart and releases outside it (or over another
+    // element), the pending drawing is still finalized and the chart can
+    // never be left with a preview that follows the mouse forever.
+    window.addEventListener('mouseup', (e) => { act(); this.onMouseUp(e); });
     this.canvas.addEventListener('mouseleave', () => { act(); this.onMouseLeave(); });
     this.canvas.addEventListener('mouseenter', () => { act(); this.mouseInside = true; });
     this.canvas.addEventListener('wheel', (e) => { act(); this.onWheel(e); }, {passive: false});
     this.canvas.addEventListener('contextmenu', (e) => { e.preventDefault(); act(); this.onRightClick(e); });
+    // v2.10.0: double-click finishes an in-progress polygon (click-click-click... done)
+    this.canvas.addEventListener('dblclick', (e) => { act(); this.onDblClick(e); });
     window.addEventListener('keydown', (e) => { act(); this.onKeyDown(e); });
 
     // Touch events (mobile)
@@ -1669,7 +1696,16 @@ class TradingChart {
       if (this.activeTool !== 'cursor') {
         this.isDragging = false;
         if (this.inChartArea(this.touchStartX, this.touchStartY)) {
-          this.startDrawing(this.touchStartX, this.touchStartY);
+          // v2.10.0: polygon on touch — every extra tap adds a vertex
+          // (double-tap finishes, see onTouchEnd). Other tools start/continue
+          // a drag-drawing; a tap that never moves is discarded in onTouchEnd.
+          if (this.currentDrawing && this.currentDrawing.type === 'poly') {
+            this.addPolygonVertex(this.touchStartX, this.touchStartY);
+          } else if (!this.currentDrawing) {
+            this._drawAnchor = { x: this.touchStartX, y: this.touchStartY };
+            this._drawMoved = false;
+            this.startDrawing(this.touchStartX, this.touchStartY);
+          }
         }
       } else if (this.inChartArea(this.touchStartX, this.touchStartY)) {
         // v2.7.0: Drawing handle/whole-drag on touch (before pan)
@@ -1779,6 +1815,11 @@ class TradingChart {
       const t = touches[0];
       const x = t.clientX - r.left;
       const y = t.clientY - r.top;
+      // v2.10.0: remember whether this touch is a real drag (>8px) or a tap
+      if (this._drawAnchor &&
+          (Math.abs(x - this._drawAnchor.x) > 8 || Math.abs(y - this._drawAnchor.y) > 8)) {
+        this._drawMoved = true;
+      }
       this.updateCurrentDrawing(x, y);
     }
   }
@@ -1801,7 +1842,26 @@ class TradingChart {
       this._lastPanTime = 0;
     }
     if (this.currentDrawing) {
-      this.finishDrawing();
+      // v2.10.0: touch drawing endings
+      const cd = this.currentDrawing;
+      const nowMs = performance.now();
+      if (cd.type === 'poly') {
+        // Polygon: taps add vertices, a quick double-tap closes the shape
+        if (nowMs - (this._lastPolyTap || 0) < 350) {
+          this.finishDrawing();
+        } else {
+          this._lastPolyTap = nowMs;
+        }
+      } else if (this._drawMoved) {
+        // Real drag → place the drawing (classic gesture)
+        this.finishDrawing();
+      } else {
+        // A tap without movement would create a degenerate zero-size drawing
+        // → discard it, keep the tool armed and teach the gesture instead.
+        this.currentDrawing = null;
+        this._drawAnchor = null;
+        this._hintOnce('Drag to draw');
+      }
     }
     // Hide crosshair after a delay on mobile
     setTimeout(() => {
@@ -1839,6 +1899,15 @@ class TradingChart {
     if (this._dragWhole) {
       this._applyWholeDrag(x, y);
       return;
+    }
+
+    // v2.10.0: while the left button is held with a drawing tool, remember
+    // whether the pointer really moved (>4px) — release then means "place";
+    // a still release means "arm, wait for the 2nd click".
+    if (this._mouseDown && this._drawAnchor) {
+      if (Math.abs(x - this._drawAnchor.x) > 4 || Math.abs(y - this._drawAnchor.y) > 4) {
+        this._drawMoved = true;
+      }
     }
 
     if (this.isDragging && this.activeTool === 'cursor') {
@@ -2094,6 +2163,19 @@ class TradingChart {
         this.showToast('Drawing deleted');
       }
     } else if (this.inChartArea(x, y)) {
+      // v2.10.0: two-step drawing. A 2nd click on an armed preview PLACES the
+      // drawing at that spot (it then stays there); polygon clicks add vertices.
+      if (this.currentDrawing) {
+        if (this.currentDrawing.type === 'poly') {
+          this.addPolygonVertex(x, y);
+        } else {
+          this.finishDrawing();
+        }
+        return;
+      }
+      this._mouseDown = true;
+      this._drawAnchor = { x, y };
+      this._drawMoved = false;
       this.startDrawing(x, y);
     }
   }
@@ -2108,14 +2190,32 @@ class TradingChart {
       this._panVelocity = 0;
       this._lastPanTime = 0;
     }
-    if (this.currentDrawing) this.finishDrawing();
+    // v2.10.0: smart release for drawing tools
+    const wasDrag = this._drawMoved;
+    this._mouseDown = false;
+    this._drawAnchor = null;
+    if (this.currentDrawing) {
+      if (this.currentDrawing.type === 'poly') return;   // waits for more clicks / dbl-click / Enter
+      if (wasDrag) { this.finishDrawing(); return; }     // press-drag-release → place it
+      // Simple click (no real drag): keep the preview armed so the user can
+      // move the mouse and click a 2nd time to place it. A brush dot is
+      // useless → discard it and teach the gesture.
+      if (this.currentDrawing.type === 'brush') {
+        this.currentDrawing = null;
+        this._hintOnce('Drag to draw');
+      }
+    }
   }
 
   onMouseLeave() {
     this.mouseInside = false;
     this.crosshairIndex = null;
     this.hoverButton = null;
-    if (this.currentDrawing) this.finishDrawing();
+    // v2.10.0: do NOT finalize/cancel the pending drawing here anymore.
+    // - A drag that leaves the canvas is finalized by the window-level mouseup.
+    // - An armed "click → move → click" preview simply pauses and continues
+    //   when the pointer re-enters. This fixes the chart freezing/losing the
+    //   drawing when the pointer briefly leaves the canvas mid-gesture.
   }
 
   onWheel(e) {
@@ -2150,6 +2250,14 @@ class TradingChart {
   }
 
   onRightClick(e) {
+    // v2.10.0: right-click while a drawing preview is pending → cancel it
+    if (this.currentDrawing) {
+      this.currentDrawing = null;
+      this._drawAnchor = null;
+      this.activeTool = 'cursor';
+      this.showToast('Drawing cancelled');
+      return;
+    }
     if (this.hoverDrawing) {
       this.drawings = this.drawings.filter(d => d !== this.hoverDrawing);
       this.hoverDrawing = null;
@@ -2160,11 +2268,31 @@ class TradingChart {
     }
   }
 
+  // v2.10.0: double-click closes an in-progress polygon (trailing duplicate
+  // vertices added by the two clicks are removed in finishDrawing()).
+  onDblClick(e) {
+    if (this.currentDrawing && this.currentDrawing.type === 'poly') {
+      this.finishDrawing();
+    }
+  }
+
   onKeyDown(e) {
     if (e.key === 'r' || e.key === 'R') { this.resetView(); }
     if (e.key === '+' || e.key === '=') this.zoomAtCenter(1.1);
     if (e.key === '-' || e.key === '_') this.zoomAtCenter(1/1.1);
-    if (e.key === 'Escape') { this.activeTool = 'cursor'; this.currentDrawing = null; this.dropdown = null; this.deselectDrawing(); }
+    if (e.key === 'Escape') {
+      // v2.10.0: cancel pending preview (with feedback), then deselect
+      if (this.currentDrawing) this.showToast('Drawing cancelled');
+      this.currentDrawing = null;
+      this._drawAnchor = null;
+      this.activeTool = 'cursor';
+      this.dropdown = null;
+      this.deselectDrawing();
+    }
+    // v2.10.0: Enter finishes a multi-point polygon
+    if (e.key === 'Enter' && this.currentDrawing && this.currentDrawing.type === 'poly') {
+      this.finishDrawing();
+    }
     if (e.key === 'Delete' || e.key === 'Backspace') {
       if (this.hoverDrawing) {
         this.drawings = this.drawings.filter(d => d !== this.hoverDrawing);
@@ -2721,15 +2849,47 @@ class TradingChart {
   }
   finishDrawing() {
     if (!this.currentDrawing) return;
-    this.currentDrawing.color = this.theme.drawing;
-    // For polygon: mark as closed if 3+ vertices
-    if (this.currentDrawing.type === 'poly' && this.currentDrawing.points.length >= 3) {
-      this.currentDrawing.closed = true;
+    const d = this.currentDrawing;
+    d.color = this.theme.drawing;
+    if (d.type === 'poly') {
+      // v2.10.0: a double-click adds two vertices at the same spot → drop
+      // trailing duplicates before closing.
+      while (d.points && d.points.length >= 2) {
+        const a = d.points[d.points.length - 1], b = d.points[d.points.length - 2];
+        if (Math.abs(a.i - b.i) < 0.01 && Math.abs(a.p - b.p) < 1e-9) d.points.pop();
+        else break;
+      }
+      if (!d.points || d.points.length < 3) {
+        // Not enough points → discard instead of committing a broken polygon
+        this.currentDrawing = null;
+        this._drawAnchor = null;
+        this._hintOnce('Polygon needs at least 3 points');
+        return;
+      }
+      d.closed = true;
     }
-    this.drawings.push(this.currentDrawing);
+    this.drawings.push(d);
     this.currentDrawing = null;
+    this._drawAnchor = null;
+    this._mouseDown = false;
     this.activeTool = 'cursor';
-    this.showToast('Drawing added');
+    this.showToast('Drawing placed');
+    // v2.10.0: custom tools may implement onFinish(drawing) to react when
+    // their drawing is finally placed on the chart.
+    const ct = this._customTools && this._customTools[d.type];
+    if (ct && typeof ct.onFinish === 'function') {
+      try { ct.onFinish(d); } catch (e) {
+        console.error('[BadiCharts] Custom tool onFinish error (' + d.type + '):', e);
+      }
+    }
+  }
+
+  // v2.10.0: hint toasts are throttled so gesture teaching never spams.
+  _hintOnce(text) {
+    const now = performance.now();
+    if (now - (this._lastHint || 0) < 3000) return;
+    this._lastHint = now;
+    this.showToast(text);
   }
 
   /* --------------------------- UI Hit Testing ---------------------------- */
@@ -2781,7 +2941,7 @@ class TradingChart {
       this.computeIndicators();
       this.autoScale();
     } else if (this.dropdown.type === 'tool') {
-      this.activeTool = item.value;
+      this.setTool(item.value);   // v2.10.0: go through setTool (fires callbacks, clears pending preview)
       this.showToast('Tool: ' + item.label);
     }
   }
@@ -3563,6 +3723,30 @@ class TradingChart {
     for (const d of this.drawings) drawOne(d);
     if (this.currentDrawing) drawOne(this.currentDrawing, true);
 
+    // v2.10.0: while a two-step drawing is armed (first click done, waiting
+    // for the placing click), draw a small anchor dot on point 1 so the user
+    // can see the anchor is FIXED and the preview is following the mouse.
+    if (this.currentDrawing) {
+      const cd = this.currentDrawing;
+      let ax = null, ay = null;
+      if (cd.i1 !== undefined && cd.p1 !== undefined) {
+        ax = this.indexToX(cd.i1); ay = this.priceToY(cd.p1);
+      } else if (cd.points && cd.points.length > 0 && (cd.type === 'poly')) {
+        ax = this.indexToX(cd.points[0].i); ay = this.priceToY(cd.points[0].p);
+      }
+      if (ax !== null && this.inChartArea(ax, ay)) {
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(ax, ay, 3.5, 0, Math.PI * 2);
+        ctx.fillStyle = this.theme.accent;
+        ctx.fill();
+        ctx.lineWidth = 1.5;
+        ctx.strokeStyle = this.theme.bg;
+        ctx.stroke();
+        ctx.restore();
+      }
+    }
+
     // v2.7.0: Draw draggable handles for the SELECTED drawing
     if (this.selectedDrawing && !this.selectedDrawing.locked) {
       const handles = this._getDrawingHandles(this.selectedDrawing);
@@ -4056,7 +4240,8 @@ class TradingChart {
     // v2.3.1: On mobile/touch devices, don't show the crosshair (mouse axes) at all.
     if (this._isMobile) return;
     if (!this.mouseInside || this.crosshairIndex === null) return;
-    if (this.activeTool !== 'cursor') return;
+    // v2.10.0: crosshair stays visible while a drawing tool is active too —
+    // the user needs it to aim; hiding it made the chart look frozen.
     if (!this.inChartArea(this.mouseX, this.mouseY) &&
         !this.inPriceAxis(this.mouseX, this.mouseY)) return;
     const ctx = this.ctx;
@@ -4761,13 +4946,32 @@ class TradingChart {
       const toolShort = TOOL_SHORTCUTS[this.activeTool] || '↖';
       ctx.fillText(toolShort, this.W - 6, y + this.layout.statusH / 2);
     } else {
-      const toolTxt = 'Tool: ' + DRAW_TOOLS.find(t => t.id === this.activeTool).label;
+      // v2.10.0 FIX: the old code did DRAW_TOOLS.find(...).label which threw a
+      // TypeError for CUSTOM tools (addDrawingTool) — the exception aborted
+      // every rendered frame and the chart appeared FROZEN while a custom tool
+      // was active. Look the label up safely in both lists and add a short
+      // interaction hint so users know the click → click gesture.
+      const tdef = DRAW_TOOLS.find(t => t.id === this.activeTool)
+        || (this._customTools && this._customTools[this.activeTool]);
+      let toolTxt = 'Tool: ' + (tdef && tdef.label ? tdef.label : this.activeTool);
+      const hint = this._toolHint(this.activeTool);
+      if (hint) toolTxt += '  ' + hint;
       ctx.fillText(toolTxt, this.W - 10, y + this.layout.statusH / 2);
       if (this.drawings.length > 0) {
         ctx.fillStyle = this.theme.accent;
         ctx.fillText(this.drawings.length + ' drawings', this.W - 10 - ctx.measureText(toolTxt).width - 16, y + this.layout.statusH / 2);
       }
     }
+  }
+
+  // v2.10.0: short status-bar hint explaining the current tool's gesture
+  _toolHint(id) {
+    if (id === 'poly') return '(click: add points, double-click/Enter: finish)';
+    if (id === 'brush') return '(drag to draw)';
+    if (id === 'hline' || id === 'vline' || id === 'text') return '(click to place)';
+    if (id === 'eraser') return '(click a drawing to delete)';
+    if (id === 'cursor') return '';
+    return '(click, then click again to place - or drag)';
   }
 
   /* --------------------------- Dropdown ---------------------------------- */
