@@ -4,10 +4,48 @@
 >
 > Pixel-perfect rendering, 14 drawing tools, fully custom indicators via API — you bring the data, the UI, and the indicators. BADI-CHARTS-V2 renders the chart.
 
-[![Version](https://img.shields.io/badge/version-2.6.0-2962ff.svg)](#)
+[![Version](https://img.shields.io/badge/version-2.7.0-2962ff.svg)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-26a69a.svg)](LICENSE)
 [![No Dependencies](https://img.shields.io/badge/dependencies-zero-ff9800.svg)](#)
 [![Headless](https://img.shields.io/badge/UI-headless-9c27b0.svg)](#)
+
+---
+
+## ⚠️ What changed in v2.7.0
+
+Three new features:
+
+1. **Drawing handles + whole-drawing drag.** Every drawing now shows draggable points when selected:
+   - Trend/ray/channel/arrow/rect/band/**fib**: 2 endpoint handles (fib has its 2 required points)
+   - Brush/poly: one handle per vertex
+   - Hline/vline/text: 1 handle
+   - Click the drawing's **line body and drag** to move the entire drawing to another candle area. Click a **handle** and drag to reshape. Works with mouse and touch.
+
+2. **Candle markers (icons on candles).** Draw arrows and icons on specific candles:
+   ```js
+   chart.addMarker({
+     time: 1700000000,           // or index: 42
+     position: 'belowBar',       // 'aboveBar' | 'belowBar' | 'inBar'
+     shape: 'arrowUp',           // 'arrowUp'|'arrowDown'|'circle'|'square'|'cross'
+     color: '#26a69a',
+     size: 1,
+     text: 'Buy',                // optional label
+   });
+   chart.removeMarker(id);  chart.clearMarkers();  chart.getMarkers();
+   ```
+
+3. **Gradient colors for indicators.** New `helpers.drawGradientArea(ctx, values, opts)` — fills the area under an indicator line with a vertical gradient (like TradingView area series):
+   ```js
+   render: function (ctx, values, h) {
+     h.drawGradientArea(ctx, values, {
+       lineColor:   '#2962ff',
+       topColor:    'rgba(41,98,255,0.35)',
+       bottomColor: 'rgba(41,98,255,0.02)'
+     });
+   }
+   ```
+
+No breaking API changes from v2.6.0.
 
 ---
 
@@ -221,7 +259,7 @@ const chart = new BadiCharts(canvas, { /* options */ });
 <body>
   <canvas id="chart"></canvas>
   <!-- Load from CDN (headless, no built-in UI or indicators) -->
-  <script src="https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@v2.6.0/chart.js"></script>
+  <script src="https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@v2.7.0/chart.js"></script>
   <script>
     const canvas = document.getElementById('chart');
     const chart = new BadiCharts(canvas, {

@@ -30,7 +30,7 @@
 'use strict';
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.6.0';
+const VERSION = '2.7.0';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 
 /* ============================ THEME ========================================= */
@@ -881,6 +881,12 @@ class TradingChart {
     this._instanceTools = [];     // v2.5.0+: per-instance tool metadata (don't pollute global DRAW_TOOLS)
     this._drawPanelHits = [];     // hit-test for drawing properties panel
 
+    // v2.7.0: Candle markers (arrows/icons drawn above/below candles)
+    this.markers = [];
+    // v2.7.0: Drawing drag state (handle drag + whole-drawing drag)
+    this._dragHandle = null;      // { d, key, ptIndex? } while dragging a handle
+    this._dragWhole = null;       // { d, startIdx, startPrice, snapshot } while moving a drawing
+
     // Indicators — HEADLESS v2.1.0+: no built-in indicators, no default 'volume'.
     // User registers custom indicators via addIndicator(definition), or by
     // passing definition objects in opts.indicators.
@@ -1247,6 +1253,131 @@ class TradingChart {
     this._bgOpacity = clamp(opacity, 0, 1);
   }
 
+  // ─── Candle markers (v2.7.0) ────────────────────────────────────────────
+  // Add an icon/arrow marker on a candle:
+  //   chart.addMarker({
+  //     time: 1700000000,          // OR index: 42
+  //     position: 'belowBar',      // 'aboveBar' | 'belowBar' | 'inBar'
+  //     shape: 'arrowUp',          // 'arrowUp'|'arrowDown'|'circle'|'square'|'cross'
+  //     color: '#26a69a',
+  //     size: 1,                   // multiplier (1 = ~5px base)
+  //     text: 'Buy',               // optional label
+  //     textColor: '#26a69a'       // optional (defaults to color)
+  //   });
+  addMarker(marker) {
+    if (!marker || typeof marker !== 'object') return null;
+    const m = Object.assign({}, marker);
+    m.id = m.id || (Date.now() + Math.floor(Math.random() * 100000));
+    this.markers.push(m);
+    return m.id;
+  }
+  // Remove a marker by id. Returns the removed marker or null.
+  removeMarker(id) {
+    for (let i = 0; i < this.markers.length; i++) {
+      if (this.markers[i].id === id) return this.markers.splice(i, 1)[0];
+    }
+    return null;
+  }
+  // Remove all markers.
+  clearMarkers() { this.markers = []; }
+  // Get a snapshot of all markers.
+  getMarkers() { return this.markers.slice(); }
+  // Resolve a time (unix sec) to a candle index (last candle with time <= t).
+  _indexForTime(t) {
+    const tf = this.sim.timeframeMs / 1000;
+    const ts = tf > 0 ? Math.floor(t / tf) * tf : t;
+    const arr = this.sim.candles;
+    let lo = 0, hi = arr.length - 1, res = -1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (arr[mid].time <= ts) { res = mid; lo = mid + 1; }
+      else hi = mid - 1;
+    }
+    return res;
+  }
+
+  // ─── Drawing handles (v2.7.0) ────────────────────────────────────────────
+  // Compute the draggable handle positions (media coords) for a drawing.
+  _getDrawingHandles(d) {
+    const handles = [];
+    const add = (key, mx, my, extra) => handles.push(Object.assign({ key: key, x: mx, y: my }, extra || {}));
+    switch (d.type) {
+      case 'trend': case 'ray': case 'channel': case 'arrow':
+      case 'rect': case 'band': case 'fib':
+        add('p1', this.indexToX(d.i1), this.priceToY(d.p1));
+        add('p2', this.indexToX(d.i2), this.priceToY(d.p2));
+        break;
+      case 'brush': case 'poly':
+        if (d.points) {
+          for (let i = 0; i < d.points.length; i++) {
+            add('pt', this.indexToX(d.points[i].i), this.priceToY(d.points[i].p), { ptIndex: i });
+          }
+        }
+        break;
+      case 'hline':
+        add('price', this.chartLeft + 20, this.priceToY(d.price));
+        break;
+      case 'vline':
+        add('index', this.indexToX(d.index), this.chartTop + 20);
+        break;
+      case 'text':
+        add('anchor', this.indexToX(d.i), this.priceToY(d.p));
+        break;
+    }
+    return handles;
+  }
+  // Hit-test a handle of the selected drawing (returns the handle or null).
+  _hitDrawingHandle(x, y) {
+    if (!this.selectedDrawing || this.selectedDrawing.locked) return null;
+    const handles = this._getDrawingHandles(this.selectedDrawing);
+    for (let i = 0; i < handles.length; i++) {
+      if (Math.hypot(x - handles[i].x, y - handles[i].y) <= 9) return handles[i];
+    }
+    return null;
+  }
+  // Apply a handle drag: move the drawing's point to the given position.
+  _applyHandleDrag(x, y) {
+    const h = this._dragHandle;
+    if (!h || !h.d) return;
+    const d = h.d;
+    const idx = this.xToIndex(x);
+    const price = this.yToPrice(y);
+    switch (h.key) {
+      case 'p1': d.i1 = idx; d.p1 = price; break;
+      case 'p2': d.i2 = idx; d.p2 = price; break;
+      case 'pt': if (d.points && d.points[h.ptIndex]) d.points[h.ptIndex] = { i: idx, p: price, x: x, y: y }; break;
+      case 'price': d.price = price; break;
+      case 'index': d.index = idx; break;
+      case 'anchor': d.i = idx; d.p = price; break;
+    }
+    if (typeof d.recalc === 'function') d.recalc();
+    this.autoScale();
+  }
+  // Deep-copy the coordinate fields of a drawing (for whole-drawing drag).
+  _snapshotDrawing(d) {
+    return JSON.parse(JSON.stringify({
+      i1: d.i1, p1: d.p1, i2: d.i2, p2: d.p2,
+      index: d.index, price: d.price, i: d.i, p: d.p,
+      points: d.points
+    }));
+  }
+  // Move a whole drawing by the delta between the start position and now.
+  _applyWholeDrag(x, y) {
+    const dw = this._dragWhole;
+    if (!dw || !dw.d) return;
+    const dIdx = this.xToIndex(x) - dw.startIdx;
+    const dPrice = this.yToPrice(y) - dw.startPrice;
+    const d = dw.d, s = dw.snapshot;
+    if (s.i1 !== undefined && s.i1 !== null) { d.i1 = s.i1 + dIdx; d.p1 = s.p1 + dPrice; }
+    if (s.i2 !== undefined && s.i2 !== null) { d.i2 = s.i2 + dIdx; d.p2 = s.p2 + dPrice; }
+    if (s.index !== undefined && s.index !== null) d.index = s.index + dIdx;
+    if (s.price !== undefined && s.price !== null) d.price = s.price + dPrice;
+    if (s.i !== undefined && s.i !== null) { d.i = s.i + dIdx; d.p = s.p + dPrice; }
+    if (s.points) d.points = s.points.map(function (p) { return { i: p.i + dIdx, p: p.p + dPrice }; });
+    if (typeof d.recalc === 'function') d.recalc();
+    this.autoScale();
+  }
+
   // ─── Custom drawing tools ─────────────────────────────────────────────────
   // tool: { id, label, icon (emoji/short text), onDraw(ctx, drawing), onHitTest(drawing, x, y), defaultStyle }
   addDrawingTool(tool) {
@@ -1424,6 +1555,28 @@ class TradingChart {
         if (this.inChartArea(this.touchStartX, this.touchStartY)) {
           this.startDrawing(this.touchStartX, this.touchStartY);
         }
+      } else if (this.inChartArea(this.touchStartX, this.touchStartY)) {
+        // v2.7.0: Drawing handle/whole-drag on touch (before pan)
+        if (this.selectedDrawing) {
+          const handle = this._hitDrawingHandle(this.touchStartX, this.touchStartY);
+          if (handle) {
+            this._dragHandle = { d: this.selectedDrawing, key: handle.key, ptIndex: handle.ptIndex };
+            this.isDragging = false;
+            return;
+          }
+        }
+        const clickedDrawing = this.findDrawingAt(this.touchStartX, this.touchStartY);
+        if (clickedDrawing && !clickedDrawing.locked) {
+          this.selectDrawing(clickedDrawing);
+          this._dragWhole = {
+            d: clickedDrawing,
+            startIdx: this.xToIndex(this.touchStartX),
+            startPrice: this.yToPrice(this.touchStartY),
+            snapshot: this._snapshotDrawing(clickedDrawing)
+          };
+          this.isDragging = false;
+          return;
+        }
       }
       // Update crosshair
       if (this.inChartArea(this.touchStartX, this.touchStartY)) {
@@ -1446,6 +1599,19 @@ class TradingChart {
     e.preventDefault();
     const r = this.canvas.getBoundingClientRect();
     const touches = e.touches;
+    // v2.7.0: Drawing handle drag takes priority over everything else (touch)
+    if (this._dragHandle && touches.length >= 1) {
+      const t0 = touches[0];
+      this._applyHandleDrag(t0.clientX - r.left, t0.clientY - r.top);
+      return;
+    }
+    // v2.7.0: Whole-drawing drag (touch)
+    if (this._dragWhole && touches.length >= 1) {
+      const t0 = touches[0];
+      this._applyWholeDrag(t0.clientX - r.left, t0.clientY - r.top);
+      return;
+    }
+
     if (this.isPinching && touches.length === 2) {
       const t1 = touches[0], t2 = touches[1];
       const dist = Math.hypot(t2.clientX - t1.clientX, t2.clientY - t1.clientY);
@@ -1506,6 +1672,9 @@ class TradingChart {
     if (this.isPinching) {
       this.isPinching = false;
     }
+    // v2.7.0: clear drawing drag states
+    this._dragHandle = null;
+    this._dragWhole = null;
     // v2.4.0+: Start momentum scrolling on touch release (if panning velocity is significant)
     if (this.isDragging) {
       this.isDragging = false;
@@ -1543,6 +1712,17 @@ class TradingChart {
           break;
         }
       }
+    }
+
+    // v2.7.0: Drawing handle drag takes priority over everything else
+    if (this._dragHandle) {
+      this._applyHandleDrag(x, y);
+      return;
+    }
+    // v2.7.0: Whole-drawing drag
+    if (this._dragWhole) {
+      this._applyWholeDrag(x, y);
+      return;
     }
 
     if (this.isDragging && this.activeTool === 'cursor') {
@@ -1762,13 +1942,28 @@ class TradingChart {
     }
     if (this.activeTool === 'cursor') {
       if (this.inChartArea(x, y)) {
-        // Check if clicking on a drawing (select it) before starting drag
+        // v2.7.0: Handle drag takes priority over body hit
+        if (this.selectedDrawing) {
+          const handle = this._hitDrawingHandle(x, y);
+          if (handle) {
+            this._dragHandle = { d: this.selectedDrawing, key: handle.key, ptIndex: handle.ptIndex };
+            return;
+          }
+        }
+        // Check if clicking on a drawing (select + start whole-drag)
         const clickedDrawing = this.findDrawingAt(x, y);
         if (clickedDrawing && !clickedDrawing.locked) {
           this.selectDrawing(clickedDrawing);
-          return;  // don't start drag — user clicked on a drawing
+          // v2.7.0: set up whole-drawing drag (drag the tool to another candle area)
+          this._dragWhole = {
+            d: clickedDrawing,
+            startIdx: this.xToIndex(x),
+            startPrice: this.yToPrice(y),
+            snapshot: this._snapshotDrawing(clickedDrawing)
+          };
+          return;
         }
-        // Click on empty area → deselect drawing + start drag
+        // Click on empty area → deselect drawing + start pan
         this.deselectDrawing();
         this.isDragging = true;
         this.dragStartX = x;
@@ -2167,7 +2362,64 @@ class TradingChart {
       dpr:         this.dpr,
       candles:     this.sim.candles,
       THEME:       THEME,
-      optimalCandlestickWidth: optimalCandlestickWidth
+      optimalCandlestickWidth: optimalCandlestickWidth,
+      // v2.7.0: Gradient area helper — fills the area under a line with a
+      // vertical gradient and strokes the line on top.
+      //   helpers.drawGradientArea(ctx, values, {
+      //     lineColor: '#2962ff',
+      //     topColor:  'rgba(41,98,255,0.35)',
+      //     bottomColor: 'rgba(41,98,255,0.02)',
+      //     lineWidth: 1.5
+      //   });
+      drawGradientArea: function (ctx, values, opts) {
+        opts = opts || {};
+        const lineColor = opts.lineColor || '#2962ff';
+        const topColor = opts.topColor || 'rgba(41,98,255,0.35)';
+        const bottomColor = opts.bottomColor || 'rgba(41,98,255,0.02)';
+        const lw = opts.lineWidth || 1.5;
+        // Find vertical extent of visible values
+        let minY = Infinity;
+        for (let i = firstIdx; i <= lastIdx; i++) {
+          const v = values[i];
+          if (v === null || v === undefined) continue;
+          const y = self.priceToY(v);
+          if (y < minY) minY = y;
+        }
+        if (!isFinite(minY)) return;
+        const grad = ctx.createLinearGradient(0, minY, 0, self.priceBottom);
+        grad.addColorStop(0, topColor);
+        grad.addColorStop(1, bottomColor);
+        // Fill area under the line
+        ctx.beginPath();
+        let started = false, lastX = null;
+        for (let i = firstIdx; i <= lastIdx; i++) {
+          const v = values[i];
+          if (v === null || v === undefined) { started = false; continue; }
+          const x = self.indexToX(i);
+          const y = self.priceToY(v);
+          if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
+          lastX = x;
+        }
+        if (!started) return;
+        ctx.lineTo(lastX, self.priceBottom);
+        ctx.lineTo(self.indexToX(firstIdx), self.priceBottom);
+        ctx.closePath();
+        ctx.fillStyle = grad;
+        ctx.fill();
+        // Stroke the line on top
+        ctx.beginPath();
+        started = false;
+        for (let i = firstIdx; i <= lastIdx; i++) {
+          const v = values[i];
+          if (v === null || v === undefined) { started = false; continue; }
+          const x = self.indexToX(i);
+          const y = self.priceToY(v);
+          if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
+        }
+        ctx.strokeStyle = lineColor;
+        ctx.lineWidth = lw;
+        ctx.stroke();
+      }
     };
     helpers._paneRegion = paneRegion;
     return helpers;
@@ -2387,6 +2639,7 @@ class TradingChart {
       this.drawBackground();
       this.drawGrid();
       this.drawCandles();
+      this.drawMarkers();
       this.drawVolume();
       this.drawIndicators();
       this.drawVolumeProfile();
@@ -2562,6 +2815,92 @@ class TradingChart {
         // Body: symmetric around the wick column's center
         const bodyLeft = wickCenter - bodyWidth / 2;
         ctx.fillRect(bodyLeft, bodyTop, bodyWidth, bodyH);
+      }
+    }
+    ctx.restore();
+  }
+
+  /* --------------------------- Markers (v2.7.0) --------------------------- */
+  // Draw candle markers (arrows/icons) above/below candles.
+  // Marker: { time | index, position, shape, color, size, text, textColor }
+  drawMarkers() {
+    if (!this.markers || this.markers.length === 0) return;
+    const candles = this.sim.candles;
+    if (candles.length === 0) return;
+    const ctx = this.ctx;
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(this.chartLeft, this.priceTop, this.chartRight - this.chartLeft, this.priceBottom - this.priceTop);
+    ctx.clip();
+
+    for (const m of this.markers) {
+      // Resolve candle index
+      let idx = (typeof m.index === 'number') ? m.index : this._indexForTime(m.time);
+      if (idx < 0 || idx >= candles.length) continue;
+      const c = candles[idx];
+      const x = this.indexToX(idx);
+      if (x < this.chartLeft - 20 || x > this.chartRight + 20) continue;
+
+      const s = (m.size || 1) * 5;              // base pixel size
+      const color = m.color || this.theme.accent;
+      const pos = m.position || 'belowBar';
+      let y;
+      if (pos === 'aboveBar')      y = this.priceToY(c.high) - s - 4;
+      else if (pos === 'inBar')    y = this.priceToY(c.close);
+      else                         y = this.priceToY(c.low) + s + 4;
+
+      ctx.fillStyle = color;
+      switch (m.shape) {
+        case 'arrowDown': {
+          ctx.beginPath();
+          ctx.moveTo(x, y + s);
+          ctx.lineTo(x - s * 0.7, y - s * 0.6);
+          ctx.lineTo(x + s * 0.7, y - s * 0.6);
+          ctx.closePath();
+          ctx.fill();
+          break;
+        }
+        case 'circle': {
+          ctx.beginPath();
+          ctx.arc(x, y, s * 0.6, 0, Math.PI * 2);
+          ctx.fill();
+          break;
+        }
+        case 'square': {
+          ctx.fillRect(x - s * 0.55, y - s * 0.55, s * 1.1, s * 1.1);
+          break;
+        }
+        case 'cross': {
+          ctx.strokeStyle = color;
+          ctx.lineWidth = Math.max(1.5, s * 0.28);
+          ctx.lineCap = 'round';
+          ctx.beginPath();
+          ctx.moveTo(x - s * 0.6, y - s * 0.6); ctx.lineTo(x + s * 0.6, y + s * 0.6);
+          ctx.moveTo(x + s * 0.6, y - s * 0.6); ctx.lineTo(x - s * 0.6, y + s * 0.6);
+          ctx.stroke();
+          break;
+        }
+        case 'arrowUp':
+        default: {
+          ctx.beginPath();
+          ctx.moveTo(x, y - s);
+          ctx.lineTo(x - s * 0.7, y + s * 0.6);
+          ctx.lineTo(x + s * 0.7, y + s * 0.6);
+          ctx.closePath();
+          ctx.fill();
+          break;
+        }
+      }
+
+      // Optional text label
+      if (m.text) {
+        ctx.font = 'bold 10px -apple-system, Segoe UI, Roboto, sans-serif';
+        ctx.fillStyle = m.textColor || color;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = pos === 'aboveBar' ? 'bottom' : 'top';
+        const ty = pos === 'aboveBar' ? y - s - 2 : y + s + 3;
+        ctx.fillText(m.text, x, ty);
+        ctx.textAlign = 'left'; ctx.textBaseline = 'top';
       }
     }
     ctx.restore();
@@ -3077,6 +3416,20 @@ class TradingChart {
     };
     for (const d of this.drawings) drawOne(d);
     if (this.currentDrawing) drawOne(this.currentDrawing, true);
+
+    // v2.7.0: Draw draggable handles for the SELECTED drawing
+    if (this.selectedDrawing && !this.selectedDrawing.locked) {
+      const handles = this._getDrawingHandles(this.selectedDrawing);
+      for (const h of handles) {
+        ctx.beginPath();
+        ctx.arc(h.x, h.y, 4.5, 0, Math.PI * 2);
+        ctx.fillStyle = this.theme.bg;
+        ctx.fill();
+        ctx.strokeStyle = this.theme.accent;
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+      }
+    }
   }
 
   // Build the helpers object passed to custom drawing tools' onDraw / onHitTest.
