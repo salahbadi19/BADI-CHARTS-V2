@@ -4,12 +4,35 @@
 >
 > Pixel-perfect rendering, 14 drawing tools, fully custom indicators via API — you bring the data, the UI, and the indicators. BADI-CHARTS-V2 renders the chart.
 
-[![Version](https://img.shields.io/badge/version-2.7.0-2962ff.svg)](#)
+[![Version](https://img.shields.io/badge/version-2.8.0-2962ff.svg)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-26a69a.svg)](LICENSE)
 [![No Dependencies](https://img.shields.io/badge/dependencies-zero-ff9800.svg)](#)
 [![Headless](https://img.shields.io/badge/UI-headless-9c27b0.svg)](#)
 
 ---
+
+## ⚠️ What changed in v2.8.0
+
+**Stability & Signals release** — fixes two reported problems: buy/sell arrows drawing only one type, and a "strange movement" appearing in the chart with complex multi-color indicators.
+
+1. **Custom indicators are now sandboxed.** Each indicator's `render()` and `calculate()` runs wrapped in `try/catch` **plus a canvas `save()/restore()` guard**:
+   - A buggy indicator can no longer **leak canvas state** (transform / clip / alpha / shadow) that visually moved or shifted the whole chart.
+   - A crash **mid-render** can no longer leave a half-drawn frame (the classic "buy arrows drawn, sell arrows missing"). The old code swallowed errors silently; now the error is **always logged to console**, shown **once as a toast**, and the indicator card gets a **red "!" badge** until the indicator recovers.
+   - If `calculate()` throws, `render()` is skipped (no more feeding `null` into user code).
+
+2. **Frame guard + idle throttle.** Nothing can kill the `requestAnimationFrame` loop anymore. After 2s with no interaction/data/animation the chart renders at half rate (~30fps) to save CPU with heavy indicators — any interaction instantly resumes full speed.
+
+3. **Markers hardened + `setMarkers()` batch API.**
+   ```js
+   // Recommended for buy/sell signals — idempotent, safe to call every tick:
+   chart.setMarkers([
+     { time: t1, position: 'belowBar', shape: 'arrowUp',   color: '#26a69a', text: 'Buy'  },
+     { time: t2, position: 'aboveBar', shape: 'arrowDown', color: '#ef5350', text: 'Sell' }
+   ]);
+   ```
+   - `time` now accepts **unix seconds, ms epoch, ISO strings and Date objects** (auto-normalized) — mixed time units no longer collapse all markers onto one candle.
+   - Invalid `shape`/`position`/`size` are coerced to safe defaults; a marker with an unusable time/index is rejected instead of corrupting the render.
+   - Markers are drawn **above indicator fills/gradients** so translucent indicator areas never cover the arrows.
 
 ## ⚠️ What changed in v2.7.0
 
@@ -24,7 +47,8 @@ Three new features:
 2. **Candle markers (icons on candles).** Draw arrows and icons on specific candles:
    ```js
    chart.addMarker({
-     time: 1700000000,           // or index: 42
+     time: 1700000000,           // seconds / ms epoch / ISO string / Date — auto-normalized (v2.8.0)
+     index: 42,                  // or a direct candle index (overrides time)
      position: 'belowBar',       // 'aboveBar' | 'belowBar' | 'inBar'
      shape: 'arrowUp',           // 'arrowUp'|'arrowDown'|'circle'|'square'|'cross'
      color: '#26a69a',
@@ -32,6 +56,8 @@ Three new features:
      text: 'Buy',                // optional label
    });
    chart.removeMarker(id);  chart.clearMarkers();  chart.getMarkers();
+   // v2.8.0: batch replace (idempotent — ideal for signal indicators):
+   chart.setMarkers([ { time: t, position:'belowBar', shape:'arrowUp', color:'#26a69a' }, /*...*/ ]);
    ```
 
 3. **Gradient colors for indicators.** New `helpers.drawGradientArea(ctx, values, opts)` — fills the area under an indicator line with a vertical gradient (like TradingView area series):

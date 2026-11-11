@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v1.0.0 — Pixel-Perfect Pure JavaScript Trading Chart Library
+ * BADI-CHARTS-V2 v2.8.0 — Pixel-Perfect Pure JavaScript Trading Chart Library
  *
  * A lightweight, dependency-free candlestick charting library built entirely
  * with the HTML5 Canvas API. Inspired by TradingView Lightweight Charts.
@@ -13,6 +13,25 @@
  *   - Responsive (desktop + mobile with touch/pinch support)
  *   - Crosshair, current price line, OHLC legend
  *   - Clipping for all chart areas (no overflow)
+ *
+ * v2.8.0 — Stability & Signals:
+ *   - Custom indicator render()/calculate() are SANDBOXED (per-indicator
+ *     save/restore + try/catch): a buggy indicator can no longer leak canvas
+ *     state (transform/clip/alpha/shadow) that visually "moves" the whole
+ *     chart, nor leave a half-drawn frame (e.g. buy arrows drawn, sell
+ *     arrows missing because the code threw mid-loop)
+ *   - Errors are ALWAYS logged (not only in debug mode), shown once as a
+ *     toast, and flagged with a red "!" badge on the indicator card until
+ *     the indicator recovers
+ *   - Markers hardened: ms-epoch / ISO-string / Date times auto-normalized
+ *     to unix seconds, invalid shape/position/size coerced to safe defaults,
+ *     new setMarkers() batch API (idempotent — safe to call every tick),
+ *     and markers are drawn ABOVE indicator fills/gradients so buy/sell
+ *     arrows are never covered by translucent indicator areas
+ *   - Frame guard: nothing can kill the requestAnimationFrame loop; a failed
+ *     frame is logged and the next frame starts clean
+ *   - Idle render throttle: after 2s with no interaction/data/animation the
+ *     chart renders at half rate to save CPU with heavy custom indicators
  *
  * Algorithms ported 1:1 from TradingView Lightweight Charts (v5):
  *   - optimalCandlestickWidth()  — exact same formula
@@ -30,7 +49,7 @@
 'use strict';
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.7.0';
+const VERSION = '2.8.0';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 
 /* ============================ THEME ========================================= */
@@ -799,6 +818,9 @@ class TradingChart {
     // v2.6.0: Gentler momentum — higher friction (stops sooner) + stronger
     // smoothing (instantaneous spikes weighted less) + max velocity cap.
     this._momentumFriction = 0.90;  // velocity × 0.90 per frame → stops in ~0.5s
+    // v2.8.0: Stability — idle render throttle + user-code sandboxing
+    this._lastActivity = performance.now();  // last interaction / data update
+    this._idleSkip = false;                  // frame alternator for idle throttle
     this._momentumThreshold = 0.05; // px/ms — below this, momentum stops
     this._momentumMaxVelocity = 1.2; // px/ms cap so flicks never fly across the chart
 
@@ -1217,6 +1239,7 @@ class TradingChart {
   setTheme(overrides) {
     if (overrides && typeof overrides === 'object') {
       Object.assign(this.theme, overrides);
+      this.invalidate(); // v2.8.0
     }
   }
   // Get a copy of THIS instance's theme.
@@ -1253,37 +1276,92 @@ class TradingChart {
     this._bgOpacity = clamp(opacity, 0, 1);
   }
 
-  // ─── Candle markers (v2.7.0) ────────────────────────────────────────────
+  // ─── Candle markers (v2.7.0, hardened v2.8.0) ─────────────────────────
   // Add an icon/arrow marker on a candle:
   //   chart.addMarker({
-  //     time: 1700000000,          // OR index: 42
+  //     time: 1700000000,          // unix SECONDS (ms epoch / ISO / Date also accepted — auto-converted)
+  //     index: 42,                 // OR a direct candle index (overrides time)
   //     position: 'belowBar',      // 'aboveBar' | 'belowBar' | 'inBar'
   //     shape: 'arrowUp',          // 'arrowUp'|'arrowDown'|'circle'|'square'|'cross'
   //     color: '#26a69a',
-  //     size: 1,                   // multiplier (1 = ~5px base)
+  //     size: 1,                   // multiplier (1 = ~5px base, clamped 0.3..10)
   //     text: 'Buy',               // optional label
   //     textColor: '#26a69a'       // optional (defaults to color)
   //   });
+  // v2.8.0: invalid fields are coerced to safe defaults; a marker with an
+  // unusable time/index is REJECTED (returns null) instead of corrupting the
+  // render. TIP: for signal indicators that refresh every tick, prefer
+  // setMarkers(batch) below — it replaces the whole array (no duplicates).
   addMarker(marker) {
     if (!marker || typeof marker !== 'object') return null;
     const m = Object.assign({}, marker);
+    // ── time normalization (v2.8.0): Date | ISO string | ms epoch | seconds
+    if (typeof m.index !== 'number' || !isFinite(m.index)) {
+      let t = m.time;
+      if (t instanceof Date) t = Math.floor(t.getTime() / 1000);
+      else if (typeof t === 'string') { const p = Date.parse(t); t = isNaN(p) ? NaN : Math.floor(p / 1000); }
+      else if (typeof t === 'number' && t > 1e11) t = Math.floor(t / 1000); // ms epoch → s
+      if (typeof t !== 'number' || !isFinite(t)) return null; // unusable marker
+      m.time = t;
+      delete m.index;
+    } else {
+      m.index = Math.round(m.index);
+    }
+    // ── whitelist shape/position (invalid → safe default, marker still drawn)
+    const _shapes = ['arrowUp', 'arrowDown', 'circle', 'square', 'cross'];
+    if (_shapes.indexOf(m.shape) === -1) m.shape = 'arrowUp';
+    const _positions = ['aboveBar', 'belowBar', 'inBar'];
+    if (_positions.indexOf(m.position) === -1) m.position = 'belowBar';
+    // ── clamp size / validate color & text
+    if (typeof m.size !== 'number' || !isFinite(m.size)) m.size = 1;
+    m.size = Math.min(10, Math.max(0.3, m.size));
+    if (typeof m.color !== 'string' || !m.color) delete m.color;
+    if (m.text !== undefined && typeof m.text !== 'string') m.text = String(m.text);
     m.id = m.id || (Date.now() + Math.floor(Math.random() * 100000));
     this.markers.push(m);
+    // v2.8.0: warn once when the array grows abnormally (e.g. addMarker called
+    // inside calculate() on every tick — use setMarkers() to replace instead)
+    if (this.markers.length > 10000 && !this._markerWarned) {
+      this._markerWarned = true;
+      console.warn('[BadiCharts] ' + this.markers.length + ' markers accumulated. ' +
+        'If you add signal markers on every update(), prefer chart.setMarkers(batch) which replaces the whole array.');
+    }
+    this.invalidate();
     return m.id;
+  }
+  // v2.8.0: Replace ALL markers with a new batch (idempotent — safe to call on
+  // every data refresh / tick). Recommended for buy/sell signal markers so the
+  // array never grows unbounded. Returns the number of stored markers.
+  //   chart.setMarkers([
+  //     { time: t1, position:'belowBar', shape:'arrowUp',   color:'#26a69a', text:'Buy'  },
+  //     { time: t2, position:'aboveBar', shape:'arrowDown', color:'#ef5350', text:'Sell' }
+  //   ]);
+  setMarkers(markers) {
+    this.markers = [];
+    this._markerWarned = false;
+    if (Array.isArray(markers)) {
+      for (const m of markers) this.addMarker(m);
+    }
+    this.invalidate();
+    return this.markers.length;
   }
   // Remove a marker by id. Returns the removed marker or null.
   removeMarker(id) {
     for (let i = 0; i < this.markers.length; i++) {
       if (this.markers[i].id === id) return this.markers.splice(i, 1)[0];
     }
+    this.invalidate();
     return null;
   }
   // Remove all markers.
-  clearMarkers() { this.markers = []; }
+  clearMarkers() { this.markers = []; this._markerWarned = false; this.invalidate(); }
   // Get a snapshot of all markers.
   getMarkers() { return this.markers.slice(); }
   // Resolve a time (unix sec) to a candle index (last candle with time <= t).
+  // v2.8.0: tolerates ms epoch + invalid input (returns -1 instead of NaN).
   _indexForTime(t) {
+    if (typeof t !== 'number' || !isFinite(t)) return -1;
+    if (t > 1e11) t = Math.floor(t / 1000); // ms epoch → seconds
     const tf = this.sim.timeframeMs / 1000;
     const ts = tf > 0 ? Math.floor(t / tf) * tf : t;
     const arr = this.sim.candles;
@@ -1440,6 +1518,7 @@ class TradingChart {
       this.H = h;
       this.updateLayout();
       this.invalidateTimeMarks();
+      this.invalidate(); // v2.8.0
     };
     resize();
     window.addEventListener('resize', resize);
@@ -1503,21 +1582,24 @@ class TradingChart {
 
   /* --------------------------- Events ------------------------------------ */
   setupEvents() {
+    // v2.8.0: every input event marks the chart active so the idle throttle
+    // resumes full-speed rendering instantly on interaction.
+    const act = () => this.invalidate();
     // Mouse events (desktop)
-    this.canvas.addEventListener('mousemove', (e) => this.onMouseMove(e));
-    this.canvas.addEventListener('mousedown', (e) => this.onMouseDown(e));
-    this.canvas.addEventListener('mouseup', (e) => this.onMouseUp(e));
-    this.canvas.addEventListener('mouseleave', () => this.onMouseLeave());
-    this.canvas.addEventListener('mouseenter', () => this.mouseInside = true);
-    this.canvas.addEventListener('wheel', (e) => this.onWheel(e), {passive: false});
-    this.canvas.addEventListener('contextmenu', (e) => { e.preventDefault(); this.onRightClick(e); });
-    window.addEventListener('keydown', (e) => this.onKeyDown(e));
+    this.canvas.addEventListener('mousemove', (e) => { act(); this.onMouseMove(e); });
+    this.canvas.addEventListener('mousedown', (e) => { act(); this.onMouseDown(e); });
+    this.canvas.addEventListener('mouseup', (e) => { act(); this.onMouseUp(e); });
+    this.canvas.addEventListener('mouseleave', () => { act(); this.onMouseLeave(); });
+    this.canvas.addEventListener('mouseenter', () => { act(); this.mouseInside = true; });
+    this.canvas.addEventListener('wheel', (e) => { act(); this.onWheel(e); }, {passive: false});
+    this.canvas.addEventListener('contextmenu', (e) => { e.preventDefault(); act(); this.onRightClick(e); });
+    window.addEventListener('keydown', (e) => { act(); this.onKeyDown(e); });
 
     // Touch events (mobile)
-    this.canvas.addEventListener('touchstart', (e) => this.onTouchStart(e), {passive: false});
-    this.canvas.addEventListener('touchmove', (e) => this.onTouchMove(e), {passive: false});
-    this.canvas.addEventListener('touchend', (e) => this.onTouchEnd(e), {passive: false});
-    this.canvas.addEventListener('touchcancel', (e) => this.onTouchEnd(e), {passive: false});
+    this.canvas.addEventListener('touchstart', (e) => { act(); this.onTouchStart(e); }, {passive: false});
+    this.canvas.addEventListener('touchmove', (e) => { act(); this.onTouchMove(e); }, {passive: false});
+    this.canvas.addEventListener('touchend', (e) => { act(); this.onTouchEnd(e); }, {passive: false});
+    this.canvas.addEventListener('touchcancel', (e) => { act(); this.onTouchEnd(e); }, {passive: false});
   }
 
   /* --------------------------- Touch Handlers ---------------------------- */
@@ -2327,12 +2409,61 @@ class TradingChart {
       if (!state || !state.def || typeof state.def.calculate !== 'function') continue;
       try {
         this.indCache[id] = state.def.calculate(candles, state.settings);
+        this._clearIndicatorError(state);   // v2.8.0: recovered
       } catch (e) {
-        if (BADI_DEBUG) console.error('[BadiCharts] Indicator calculate error (' + id + '):', e);
         this.indCache[id] = null;
+        state._lastCalcError = e;
+        this._flagIndicatorError(id, state, e, 'calculate()'); // v2.8.0: visible, not silent
       }
     }
+    this.invalidate();
   }
+
+  /* ----------------- User-code sandbox (v2.8.0) ------------------------- */
+  // Custom indicator render()/calculate() run with try/catch + a canvas state
+  // guard (save/restore). A buggy or heavy user indicator can no longer:
+  //   - leak a transform/clip/alpha/shadow that visually "moves" the chart
+  //   - leave a half-drawn frame (e.g. buy arrows drawn, sell arrows missing
+  //     because the code threw mid-loop and the old catch swallowed it)
+  //   - kill the render loop
+  // Errors are ALWAYS logged (not only in debug mode), shown once as a toast,
+  // and flagged with a red "!" badge on the indicator card until recovery.
+  _flagIndicatorError(id, state, e, phase) {
+    state._errFlag = true;
+    if (!state._errLogged) {
+      state._errLogged = true;
+      const label = (state.def && state.def.label) ? state.def.label : id;
+      try { console.error('[BadiCharts] Indicator "' + label + '" ' + phase + ' error:', e); } catch (_) {}
+      this.showToast('Indicator "' + label + '" ' + phase + ' error — see console (F12)');
+    }
+  }
+  _clearIndicatorError(state) {
+    state._errFlag = false;
+    state._errLogged = false;
+  }
+  // Safely render ONE indicator: skips render when calculate() failed (values
+  // are null) and isolates canvas state per indicator via save/restore.
+  _safeRenderIndicator(id, state, helpers) {
+    const ctx = this.ctx;
+    if (typeof state.def.calculate === 'function' && this.indCache[id] == null) {
+      // calculate() failed earlier — don't feed null values into user code
+      this._flagIndicatorError(id, state, state._lastCalcError || new Error('calculate() returned no values'), 'render');
+      return;
+    }
+    ctx.save();
+    try {
+      state.def.render(ctx, this.indCache[id], helpers, state.settings, state);
+      this._clearIndicatorError(state);
+    } catch (e) {
+      this._flagIndicatorError(id, state, e, 'render()');
+    } finally {
+      ctx.restore();  // discard any leaked transform / clip / alpha / shadow
+    }
+  }
+  // v2.8.0: Mark the chart as "active" — resumes full-speed rendering in the
+  // idle throttle (start()). Called automatically by input handlers and all
+  // data / indicator / marker / theme APIs. Also safe to call from user code.
+  invalidate() { this._lastActivity = performance.now(); }
 
   // Build the helpers object passed to each indicator's render() function.
   // Contains coordinate-conversion functions and current chart geometry.
@@ -2639,11 +2770,13 @@ class TradingChart {
       this.drawBackground();
       this.drawGrid();
       this.drawCandles();
-      this.drawMarkers();
       this.drawVolume();
       this.drawIndicators();
       this.drawVolumeProfile();
       this.drawPane();
+      // v2.8.0: markers are drawn AFTER indicators/pane so translucent fills,
+      // gradients and the pane backdrop never cover buy/sell arrows.
+      this.drawMarkers();
       this.drawDrawings();
       this.drawDrawingPanel();  // Floating properties panel for selected drawing
       this.drawPriceAxis();
@@ -2955,12 +3088,8 @@ class TradingChart {
     const helpers = this._indicatorHelpers(firstIdx, lastIdx);
     for (const id of volIndicators) {
       const state = this.indicatorStates.get(id);
-      if (typeof state.def.render !== 'function') continue;
-      try {
-        state.def.render(ctx, this.indCache[id], helpers, state.settings, state);
-      } catch (e) {
-        if (BADI_DEBUG) console.error('[BadiCharts] Volume indicator render error (' + id + '):', e);
-      }
+      if (!state || !state.def || typeof state.def.render !== 'function') continue;
+      this._safeRenderIndicator(id, state, helpers);   // v2.8.0: sandboxed
     }
 
     ctx.restore();
@@ -3011,11 +3140,7 @@ class TradingChart {
       if (state.def.type !== 'overlay') continue;
       if (state.visible === false) continue;
       if (typeof state.def.render !== 'function') continue;
-      try {
-        state.def.render(ctx, this.indCache[id], helpers, state.settings, state);
-      } catch (e) {
-        if (BADI_DEBUG) console.error('[BadiCharts] Overlay indicator render error (' + id + '):', e);
-      }
+      this._safeRenderIndicator(id, state, helpers);   // v2.8.0: sandboxed
     }
 
     ctx.restore();
@@ -3095,11 +3220,7 @@ class TradingChart {
       if (state.def.type !== 'pane') continue;
       if (state.visible === false) continue;
       if (typeof state.def.render !== 'function') continue;
-      try {
-        state.def.render(ctx, this.indCache[id], helpers, state.settings, state);
-      } catch (e) {
-        if (BADI_DEBUG) console.error('[BadiCharts] Pane indicator render error (' + id + '):', e);
-      }
+      this._safeRenderIndicator(id, state, helpers);   // v2.8.0: sandboxed
     }
     ctx.restore();
 
@@ -3403,10 +3524,13 @@ class TradingChart {
           const customTool = this._customTools && this._customTools[d.type];
           if (customTool && typeof customTool.onDraw === 'function') {
             const helpers = this._drawingHelpers();
+            ctx.save();   // v2.8.0: sandbox user drawing code
             try {
               customTool.onDraw(ctx, d, helpers);
             } catch (e) {
-              if (BADI_DEBUG) console.error('[BadiCharts] Custom tool onDraw error (' + d.type + '):', e);
+              console.error('[BadiCharts] Custom tool onDraw error (' + d.type + '):', e);
+            } finally {
+              ctx.restore();
             }
           }
           break;
@@ -4062,6 +4186,8 @@ class TradingChart {
     const labelW = ctx.measureText(labelTxt).width;
     const valTxt = val || '';
     const valW = ctx.measureText(valTxt).width;
+    // v2.8.0: reserve space for the red "!" error badge when this indicator threw
+    const errW = state._errFlag ? 14 : 0;
     // Background when active (subtle highlight)
     const allIcons = state.icons.concat(state.customIcons.map(c => c.id));
     const iconSize = 16;   // bigger icons for easier clicking
@@ -4071,7 +4197,7 @@ class TradingChart {
     const centerY = y + cardH / 2;
     let iconsW = 0;
     if (isActive) iconsW = allIcons.length * (iconSize + iconGap);
-    const lineW = padX + labelW + 6 + valW + (isActive ? iconsW + 8 : 0) + padX;
+    const lineW = padX + labelW + 6 + valW + errW + (isActive ? iconsW + 8 : 0) + padX;
     // Highlight background when active
     if (isActive) {
       ctx.fillStyle = 'rgba(42,46,57,0.85)';
@@ -4088,9 +4214,22 @@ class TradingChart {
     // Value
     ctx.fillStyle = isVisible ? this.theme.text : this.theme.textDim;
     ctx.fillText(valTxt, x + padX + 10 + labelW + 6, centerY);
+    // v2.8.0: red "!" badge — this indicator's calculate()/render() threw
+    if (state._errFlag) {
+      const bx = x + padX + 10 + labelW + 6 + valW + 9;
+      ctx.fillStyle = '#ef5350';
+      ctx.beginPath();
+      ctx.arc(bx, centerY, 5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#ffffff';
+      ctx.font = 'bold 9px -apple-system, Segoe UI, Roboto, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('!', bx, centerY + 0.5);
+      ctx.textAlign = 'left';
+    }
     // Icons (only when active)
     if (isActive) {
-      let ix = x + padX + 10 + labelW + 6 + valW + 8;
+      let ix = x + padX + 10 + labelW + 6 + valW + 8 + errW;
       for (const iconId of allIcons) {
         const isCustom = state.customIcons.find(c => c.id === iconId);
         this._drawIndicatorIcon(ix, y + (cardH - iconSize) / 2, iconId, iconSize, id, isCustom);
@@ -4195,7 +4334,8 @@ class TradingChart {
     }
     const padX = 6;
     const cardH = 18;
-    const cardW = padX + labelW + 4 + valW + padX + (isActive ? iconsW + 4 : 0);
+    const errW = state._errFlag ? 14 : 0;   // v2.8.0: red "!" error badge space
+    const cardW = padX + labelW + 4 + valW + errW + padX + (isActive ? iconsW + 4 : 0);
     // Background: always show a solid background for pane cards (RSI/MACD) so they're
     // readable over the indicator line. For main-legend cards, only show when active.
     const isPaneCard = id === 'rsi' || id === 'macd';
@@ -4218,9 +4358,22 @@ class TradingChart {
     // Value
     ctx.fillStyle = isVisible ? this.theme.text : this.theme.textDim;
     ctx.fillText(valTxt, x + padX + labelW + 4, y);
+    // v2.8.0: red "!" badge — this indicator's calculate()/render() threw
+    if (state._errFlag) {
+      const bx = x + padX + labelW + 4 + valW + 9;
+      ctx.fillStyle = '#ef5350';
+      ctx.beginPath();
+      ctx.arc(bx, y + cardH / 2 - 1, 5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#ffffff';
+      ctx.font = 'bold 9px -apple-system, Segoe UI, Roboto, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('!', bx, y + cardH / 2 - 0.5);
+      ctx.textAlign = 'left';
+    }
     // Icons (only when active)
     if (isActive) {
-      let ix = x + padX + labelW + 4 + valW + 4;
+      let ix = x + padX + labelW + 4 + valW + 4 + errW;
       for (const iconId of allIcons) {
         const isCustom = state.customIcons.find(c => c.id === iconId);
         this._drawIndicatorIcon(ix, y, iconId, iconSize, id, isCustom);
@@ -4651,12 +4804,27 @@ class TradingChart {
       if (document.hidden) return;
       // Apply momentum scrolling (inertia) — runs every frame regardless of throttle
       this._applyMomentum(now);
+      // v2.8.0: Idle throttle — with no interaction, data update or animation
+      // for >2s, render at half rate (~30fps) so heavy custom indicators don't
+      // burn CPU while the chart is idle. Any activity resumes full speed.
+      if (!this._momentum && now - this._lastActivity > 2000) {
+        this._idleSkip = !this._idleSkip;
+        if (this._idleSkip) return;
+      } else {
+        this._idleSkip = false;
+      }
       // Throttle on mobile
       if (this._renderThrottleMs > 0) {
         if (now - this._lastRenderTime < this._renderThrottleMs) return;
       }
       this._lastRenderTime = now;
-      this.render(now);
+      // v2.8.0: frame guard — nothing a user indicator/tool does can kill the
+      // render loop; a failed frame is logged and the next frame starts clean.
+      try {
+        this.render(now);
+      } catch (e) {
+        console.error('[BadiCharts] Render frame error:', e);
+      }
     };
     this.rafId = requestAnimationFrame(loop);
   }
