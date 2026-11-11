@@ -4,12 +4,44 @@
 >
 > Pixel-perfect rendering, 14 drawing tools, fully custom indicators via API — you bring the data, the UI, and the indicators. BADI-CHARTS-V2 renders the chart.
 
-[![Version](https://img.shields.io/badge/version-2.10.0-2962ff.svg)](#)
+[![Version](https://img.shields.io/badge/version-2.11.0-2962ff.svg)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-26a69a.svg)](LICENSE)
 [![No Dependencies](https://img.shields.io/badge/dependencies-zero-ff9800.svg)](#)
 [![Headless](https://img.shields.io/badge/UI-headless-9c27b0.svg)](#)
 
 ---
+
+## ⚠️ What changed in v2.11.0
+
+**Render robustness release — the chart can no longer jitter or lose pixels with heavy, colorful custom indicators.** Verified with a 12-band rainbow indicator (glow shadows, gradients, hundreds of colored shapes): hovering costs one `drawImage`, idle costs **zero CPU**.
+
+1. **Render-on-demand (the big one).** The chart no longer repaints itself 60 times per second forever. It now renders **exactly once per change** — interaction, data update, API call — and goes **fully idle (0% CPU)** until the next change. This is how TradingView stays smooth. The two jitter sources of the old design are gone:
+   - constant 60fps full repaints with a heavy indicator (frame time > 16ms → dropped frames → stutter), and
+   - the v2.8.0 alternating idle throttle, which oscillated the frame rate between 60 and 30 fps (visible shaking whenever anything touched the chart periodically).
+   - A **"Reset view" toast fired on every `setData()`** also forced 2.2s of 60fps rendering right after every data load — removed.
+
+2. **Per-indicator offscreen cache.** Every custom indicator renders into its **own offscreen canvas**, rebuilt only when its inputs actually change (data, visible range, scale, size, settings, theme). The rebuild condition is a **fingerprint recomputed from live values every frame** — so the cache can never go stale, no matter which API mutated the chart. Moving the crosshair with a heavy multi-color indicator now costs one `drawImage` per indicator instead of a full re-render.
+
+3. **Animated indicators:** if your indicator animates itself (color cycling, pulsing…), declare **`animated: true`** in its definition — it bypasses the cache and the loop keeps running for it:
+   ```js
+   chart.addIndicator({ id:'glow', label:'Glow', type:'overlay', animated: true,
+                        calculate: c => c.map(x => x.close),
+                        render(ctx, values, h) { /* runs every frame, like before */ } });
+   ```
+   Static indicators (the vast majority) get the cache and the smoothness for free.
+
+4. **Auto-retry for failed `calculate()`.** A transient failure (one bad tick, briefly incomplete data) no longer makes an indicator **disappear forever** — it is retried automatically every ~0.7s until it recovers.
+
+5. **`getRange(values, settings)` hook — fixes "parts of my indicator disappear".** `autoScale()` only included plain-number arrays in the price range; indicators returning **objects per bar** (multi-band, multi-color arrays) were clipped away whenever they extended beyond the candle range. An indicator can now declare its own range:
+   ```js
+   getRange: function (values, settings) {
+     return { min: myMin, max: myMax };  // merged into the price auto-scale
+   }
+   ```
+
+6. **Canvas-wreck guard.** Setting `canvas.width/height` inside user `render()` wipes the whole bitmap (the classic "everything disappeared" bug). The chart now detects it and restores the bitmap + HiDPI transform instantly.
+
+7. **New API:** `chart.invalidateScene()` — force all cached indicator layers to rebuild on the next frame (rarely needed; e.g. after mutating a settings object in place). `chart.invalidate()` now schedules exactly one repaint.
 
 ## ⚠️ What changed in v2.10.0
 

@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.8.0 — Pixel-Perfect Pure JavaScript Trading Chart Library
+ * BADI-CHARTS-V2 v2.11.0 — Pixel-Perfect Pure JavaScript Trading Chart Library
  *
  * A lightweight, dependency-free candlestick charting library built entirely
  * with the HTML5 Canvas API. Inspired by TradingView Lightweight Charts.
@@ -13,6 +13,29 @@
  *   - Responsive (desktop + mobile with touch/pinch support)
  *   - Crosshair, current price line, OHLC legend
  *   - Clipping for all chart areas (no overflow)
+ *
+ * v2.11.0 — Render robustness (anti-jitter + anti-disappear):
+ *   - RENDER-ON-DEMAND: the chart no longer repaints 60 times per second
+ *     forever. It renders exactly once per change (interaction, data update,
+ *     API call) and goes fully idle (zero CPU) until the next change. This is
+ *     how TradingView / lightweight-charts stay smooth: no more frame-rate
+ *     oscillation, no more stutter with heavy colorful indicators. The old
+ *     alternating idle throttle (60↔30 fps) is gone — it was a visible
+ *     jitter source when anything marked activity periodically.
+ *   - PER-INDICATOR OFFSCREEN CACHE: every custom indicator renders into its
+ *     own offscreen canvas, rebuilt ONLY when its inputs actually change
+ *     (data, visible range, scale, size, settings, theme). Hovering the
+ *     crosshair with a heavy multi-color indicator now costs one drawImage —
+ *     not a full re-render — so the chart stays fluid.
+ *   - An indicator that animates by itself can declare animated: true — it
+ *     bypasses the cache and keeps the loop running (its render() is called
+ *     every frame, like before).
+ *   - AUTO-RETRY for failed calculate(): a transient failure (null/throw on
+ *     one update) no longer makes an indicator disappear forever — it is
+ *     retried automatically ~every 0.7s until it recovers.
+ *   - CANVAS-WRECK GUARD: if user render code touches canvas.width/height
+ *     (which wipes the whole bitmap — a classic "everything disappears" bug),
+ *     the chart detects it and restores the bitmap + transform instantly.
  *
  * v2.9.0 — Dedicated pane section:
  *   - Pane indicators (RSI/MACD) now render in their own DEDICATED SECTION
@@ -43,8 +66,8 @@
  *     arrows are never covered by translucent indicator areas
  *   - Frame guard: nothing can kill the requestAnimationFrame loop; a failed
  *     frame is logged and the next frame starts clean
- *   - Idle render throttle: after 2s with no interaction/data/animation the
- *     chart renders at half rate to save CPU with heavy custom indicators
+ *   - (v2.11.0 replaces the v2.8.0 idle half-rate throttle with true
+ *     render-on-demand + per-indicator offscreen caching — smoother and cooler)
  *
  * Algorithms ported 1:1 from TradingView Lightweight Charts (v5):
  *   - optimalCandlestickWidth()  — exact same formula
@@ -62,7 +85,7 @@
 'use strict';
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.10.0';
+const VERSION = '2.11.0';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 
 /* ============================ THEME ========================================= */
@@ -831,9 +854,12 @@ class TradingChart {
     // v2.6.0: Gentler momentum — higher friction (stops sooner) + stronger
     // smoothing (instantaneous spikes weighted less) + max velocity cap.
     this._momentumFriction = 0.90;  // velocity × 0.90 per frame → stops in ~0.5s
-    // v2.8.0: Stability — idle render throttle + user-code sandboxing
+    // v2.11.0: Render-on-demand + per-indicator offscreen cache (anti-jitter)
     this._lastActivity = performance.now();  // last interaction / data update
-    this._idleSkip = false;                  // frame alternator for idle throttle
+    this._needsRender = true;                // dirty flag — render only when set
+    this._sceneVersion = 0;                  // bumped on theme/data/layout changes
+    this._indCache2 = new Map();             // id -> {canvas, octx, stamp, ok} offscreen cache
+    this._cacheHits = 0; this._cacheMisses = 0;  // debug counters
     this._momentumThreshold = 0.05; // px/ms — below this, momentum stops
     this._momentumMaxVelocity = 1.2; // px/ms cap so flicks never fly across the chart
 
@@ -1057,6 +1083,7 @@ class TradingChart {
   addIndicator(idOrDef, config) {
     config = config || {};
     let id, def;
+    this._indCache2.delete(idOrDef && idOrDef.id ? idOrDef.id : idOrDef);  // v2.11.0
     if (typeof idOrDef === 'string') {
       id = idOrDef;
       def = this._customIndicators.get(id);
@@ -1099,6 +1126,7 @@ class TradingChart {
   removeIndicator(id) {
     this.activeIndicators.delete(id);
     this.indicatorStates.delete(id);
+    this._indCache2.delete(id);   // v2.11.0: drop offscreen cache
     if (this.activeIndicatorCard === id) this.activeIndicatorCard = null;
     if (this.settingsCard && this.settingsCard.id === id) this.settingsCard = null;
     this.updateLayout();
@@ -1115,6 +1143,7 @@ class TradingChart {
         this.updateLayout();
         this.autoScale();
       }
+      this._invalidateScene();   // v2.11.0: repaint now that rendering is on-demand
     }
   }
   isIndicatorVisible(id) {
@@ -1275,7 +1304,7 @@ class TradingChart {
   setTheme(overrides) {
     if (overrides && typeof overrides === 'object') {
       Object.assign(this.theme, overrides);
-      this.invalidate(); // v2.8.0
+      this._invalidateScene(); // v2.11.0: theme colors are baked into cached indicators
     }
   }
   // Get a copy of THIS instance's theme.
@@ -2323,7 +2352,10 @@ class TradingChart {
     this.constrainRightOffset();
     this.invalidateTimeMarks();
     this.autoScale();
-    this.showToast('Reset view');
+    // v2.11.0: no built-in toast here. resetView() is also called by setData()
+    // at every data load — the toast made the chart render at 60fps for its
+    // full 2.2s lifetime right after startup (and headless hosts own their UX
+    // feedback anyway). The explicit UI action path (below) still toasts.
   }
 
   // Constrain rightOffset so the chart cannot be scrolled too far away from data.
@@ -2456,6 +2488,7 @@ class TradingChart {
 
   /* --------------------------- Auto Scale -------------------------------- */
   autoScale() {
+    this.invalidate();   // v2.11.0: any scale change must schedule a repaint
     // If no data, set a safe default range and skip
     if (this.sim.candles.length === 0) {
       this.priceScale.setRange(0, 1);
@@ -2481,9 +2514,7 @@ class TradingChart {
       const values = this.indCache[id];
       if (!values) continue;
       // If the indicator returns an array of numbers, include them in the range.
-      // If it returns an object (e.g., {upper, lower, mid}), skip — the indicator's
-      // render() should stay within the candle range, or it should provide its own
-      // autoScale contribution via a future hook.
+      // Objects per bar are covered by the getRange() hook below (v2.11.0).
       if (Array.isArray(values)) {
         for (let i = firstIdx; i <= lastIdx; i++) {
           const v = values[i];
@@ -2492,6 +2523,20 @@ class TradingChart {
             if (v < min) min = v;
           }
         }
+      }
+      // v2.11.0: getRange(values, settings) hook — an indicator whose values
+      // are NOT plain numbers (objects per bar, multi-band arrays, ...) can
+      // contribute its own price range so its drawing NEVER falls outside the
+      // visible scale (a classic "parts of my indicator disappear" cause:
+      // autoScale ignored non-array values → the clip cut them off).
+      if (typeof state.def.getRange === 'function') {
+        try {
+          const r = state.def.getRange(values, state.settings);
+          if (r && isFinite(r.min) && isFinite(r.max)) {
+            if (r.min < min) min = r.min;
+            if (r.max > max) max = r.max;
+          }
+        } catch (e) { /* range hook must never break autoScale */ }
       }
     }
     for (const d of this.drawings) {
@@ -2575,10 +2620,11 @@ class TradingChart {
       } catch (e) {
         this.indCache[id] = null;
         state._lastCalcError = e;
+        state._lastCalcTry = performance.now();  // v2.11.0: start retry cooldown
         this._flagIndicatorError(id, state, e, 'calculate()'); // v2.8.0: visible, not silent
       }
     }
-    this.invalidate();
+    this._invalidateScene();   // v2.11.0: data may have changed → rebuild caches
   }
 
   /* ----------------- User-code sandbox (v2.8.0) ------------------------- */
@@ -2603,29 +2649,166 @@ class TradingChart {
     state._errFlag = false;
     state._errLogged = false;
   }
-  // Safely render ONE indicator: skips render when calculate() failed (values
-  // are null) and isolates canvas state per indicator via save/restore.
+  // Safely render ONE indicator (v2.11.0): auto-retries a failed calculate(),
+  // renders into a PER-INDICATOR OFFSCREEN CACHE that is rebuilt only when
+  // the indicator's inputs change (data / range / scale / size / settings /
+  // theme), and blits the cached bitmap. A heavy multi-color indicator now
+  // costs one drawImage per frame during hover — the chart can't jitter.
+  // Animated indicators (def.animated === true) bypass the cache.
   _safeRenderIndicator(id, state, helpers) {
     const ctx = this.ctx;
+    // v2.11.0: AUTO-RETRY — if calculate() failed transiently (returned null or
+    // threw on one update), retry it every ~0.7s instead of hiding the
+    // indicator forever. Deterministic failures stay flagged (logged once).
     if (typeof state.def.calculate === 'function' && this.indCache[id] == null) {
-      // calculate() failed earlier — don't feed null values into user code
+      const now = performance.now();
+      if (!state._lastCalcTry || now - state._lastCalcTry > 700) {
+        state._lastCalcTry = now;
+        try {
+          const v = state.def.calculate(this.sim.candles, state.settings);
+          if (v != null) {
+            this.indCache[id] = v;
+            this._clearIndicatorError(state);
+          }
+        } catch (e) { /* episode already logged by _flagIndicatorError */ }
+      }
+    }
+    if (typeof state.def.calculate === 'function' && this.indCache[id] == null) {
+      // Still broken — don't feed null values into user code; drop any cached
+      // output so the retry result is picked up as soon as it succeeds.
+      const stale = this._indCache2.get(id);
+      if (stale) stale.stamp = null;
       this._flagIndicatorError(id, state, state._lastCalcError || new Error('calculate() returned no values'), 'render');
       return;
     }
-    ctx.save();
-    try {
-      state.def.render(ctx, this.indCache[id], helpers, state.settings, state);
-      this._clearIndicatorError(state);
-    } catch (e) {
-      this._flagIndicatorError(id, state, e, 'render()');
-    } finally {
-      ctx.restore();  // discard any leaked transform / clip / alpha / shadow
+
+    // v2.11.0: self-animated indicators opt out of the cache — their render()
+    // typically depends on time and must run every frame (loop stays awake).
+    if (state.def.animated === true) {
+      ctx.save();
+      try {
+        state.def.render(ctx, this.indCache[id], helpers, state.settings, state);
+        this._clearIndicatorError(state);
+      } catch (e) {
+        this._flagIndicatorError(id, state, e, 'render()');
+      } finally {
+        ctx.restore();  // discard any leaked transform / clip / alpha / shadow
+        this._fixCanvasWreck();   // user code may have resized the bitmap
+      }
+      return;
+    }
+
+    // ---------- per-indicator offscreen cache (v2.11.0) ----------
+    const pxW = Math.max(1, Math.floor(this.W * this.dpr));
+    const pxH = Math.max(1, Math.floor(this.H * this.dpr));
+    const stamp = this._indicatorStamp(id, state);
+    let entry = this._indCache2.get(id);
+    if (!entry) {
+      const oc = document.createElement('canvas');
+      entry = { canvas: oc, octx: oc.getContext('2d'), stamp: null, ok: false };
+      this._indCache2.set(id, entry);
+      this._evictIndicatorCache();
+    }
+    if (entry.stamp !== stamp || entry.canvas.width !== pxW || entry.canvas.height !== pxH) {
+      // Rebuild: render the indicator into its own bitmap, sandboxed.
+      entry.canvas.width = pxW; entry.canvas.height = pxH;
+      const octx = entry.octx;
+      octx.setTransform(1, 0, 0, 1, 0, 0);
+      octx.clearRect(0, 0, pxW, pxH);
+      octx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+      let ok = true;
+      octx.save();
+      try {
+        state.def.render(octx, this.indCache[id], helpers, state.settings, state);
+        this._clearIndicatorError(state);
+      } catch (e) {
+        ok = false;
+        this._flagIndicatorError(id, state, e, 'render()');
+      } finally {
+        octx.restore();
+      }
+      entry.ok = ok;
+      // Failed renders are NOT cached — they retry next frame (v2.8.0 behavior).
+      entry.stamp = ok ? stamp : null;
+      this._cacheMisses++;
+    } else {
+      this._cacheHits++;
+    }
+    if (entry.ok) {
+      ctx.drawImage(entry.canvas, 0, 0, this.W, this.H);
     }
   }
-  // v2.8.0: Mark the chart as "active" — resumes full-speed rendering in the
-  // idle throttle (start()). Called automatically by input handlers and all
-  // data / indicator / marker / theme APIs. Also safe to call from user code.
-  invalidate() { this._lastActivity = performance.now(); }
+
+  // v2.11.0: Fingerprint of EVERYTHING a custom indicator's render() can see.
+  // Same fingerprint + same settings ⇒ same output ⇒ safe to reuse the cached
+  // bitmap. Recomputed each frame from live values, so no mutation point can
+  // be "forgotten" (self-validating — the cache can never go stale silently).
+  _indicatorStamp(id, state) {
+    const pr = this.priceScale && this.priceScale.priceRange();
+    const range = pr ? (pr.min + '~' + pr.max) : 'x';
+    const ps = this.paneScale;
+    const ppr = ps && ps.priceRange() ? (ps.priceRange().min + '~' + ps.priceRange().max) : 'x';
+    const N = this.sim.candles.length;
+    const last = N ? this.sim.candles[N - 1] : null;
+    return [
+      this._sceneVersion,
+      N,
+      last ? last.time : 0, last ? last.open : 0, last ? last.high : 0, last ? last.low : 0, last ? last.close : 0,
+      Math.round(this.barSpacing * 100) / 100,
+      Math.round(this.rightOffset * 100) / 100,
+      Math.round(this.W), Math.round(this.H), Math.round(this.dpr * 100) / 100,
+      Math.round(this.priceTop), Math.round(this.priceBottom),
+      Math.round(this.paneTop || 0), Math.round(this.paneBottom || 0),
+      Math.round(this.chartLeft), Math.round(this.chartRight),
+      range, ppr,
+      state.visible !== false ? 1 : 0,
+      JSON.stringify(state.settings || {})
+    ].join('|');
+  }
+  // v2.11.0: keep at most 8 offscreen bitmaps alive (removed indicators evict
+  // explicitly; this is just a safety net for long-running pages).
+  _evictIndicatorCache() {
+    const MAX = 8;
+    while (this._indCache2.size > MAX) {
+      const oldest = this._indCache2.keys().next().value;
+      this._indCache2.delete(oldest);
+    }
+  }
+  // v2.11.0: CANVAS-WRECK GUARD — setting canvas.width/height wipes the whole
+  // bitmap and resets the transform (classic "everything disappears" bug when
+  // user render code experiments with the canvas). Detect and repair instantly.
+  _fixCanvasWreck() {
+    const expW = Math.max(1, Math.floor(this.W * this.dpr));
+    const expH = Math.max(1, Math.floor(this.H * this.dpr));
+    if (this.canvas.width !== expW || this.canvas.height !== expH) {
+      this.canvas.width = expW;
+      this.canvas.height = expH;
+      this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+      this._invalidateScene();
+    }
+  }
+  // v2.11.0: true while any active indicator declares animated: true — keeps
+  // the render loop awake so self-animating indicators keep moving.
+  _hasAnimatedIndicator() {
+    for (const id of this.activeIndicators) {
+      const s = this.indicatorStates.get(id);
+      if (s && s.def && s.def.animated === true) return true;
+    }
+    return false;
+  }
+  // v2.11.0: schedule a repaint + mark activity. Called automatically by all
+  // input handlers and all data / indicator / marker / theme APIs. Also safe
+  // to call from user code.
+  invalidate() {
+    this._needsRender = true;              // v2.11.0: schedule exactly one repaint
+    this._lastActivity = performance.now();
+  }
+  // v2.11.0: Force every cached indicator to rebuild on the next render.
+  // Called when something that affects indicator OUTPUT (but not its geometry
+  // fingerprint) changes: theme, settings, data structure, layout.
+  _invalidateScene() { this._sceneVersion++; this.invalidate(); }
+  // Public alias — safe to call from user code / framework integrations.
+  invalidateScene() { this._invalidateScene(); }
 
   // Build the helpers object passed to each indicator's render() function.
   // Contains coordinate-conversion functions and current chart geometry.
@@ -5033,26 +5216,31 @@ class TradingChart {
   // reduce CPU/battery usage. Desktop renders uncapped (60fps). Also pause
   // rendering when the tab is hidden (Page Visibility API) to save battery.
   // v2.4.0+: Apply momentum scrolling (inertia) each frame.
+  // v2.11.0: RENDER-ON-DEMAND — the loop idles at ZERO cost until something
+  // changes (this._needsRender) or a continuous condition holds (momentum,
+  // visible toast, self-animated indicator). This kills the two jitter
+  // sources of the old design: constant 60fps full repaints with heavy
+  // colorful indicators, and the v2.8.0 alternating idle throttle that made
+  // the frame rate oscillate between 60 and 30 fps.
   start() {
     const loop = (now) => {
       this.rafId = requestAnimationFrame(loop);
       // Pause when tab is hidden
       if (document.hidden) return;
-      // Apply momentum scrolling (inertia) — runs every frame regardless of throttle
+      // Apply momentum scrolling (inertia) — runs every frame regardless
       this._applyMomentum(now);
-      // v2.8.0: Idle throttle — with no interaction, data update or animation
-      // for >2s, render at half rate (~30fps) so heavy custom indicators don't
-      // burn CPU while the chart is idle. Any activity resumes full speed.
-      if (!this._momentum && now - this._lastActivity > 2000) {
-        this._idleSkip = !this._idleSkip;
-        if (this._idleSkip) return;
-      } else {
-        this._idleSkip = false;
+      // Continuous conditions: something is genuinely animating right now.
+      if (this.toast && now > this.toast.until) {
+        this.toast = null;            // expired — one last repaint clears it
+        this._needsRender = true;
       }
+      const continuous = !!this._momentum || !!this.toast || this._hasAnimatedIndicator();
+      if (!continuous && !this._needsRender) return;   // idle — zero work
       // Throttle on mobile
       if (this._renderThrottleMs > 0) {
         if (now - this._lastRenderTime < this._renderThrottleMs) return;
       }
+      this._needsRender = false;
       this._lastRenderTime = now;
       // v2.8.0: frame guard — nothing a user indicator/tool does can kill the
       // render loop; a failed frame is logged and the next frame starts clean.
