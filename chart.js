@@ -30,7 +30,7 @@
 'use strict';
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.5.1';
+const VERSION = '2.6.0';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 
 /* ============================ THEME ========================================= */
@@ -796,8 +796,11 @@ class TradingChart {
     this._panVelocity = 0;          // current tracked velocity during active drag
     this._lastPanX = 0;             // last X position during drag (for velocity calc)
     this._lastPanTime = 0;          // last timestamp during drag
-    this._momentumFriction = 0.94;  // velocity multiplier per frame (~60fps → stops in ~1s)
-    this._momentumThreshold = 0.02; // px/ms — below this, momentum stops
+    // v2.6.0: Gentler momentum — higher friction (stops sooner) + stronger
+    // smoothing (instantaneous spikes weighted less) + max velocity cap.
+    this._momentumFriction = 0.90;  // velocity × 0.90 per frame → stops in ~0.5s
+    this._momentumThreshold = 0.05; // px/ms — below this, momentum stops
+    this._momentumMaxVelocity = 1.2; // px/ms cap so flicks never fly across the chart
 
     // Layout — HEADLESS MODE (v2.0.0+)
     // The built-in toolbar has been REMOVED entirely. The library is now fully
@@ -1332,7 +1335,9 @@ class TradingChart {
 
     const paneTop = this.layout.toolbarH;
     const bottomStart = this.H - this.layout.statusH - this.layout.timeAxisH;
-    // HEADLESS v2.1.0+: scan custom indicators for type='pane' and type='volume'
+    // HEADLESS v2.6.0: pane indicators (RSI/MACD) are drawn INSIDE the main chart
+    // as an overlay at the bottom (like TradingView's same-pane mode) — no separate
+    // window below the chart.
     let hasPane = false, hasVolume = false;
     for (const id of this.activeIndicators) {
       const state = this.indicatorStates.get(id);
@@ -1340,7 +1345,7 @@ class TradingChart {
       if (state.def.type === 'pane') hasPane = true;
       else if (state.def.type === 'volume') hasVolume = true;
     }
-    this.layout.paneH = hasPane ? (isMobile ? 110 : 140) : 0;
+    this.layout.paneH = 0;  // no separate pane window — overlay instead
     const volH = hasVolume ? this.layout.volumeH : 0;
 
     this.chartLeft = this.layout.leftPad;
@@ -1477,7 +1482,10 @@ class TradingChart {
       const dt = now - this._lastPanTime;
       if (dt > 0 && this._lastPanTime > 0) {
         const instV = (x - this._lastPanX) / dt;
-        this._panVelocity = this._panVelocity * 0.4 + instV * 0.6;
+        // v2.6.0: Stronger smoothing + velocity cap
+        this._panVelocity = this._panVelocity * 0.65 + instV * 0.35;
+        if (this._panVelocity > this._momentumMaxVelocity) this._panVelocity = this._momentumMaxVelocity;
+        if (this._panVelocity < -this._momentumMaxVelocity) this._panVelocity = -this._momentumMaxVelocity;
       }
       this._lastPanX = x;
       this._lastPanTime = now;
@@ -1548,8 +1556,11 @@ class TradingChart {
       const dt = now - this._lastPanTime;
       if (dt > 0 && this._lastPanTime > 0) {
         const instV = (x - this._lastPanX) / dt;  // px/ms
-        // Smooth: weighted average of previous velocity and instantaneous
-        this._panVelocity = this._panVelocity * 0.4 + instV * 0.6;
+        // v2.6.0: Stronger smoothing (previous 60% + instant 40%) so a single
+        // fast flick doesn't produce an extreme velocity.
+        this._panVelocity = this._panVelocity * 0.65 + instV * 0.35;
+        if (this._panVelocity > this._momentumMaxVelocity) this._panVelocity = this._momentumMaxVelocity;
+        if (this._panVelocity < -this._momentumMaxVelocity) this._panVelocity = -this._momentumMaxVelocity;
       }
       this._lastPanX = x;
       this._lastPanTime = now;
@@ -1671,9 +1682,30 @@ class TradingChart {
         const sc = this.settingsCard;
         const newSettings = {};
         for (const f of sc.fields) newSettings[f.key] = f.value;
-        this.setIndicatorSettings(sc.id, newSettings);
-        this.settingsCard = null;
-        this.showToast('Settings saved');
+        // v2.6.0: Drawing settings card — apply to the drawing object and
+        // notify the custom tool via its onSettings(drawing, settings) hook.
+        if (sc.isDrawingCard && sc.drawing) {
+          const d = sc.drawing;
+          if (newSettings.color !== undefined) d.color = newSettings.color;
+          if (newSettings.lineWidth !== undefined) d.lineWidth = +newSettings.lineWidth;
+          // Merge remaining custom fields into the drawing
+          for (const key in newSettings) {
+            if (key === 'color' || key === 'lineWidth') continue;
+            d[key] = newSettings[key];
+          }
+          const tool = this._customTools && this._customTools[d.type];
+          if (tool && typeof tool.onSettings === 'function') {
+            try { tool.onSettings(d, newSettings); } catch (e) {
+              if (BADI_DEBUG) console.error('[BadiCharts] Tool onSettings error:', e);
+            }
+          }
+          this.settingsCard = null;
+          this.showToast('Tool settings saved');
+        } else {
+          this.setIndicatorSettings(sc.id, newSettings);
+          this.settingsCard = null;
+          this.showToast('Settings saved');
+        }
       } else if (scHit.action === 'field') {
         // Cycle field value via prompt (simple editor) — for number/color
         const sc = this.settingsCard;
@@ -2043,8 +2075,8 @@ class TradingChart {
       this.volScale.rebuildMarks();
     }
 
-    // HEADLESS v2.1.0+: pane scale based on the FIRST active pane-type indicator.
-    // Uses def.getRange(values, settings) if provided, else auto-range from values.
+    // HEADLESS v2.6.0: pane scale based on the FIRST active pane-type indicator.
+    // The pane overlay region is the bottom 30% of the price area.
     let paneId = null;
     for (const id of this.activeIndicators) {
       const state = this.indicatorStates.get(id);
@@ -2056,6 +2088,7 @@ class TradingChart {
     if (paneId) {
       const state = this.indicatorStates.get(paneId);
       const values = this.indCache[paneId];
+      const overlayH = Math.round((this.priceBottom - this.priceTop) * 0.30);
       let pMin, pMax;
       if (typeof state.def.getRange === 'function') {
         try {
@@ -2078,8 +2111,8 @@ class TradingChart {
       if (!isFinite(pMin)) { pMin = -1; pMax = 1; }
       if (pMin === pMax) { pMin -= 1; pMax += 1; }
       const pad = (pMax - pMin) * 0.1;
-      this.paneScale = new PriceScale({scaleMargins: {top: 0.18, bottom: 0.1}, base: 100});
-      this.paneScale.setHeight(this.paneBottom - this.paneTop);
+      this.paneScale = new PriceScale({scaleMargins: {top: 0.12, bottom: 0.08}, base: 100});
+      this.paneScale.setHeight(overlayH);
       this.paneScale.setRange(pMin - pad, pMax + pad);
       this.paneScale.setFormatter(new PriceFormatter(100, 1));
       this.paneScale.rebuildMarks();
@@ -2110,14 +2143,17 @@ class TradingChart {
   // Contains coordinate-conversion functions and current chart geometry.
   _indicatorHelpers(firstIdx, lastIdx) {
     const self = this;
-    return {
+    // v2.6.0: paneRegion is mutable — drawPane() overrides .top/.bottom so
+    // paneToY() maps into the in-chart overlay region (bottom of price area).
+    const paneRegion = { top: self.paneTop || 0, bottom: self.paneBottom || 0 };
+    const helpers = {
       firstIdx: firstIdx,
       lastIdx:  lastIdx,
       indexToX: function (i) { return self.indexToX(i); },
       priceToY: function (p) { return self.priceToY(p); },
       volToY:   function (v) { return self.volToY(v); },
       paneToY:  function (v) {
-        return self.paneTop + (self.paneScale ? self.paneScale.logicalToCoordinate(v, 0) : 0);
+        return paneRegion.top + (self.paneScale ? self.paneScale.logicalToCoordinate(v, 0) : 0);
       },
       chartLeft:   this.chartLeft,
       chartRight:  this.chartRight,
@@ -2133,6 +2169,8 @@ class TradingChart {
       THEME:       THEME,
       optimalCandlestickWidth: optimalCandlestickWidth
     };
+    helpers._paneRegion = paneRegion;
+    return helpers;
   }
 
   /* --------------------------- Drawing Tools ----------------------------- */
@@ -2497,35 +2535,32 @@ class TradingChart {
       const yHigh = this.priceToY(c.high);
       const yLow = this.priceToY(c.low);
 
-      // Snap center to integer bitmap pixel for crisp wick
-      const wickXBmp = Math.round(x * dpr);
-      const wickX = wickXBmp / dpr;
+      // v2.6.0: Draw wick and body BOTH centered on the same snapped center point.
+      // The wick is a wickWidthBmp-wide column starting at the snapped center c;
+      // the body is drawn symmetric around that column's center so the wick always
+      // sits exactly in the middle of the body at every zoom level.
+      const cxBmp = Math.round(x * dpr);
+      const cx = cxBmp / dpr;             // snapped center (bitmap-aligned)
+      const wickCenter = cx + wickWidth / 2; // center of the wick column
+
+      // Vertical extents — snapped to bitmap grid for crisp edges
+      const wickTop = Math.floor(yHigh * dpr) / dpr;
+      const wickBottom = Math.ceil(yLow * dpr) / dpr;
+      const wickH = Math.max(1 / dpr, wickBottom - wickTop);
+      const bodyTop = Math.round(Math.min(yOpen, yClose) * dpr) / dpr;
+      const bodyBottom = Math.round(Math.max(yOpen, yClose) * dpr) / dpr;
+      const bodyH = Math.max(1 / dpr, bodyBottom - bodyTop);
 
       ctx.fillStyle = color;
 
       if (drawAsLine) {
-        // ── LWC-style thin mode: single vertical line from high to low ──
-        // Use a crisp 1-bitmap-pixel-wide filled rectangle.
-        const lineLeft = wickX - wickWidth / 2;
-        const lineTop = Math.floor(yHigh * dpr) / dpr;
-        const lineBot = Math.ceil(yLow * dpr) / dpr;
-        const lineH = Math.max(1 / dpr, lineBot - lineTop);
-        ctx.fillRect(lineLeft, lineTop, wickWidth, lineH);
+        // LWC-style thin mode: single crisp vertical line from high to low
+        ctx.fillRect(cx, wickTop, wickWidth, wickH);
       } else {
-        // ── Normal mode: wick + body ──
-        const wickLeft = wickX - wickWidth / 2;
-        // Draw wick as a filled rectangle (LWC-style) for pixel-perfect crispness
-        const wickTop = Math.floor(yHigh * dpr) / dpr;
-        const wickBottom = Math.ceil(yLow * dpr) / dpr;
-        const wickH = Math.max(1 / dpr, wickBottom - wickTop);
-        ctx.fillRect(wickLeft, wickTop, wickWidth, wickH);
-
-        // Body — pixel-perfect rectangle
-        const bodyLeftBmp = wickXBmp - Math.floor(bodyWidthBmp / 2);
-        const bodyLeft = bodyLeftBmp / dpr;
-        const bodyTop = Math.round(Math.min(yOpen, yClose) * dpr) / dpr;
-        const bodyBottom = Math.round(Math.max(yOpen, yClose) * dpr) / dpr;
-        const bodyH = Math.max(1 / dpr, bodyBottom - bodyTop);
+        // Wick: bitmap-aligned column
+        ctx.fillRect(cx, wickTop, wickWidth, wickH);
+        // Body: symmetric around the wick column's center
+        const bodyLeft = wickCenter - bodyWidth / 2;
         ctx.fillRect(bodyLeft, bodyTop, bodyWidth, bodyH);
       }
     }
@@ -2648,20 +2683,51 @@ class TradingChart {
   }
 
   /* --------------------------- Pane (custom pane indicators) ------------- */
-  // Renders all active pane-type custom indicators. Each indicator's
-  // render(ctx, values, helpers, settings, state) is called inside a clip
-  // to the pane area. Pane scaling is set up in autoScale() based on the first
-  // active pane indicator's getRange() (or auto-range from values).
+  // v2.6.0: Pane indicators are drawn INSIDE the main chart as an overlay at the
+  // bottom of the price area (not in a separate window below the chart).
+  // The overlay region is the bottom 30% of the price area, with a translucent
+  // background so candles remain visible behind it. Pane scaling is set up in
+  // autoScale() based on def.getRange() or auto-range from values.
   drawPane() {
-    if (this.layout.paneH === 0 || !this.paneScale) return;
+    // Find the first active, visible pane-type indicator
+    let paneId = null;
+    for (const id of this.activeIndicators) {
+      const state = this.indicatorStates.get(id);
+      if (state && state.def && state.def.type === 'pane' && state.visible !== false) {
+        paneId = id;
+        break;
+      }
+    }
+    if (!paneId || !this.paneScale) return;
+
     const ctx = this.ctx;
-    const top = this.paneTop, bot = this.paneBottom, left = this.paneLeft, right = this.paneRight;
+    // Overlay region: bottom 30% of the PRICE area (inside the chart)
+    const overlayH = Math.round((this.priceBottom - this.priceTop) * 0.30);
+    const top = this.priceBottom - overlayH;
+    const bot = this.priceBottom;
+    const left = this.chartLeft;
+    const right = this.chartRight;
     const firstIdx = Math.max(0, Math.floor(this.xToIndex(this.chartLeft)));
     const lastIdx = Math.min(this.sim.candles.length - 1, Math.ceil(this.xToIndex(this.chartRight)));
 
-    // Grid (use pane scale marks)
-    ctx.strokeStyle = this.theme.grid;
+    ctx.save();
+
+    // Translucent backdrop so candles behind are dimmed but still visible
+    ctx.fillStyle = this.theme.panelBg;
+    ctx.globalAlpha = 0.75;
+    ctx.fillRect(left, top, right - left, bot - top);
+    ctx.globalAlpha = 1;
+
+    // Separator line at the top of the overlay
+    ctx.strokeStyle = this.theme.axisBorder;
     ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(left, Math.floor(top) + 0.5);
+    ctx.lineTo(right, Math.floor(top) + 0.5);
+    ctx.stroke();
+
+    // Grid (pane scale marks within the overlay)
+    ctx.strokeStyle = this.theme.grid;
     const pmarks = this.paneScale.marks();
     for (const m of pmarks) {
       const y = top + m.coord;
@@ -2672,15 +2738,18 @@ class TradingChart {
       ctx.stroke();
     }
 
-    // Clip to pane area for indicator drawings
-    ctx.save();
+    // Clip to overlay region and render each active pane indicator
     ctx.beginPath();
     ctx.rect(left, top, right - left, bot - top);
     ctx.clip();
 
     const helpers = this._indicatorHelpers(firstIdx, lastIdx);
+    // v2.6.0: Override the pane region so paneToY maps into the in-chart overlay
+    helpers._paneRegion.top = top;
+    helpers._paneRegion.bottom = bot;
+    helpers.paneTop = top;
+    helpers.paneBottom = bot;
 
-    // Render each active pane indicator
     for (const id of this.activeIndicators) {
       const state = this.indicatorStates.get(id);
       if (!state || !state.def) continue;
@@ -2693,10 +2762,19 @@ class TradingChart {
         if (BADI_DEBUG) console.error('[BadiCharts] Pane indicator render error (' + id + '):', e);
       }
     }
-
     ctx.restore();
 
-    // Indicator labels inside the pane — stacked vertically like the main legend.
+    // Right-side value labels for the pane scale (inside the overlay)
+    ctx.font = '9px -apple-system, Segoe UI, Roboto, sans-serif';
+    ctx.fillStyle = this.theme.textDim;
+    ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+    for (const m of pmarks) {
+      const y = top + m.coord;
+      if (y < top + 6 || y > bot - 4) continue;
+      ctx.fillText(m.label, right - ctx.measureText(m.label).width - 4, y);
+    }
+
+    // Indicator labels inside the overlay (top-left), stacked
     ctx.font = '11px -apple-system, Segoe UI, Roboto, sans-serif';
     ctx.textBaseline = 'top';
     const paneIdx = this.crosshairIndex !== null ?
@@ -2710,11 +2788,6 @@ class TradingChart {
       this._drawIndicatorLine(left + 6, labelY, id, state.def, state, val);
       labelY += 22;
     }
-
-    // Right axis labels (price scale of the pane)
-    ctx.font = '10px -apple-system, Segoe UI, Roboto, sans-serif';
-    ctx.fillStyle = this.theme.textDim; ctx.textAlign = 'left';
-    for (const m of pmarks) ctx.fillText(m.label, right + 4, top + m.coord - 5);
   }
 
   /* --------------------------- Drawings ---------------------------------- */
@@ -3166,6 +3239,24 @@ class TradingChart {
       ctx.stroke();
     }, 'duplicate', 'Duplicate');
 
+    // 9. Settings (gear) icon — v2.6.0: opens the deep drawing settings card
+    drawIconBtn(function (cx, cy) {
+      // Gear: circle + 8 teeth
+      ctx.beginPath();
+      ctx.arc(cx, cy, 3.2, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(cx, cy, 1.2, 0, Math.PI * 2);
+      ctx.stroke();
+      for (let a = 0; a < 8; a++) {
+        const ang = (a / 8) * Math.PI * 2;
+        ctx.beginPath();
+        ctx.moveTo(cx + Math.cos(ang) * 3.2, cy + Math.sin(ang) * 3.2);
+        ctx.lineTo(cx + Math.cos(ang) * 5, cy + Math.sin(ang) * 5);
+        ctx.stroke();
+      }
+    }, 'settings', 'Deep settings');
+
     ctx.lineCap = 'butt'; ctx.lineJoin = 'miter';
   }
 
@@ -3201,11 +3292,49 @@ class TradingChart {
             this.selectedDrawing = copy;
             this.showToast('Drawing duplicated');
             break;
+          case 'settings':
+            // v2.6.0: Open the deep drawing settings card
+            this._openDrawingSettingsCard(d);
+            break;
         }
         return true;
       }
     }
     return false;
+  }
+
+  // v2.6.0: Open a deep settings card for a drawing (like the indicator
+  // settings card). Fields: color, lineWidth, plus any custom-tool defaultStyle
+  // keys. When saved, the custom tool's onSettings(drawing, settings) hook is
+  // called (if defined) so tools can react to deep changes.
+  _openDrawingSettingsCard(d) {
+    const fields = [];
+    fields.push({key: 'color', label: 'Color', type: 'color', value: d.color || this.theme.drawing});
+    fields.push({key: 'lineWidth', label: 'Line Width', type: 'number', value: d.lineWidth || 1.5});
+    // Custom tool: include defaultStyle keys as editable fields
+    const tool = this._customTools && this._customTools[d.type];
+    if (tool && tool.defaultStyle) {
+      for (const key in tool.defaultStyle) {
+        if (key === 'color' || key === 'lineWidth') continue;
+        const v = tool.defaultStyle[key];
+        if (typeof v === 'number') fields.push({key: key, label: key, type: 'number', value: v});
+        else if (typeof v === 'string') fields.push({key: key, label: key, type: 'color', value: v});
+      }
+    }
+    const w = 220;
+    const h = 36 + fields.length * 30 + 40;
+    this.settingsCard = {
+      id: '__drawing__' + d.id,
+      isDrawingCard: true,      // marker: save applies to the drawing
+      drawing: d,
+      x: this.chartLeft + 50,
+      y: this.chartTop + 50,
+      w: w,
+      h: h,
+      fields: fields,
+      title: (tool && tool.label) ? tool.label : (d.type || 'Drawing'),
+      draft: {color: d.color, lineWidth: d.lineWidth}
+    };
   }
 
   findDrawingAt(x, y) {
@@ -3776,67 +3905,96 @@ class TradingChart {
       ctx.fillText(custom.icon, cx, cy);
       ctx.textAlign = 'left'; ctx.textBaseline = 'top';
     } else {
-      // Default icons drawn as simple SVG-like paths
+      // v2.6.0: Beautiful TradingView-style icons
       switch (iconId) {
         case 'hide': {
-          // Eye icon — open eye when visible, closed eye when hidden
+          // TradingView-style eye: almond (lens) shape + pupil
           if (state && state.visible !== false) {
-            // Open eye
+            // Open eye — almond outline
             ctx.beginPath();
-            ctx.arc(cx, cy, 3, 0, Math.PI * 2);
+            ctx.moveTo(cx - 5, cy);
+            ctx.quadraticCurveTo(cx, cy - 4.5, cx + 5, cy);
+            ctx.quadraticCurveTo(cx, cy + 4.5, cx - 5, cy);
+            ctx.closePath();
             ctx.stroke();
+            // Pupil (filled dot)
             ctx.beginPath();
-            ctx.ellipse(cx, cy, 4.5, 2.5, 0, 0, Math.PI * 2);
-            ctx.stroke();
+            ctx.arc(cx, cy, 1.8, 0, Math.PI * 2);
+            ctx.fill();
           } else {
-            // Closed eye (eye with line through)
+            // Hidden — almond outline + diagonal slash
             ctx.beginPath();
-            ctx.ellipse(cx, cy, 4.5, 2.5, 0, 0, Math.PI * 2);
+            ctx.moveTo(cx - 5, cy);
+            ctx.quadraticCurveTo(cx, cy - 4.5, cx + 5, cy);
+            ctx.quadraticCurveTo(cx, cy + 4.5, cx - 5, cy);
+            ctx.closePath();
             ctx.stroke();
             ctx.beginPath();
-            ctx.moveTo(cx - 4, cy - 3);
-            ctx.lineTo(cx + 4, cy + 3);
+            ctx.moveTo(cx - 4.5, cy - 3.5);
+            ctx.lineTo(cx + 4.5, cy + 3.5);
             ctx.stroke();
           }
           break;
         }
         case 'edit': {
-          // Pencil icon
+          // Pencil: diagonal body + filled tip (TradingView-style)
           ctx.beginPath();
-          ctx.moveTo(cx - 3, cy + 3);
-          ctx.lineTo(cx + 2, cy - 2);
-          ctx.lineTo(cx + 4, cy);
-          ctx.lineTo(cx - 1, cy + 5);
+          ctx.moveTo(cx - 2.2, cy + 2.8);   // bottom-left of body
+          ctx.lineTo(cx + 2.2, cy - 2.8);   // top-right of body
+          ctx.lineTo(cx + 3.6, cy - 1.4);   // body width
+          ctx.lineTo(cx - 0.8, cy + 4.2);   // near the tip
           ctx.closePath();
           ctx.stroke();
+          // Tip (filled triangle)
           ctx.beginPath();
-          ctx.moveTo(cx - 3, cy + 3);
-          ctx.lineTo(cx - 4, cy + 4);
-          ctx.lineTo(cx - 1, cy + 5);
-          ctx.stroke();
+          ctx.moveTo(cx - 2.2, cy + 2.8);
+          ctx.lineTo(cx - 3.4, cy + 4.6);
+          ctx.lineTo(cx - 0.8, cy + 4.2);
+          ctx.closePath();
+          ctx.fill();
           break;
         }
         case 'settings': {
-          // Gear icon (simplified: circle + 4 small ticks)
+          // Gear: ring + inner hole + 8 teeth (TradingView-style)
           ctx.beginPath();
-          ctx.arc(cx, cy, 2.5, 0, Math.PI * 2);
+          ctx.arc(cx, cy, 3, 0, Math.PI * 2);
           ctx.stroke();
-          for (let a = 0; a < 4; a++) {
-            const ang = a * Math.PI / 2;
+          ctx.beginPath();
+          ctx.arc(cx, cy, 1.1, 0, Math.PI * 2);
+          ctx.stroke();
+          for (let a = 0; a < 8; a++) {
+            const ang = (a / 8) * Math.PI * 2;
             ctx.beginPath();
-            ctx.moveTo(cx + Math.cos(ang) * 3.5, cy + Math.sin(ang) * 3.5);
-            ctx.lineTo(cx + Math.cos(ang) * 5, cy + Math.sin(ang) * 5);
+            ctx.moveTo(cx + Math.cos(ang) * 3, cy + Math.sin(ang) * 3);
+            ctx.lineTo(cx + Math.cos(ang) * 4.6, cy + Math.sin(ang) * 4.6);
             ctx.stroke();
           }
           break;
         }
         case 'delete': {
-          // X icon
+          // Trash can: lid + handle + tapered body + ribs (TradingView-style)
           ctx.beginPath();
-          ctx.moveTo(cx - 3, cy - 3);
-          ctx.lineTo(cx + 3, cy + 3);
-          ctx.moveTo(cx + 3, cy - 3);
-          ctx.lineTo(cx - 3, cy + 3);
+          ctx.moveTo(cx - 4, cy - 2.5);
+          ctx.lineTo(cx + 4, cy - 2.5);   // lid
+          ctx.stroke();
+          ctx.beginPath();
+          ctx.moveTo(cx - 1.8, cy - 2.5);
+          ctx.lineTo(cx - 1.8, cy - 4);   // handle
+          ctx.lineTo(cx + 1.8, cy - 4);
+          ctx.lineTo(cx + 1.8, cy - 2.5);
+          ctx.stroke();
+          ctx.beginPath();
+          ctx.moveTo(cx - 3, cy - 2.5);
+          ctx.lineTo(cx - 2.4, cy + 4.2); // left side (tapered)
+          ctx.lineTo(cx + 2.4, cy + 4.2);
+          ctx.lineTo(cx + 3, cy - 2.5);
+          ctx.closePath();
+          ctx.stroke();
+          ctx.beginPath();
+          ctx.moveTo(cx - 1.2, cy - 0.8);
+          ctx.lineTo(cx - 1.2, cy + 2.2); // left rib
+          ctx.moveTo(cx + 1.2, cy - 0.8);
+          ctx.lineTo(cx + 1.2, cy + 2.2); // right rib
           ctx.stroke();
           break;
         }

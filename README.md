@@ -4,10 +4,28 @@
 >
 > Pixel-perfect rendering, 14 drawing tools, fully custom indicators via API — you bring the data, the UI, and the indicators. BADI-CHARTS-V2 renders the chart.
 
-[![Version](https://img.shields.io/badge/version-2.5.1-2962ff.svg)](#)
+[![Version](https://img.shields.io/badge/version-2.6.0-2962ff.svg)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-26a69a.svg)](LICENSE)
 [![No Dependencies](https://img.shields.io/badge/dependencies-zero-ff9800.svg)](#)
 [![Headless](https://img.shields.io/badge/UI-headless-9c27b0.svg)](#)
+
+---
+
+## ⚠️ What changed in v2.6.0
+
+Five improvements:
+
+1. **Gentler momentum scrolling.** Friction increased (0.94 → 0.90 → stops in ~0.5s), stronger velocity smoothing (65/35 weighted average), and a max velocity cap (1.2 px/ms) so fast flicks never fly across the chart.
+
+2. **Wick always centered on the candle body.** The wick column and the body rectangle are now both drawn symmetric around the same snapped center point — the wick no longer drifts to the left of the body when zooming out.
+
+3. **Pane indicators drawn INSIDE the chart.** Pane-type indicators (RSI, MACD) now render as a translucent overlay at the bottom 30% of the price area — like TradingView's same-pane mode — instead of a separate window below the chart. `layout.paneH` is always 0.
+
+4. **Deep settings for drawing tools.** The drawing properties panel now has a ⚙ gear icon. Clicking it opens a settings card with Color, Line Width, plus any custom-tool `defaultStyle` fields. On save, the tool's `onSettings(drawing, settings)` hook fires.
+
+5. **Beautiful TradingView-style icons.** Indicator card icons redrawn: almond-shaped eye with pupil (open/closed + slash), proper diagonal pencil with filled tip, gear with ring + hole + 8 teeth, and a trash can with lid, handle, tapered body, and ribs.
+
+No breaking API changes from v2.5.1.
 
 ---
 
@@ -203,7 +221,7 @@ const chart = new BadiCharts(canvas, { /* options */ });
 <body>
   <canvas id="chart"></canvas>
   <!-- Load from CDN (headless, no built-in UI or indicators) -->
-  <script src="https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@v2.5.1/chart.js"></script>
+  <script src="https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@v2.6.0/chart.js"></script>
   <script>
     const canvas = document.getElementById('chart');
     const chart = new BadiCharts(canvas, {
