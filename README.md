@@ -4,12 +4,23 @@
 >
 > Pixel-perfect rendering, 14 drawing tools, fully custom indicators via API — you bring the data, the UI, and the indicators. BADI-CHARTS-V2 renders the chart.
 
-[![Version](https://img.shields.io/badge/version-2.8.0-2962ff.svg)](#)
+[![Version](https://img.shields.io/badge/version-2.9.0-2962ff.svg)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-26a69a.svg)](LICENSE)
 [![No Dependencies](https://img.shields.io/badge/dependencies-zero-ff9800.svg)](#)
 [![Headless](https://img.shields.io/badge/UI-headless-9c27b0.svg)](#)
 
 ---
+
+## ⚠️ What changed in v2.9.0
+
+**Dedicated pane section** — bottom indicators (RSI/MACD) no longer render as a translucent layer ON TOP of the candles. Instead they get their own **real section inside the chart**, carved out below the price area (TradingView-style oscillator panes):
+
+- The **price area shrinks** to make room — candles are never covered, fully opaque and crisp.
+- The section has its **own scale with labels in the right axis strip**, its own grid, and a separator line.
+- It **shares the time axis** with the price area, so panning/zooming stay perfectly smooth (one synchronized x-scale).
+- The section reserves/free itself automatically: `addIndicator` / `removeIndicator` / `setIndicatorVisible` on a pane indicator re-layout the chart instantly.
+- Section height: ~24% of the chart height (clamped 80–200px). Volume stays hugging the time axis, below the pane section.
+- `helpers.paneToY(v)` maps into the section; `helpers.paneTop/paneBottom` give its bounds; optional `def.getRange(values, settings)` pins the scale (e.g. RSI 0–100).
 
 ## ⚠️ What changed in v2.8.0
 
@@ -83,7 +94,7 @@ Five improvements:
 
 2. **Wick always centered on the candle body.** The wick column and the body rectangle are now both drawn symmetric around the same snapped center point — the wick no longer drifts to the left of the body when zooming out.
 
-3. **Pane indicators drawn INSIDE the chart.** Pane-type indicators (RSI, MACD) now render as a translucent overlay at the bottom 30% of the price area — like TradingView's same-pane mode — instead of a separate window below the chart. `layout.paneH` is always 0.
+3. **Pane indicators drawn INSIDE the chart.** *(Updated in v2.9.0: pane indicators now get a dedicated section inside the chart below the price area — no translucent overlay on the candles.)* `layout.paneH` holds the section height (0 when no pane indicator is active).
 
 4. **Deep settings for drawing tools.** The drawing properties panel now has a ⚙ gear icon. Clicking it opens a settings card with Color, Line Width, plus any custom-tool `defaultStyle` fields. On save, the tool's `onSettings(drawing, settings)` hook fires.
 
@@ -500,7 +511,7 @@ The library ships with **NO built-in indicators**. Register your own via `addInd
 chart.addIndicator({
   id: 'mySMA',                  // unique id
   label: 'My SMA',              // display label
-  type: 'overlay',              // 'overlay' | 'pane' | 'volume'
+  type: 'overlay',              // 'overlay' (on candles) | 'pane' (own section below price) | 'volume'
   color: '#2962ff',             // color used in legend/cards
   settings: { period: 20 },     // default settings (cloned per instance)
   calculate: function (candles, settings) {

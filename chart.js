@@ -14,6 +14,19 @@
  *   - Crosshair, current price line, OHLC legend
  *   - Clipping for all chart areas (no overflow)
  *
+ * v2.9.0 — Dedicated pane section:
+ *   - Pane indicators (RSI/MACD) now render in their own DEDICATED SECTION
+ *     inside the chart, carved out below the price area (TradingView-style
+ *     oscillator panes) — no longer a translucent layer on top of the candles.
+ *     The price area shrinks to make room; candles stay fully visible.
+ *   - The section has its own scale (autoScale → paneScale) with labels in the
+ *     right axis strip, its own grid + separator, and SHARES the time axis so
+ *     panning/zooming stay perfectly smooth.
+ *   - The section reserves/frees itself automatically on addIndicator /
+ *     removeIndicator / setIndicatorVisible (pane type).
+ *   - Height: ~24% of chart height, clamped 80–200px. helpers.paneToY() maps
+ *     into the section; def.getRange() can pin the scale (RSI 0..100).
+ *
  * v2.8.0 — Stability & Signals:
  *   - Custom indicator render()/calculate() are SANDBOXED (per-indicator
  *     save/restore + try/catch): a buggy indicator can no longer leak canvas
@@ -49,7 +62,7 @@
 'use strict';
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.8.0';
+const VERSION = '2.9.0';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 
 /* ============================ THEME ========================================= */
@@ -1083,7 +1096,14 @@ class TradingChart {
   // Toggle indicator visibility
   setIndicatorVisible(id, visible) {
     const s = this.indicatorStates.get(id);
-    if (s) { s.visible = visible; }
+    if (s) {
+      s.visible = visible;
+      // v2.9.0: pane indicators live in a dedicated section — reserve/free it
+      if (s.def && s.def.type === 'pane') {
+        this.updateLayout();
+        this.autoScale();
+      }
+    }
   }
   isIndicatorVisible(id) {
     const s = this.indicatorStates.get(id);
@@ -1545,39 +1565,53 @@ class TradingChart {
 
     const paneTop = this.layout.toolbarH;
     const bottomStart = this.H - this.layout.statusH - this.layout.timeAxisH;
-    // HEADLESS v2.6.0: pane indicators (RSI/MACD) are drawn INSIDE the main chart
-    // as an overlay at the bottom (like TradingView's same-pane mode) — no separate
-    // window below the chart.
+    // v2.9.0: pane indicators (RSI/MACD) get a DEDICATED SECTION inside the chart —
+    // carved out below the price area, TradingView-style. The price area SHRINKS to
+    // make room; nothing is ever overlaid on top of the candles (the v2.6.0
+    // translucent overlay mode is gone). The section shares the time axis, so
+    // panning/zooming stay perfectly smooth.
     let hasPane = false, hasVolume = false;
     for (const id of this.activeIndicators) {
       const state = this.indicatorStates.get(id);
       if (!state || !state.def) continue;
-      if (state.def.type === 'pane') hasPane = true;
+      if (state.def.type === 'pane' && state.visible !== false) hasPane = true;
       else if (state.def.type === 'volume') hasVolume = true;
     }
-    this.layout.paneH = 0;  // no separate pane window — overlay instead
+    // Section height: ~24% of the chart height, clamped for usability
+    let paneH = 0;
+    if (hasPane) {
+      const usableH = bottomStart - (paneTop + 4);
+      paneH = Math.max(80, Math.min(200, Math.round(usableH * 0.24)));
+    }
+    this.layout.paneH = paneH;
     const volH = hasVolume ? this.layout.volumeH : 0;
 
     this.chartLeft = this.layout.leftPad;
     this.chartRight = this.W - this.layout.priceAxisW;
     this.chartTop = paneTop + 4;
-    this.chartBottom = bottomStart - this.layout.paneH - (this.layout.paneH > 0 ? this.layout.gap : 0);
+    this.chartBottom = bottomStart;   // all sections live inside [chartTop, chartBottom]
 
-    this.volTop = this.chartBottom - volH;
+    // Bottom-up layout: volume hugs the time axis, the pane section sits above
+    // it, and the price area takes whatever remains.
     this.volBottom = this.chartBottom - 4;
-    this.priceTop = this.chartTop;
-    this.priceBottom = this.volTop - 4;
-
-    if (hasPane) {
-      this.paneLeft = this.chartLeft;
-      this.paneRight = this.chartRight;
-      this.paneTop = bottomStart - this.layout.paneH;
-      this.paneBottom = bottomStart;
+    this.volTop = this.volBottom - volH;
+    if (paneH > 0) {
+      this.paneBottom = this.volTop - 4;
+      this.paneTop = this.paneBottom - paneH;
+      this.priceBottom = this.paneTop - this.layout.gap;
+    } else {
+      this.paneTop = 0;
+      this.paneBottom = 0;
+      this.priceBottom = this.volTop - 4;
     }
+    this.priceTop = this.chartTop;
 
     // Update scale heights
     this.priceScale.setHeight(this.priceBottom - this.priceTop);
     this.volScale.setHeight(this.volBottom - this.volTop);
+    // Keep the pane scale in sync between updateLayout() and the next autoScale()
+    // (e.g. after a window resize, which calls updateLayout() only)
+    if (paneH > 0 && this.paneScale) this.paneScale.setHeight(paneH);
   }
 
   /* --------------------------- Events ------------------------------------ */
@@ -2352,8 +2386,8 @@ class TradingChart {
       this.volScale.rebuildMarks();
     }
 
-    // HEADLESS v2.6.0: pane scale based on the FIRST active pane-type indicator.
-    // The pane overlay region is the bottom 30% of the price area.
+    // HEADLESS v2.9.0: pane scale for the DEDICATED in-chart section (see
+    // updateLayout). Based on the FIRST active visible pane-type indicator.
     let paneId = null;
     for (const id of this.activeIndicators) {
       const state = this.indicatorStates.get(id);
@@ -2362,10 +2396,10 @@ class TradingChart {
         break;
       }
     }
-    if (paneId) {
+    if (paneId && this.layout.paneH > 0 && this.paneBottom > this.paneTop) {
       const state = this.indicatorStates.get(paneId);
       const values = this.indCache[paneId];
-      const overlayH = Math.round((this.priceBottom - this.priceTop) * 0.30);
+      const overlayH = this.paneBottom - this.paneTop;   // v2.9.0: dedicated section height
       let pMin, pMax;
       if (typeof state.def.getRange === 'function') {
         try {
@@ -3146,29 +3180,26 @@ class TradingChart {
     ctx.restore();
   }
 
-  /* --------------------------- Pane (custom pane indicators) ------------- */
-  // v2.6.0: Pane indicators are drawn INSIDE the main chart as an overlay at the
-  // bottom of the price area (not in a separate window below the chart).
-  // The overlay region is the bottom 30% of the price area, with a translucent
-  // background so candles remain visible behind it. Pane scaling is set up in
-  // autoScale() based on def.getRange() or auto-range from values.
+  /* --------------------------- Pane (dedicated in-chart section) ---------- */
+  // v2.9.0: Pane indicators (RSI/MACD) render in a DEDICATED SECTION inside the
+  // chart, carved out below the price area by updateLayout() — like TradingView's
+  // oscillator panes. The price area shrinks to make room; candles are NEVER
+  // covered (the v2.6.0 translucent overlay is gone). The section has its own
+  // scale (autoScale → paneScale), grid, separator and axis labels, and shares
+  // the time axis with the price area so panning/zooming stay smooth.
   drawPane() {
-    // Find the first active, visible pane-type indicator
-    let paneId = null;
+    if (!this.layout.paneH || !this.paneScale || !(this.paneBottom > this.paneTop)) return;
+    // Any visible pane indicator?
+    let hasVisible = false;
     for (const id of this.activeIndicators) {
       const state = this.indicatorStates.get(id);
-      if (state && state.def && state.def.type === 'pane' && state.visible !== false) {
-        paneId = id;
-        break;
-      }
+      if (state && state.def && state.def.type === 'pane' && state.visible !== false) { hasVisible = true; break; }
     }
-    if (!paneId || !this.paneScale) return;
+    if (!hasVisible) return;
 
     const ctx = this.ctx;
-    // Overlay region: bottom 30% of the PRICE area (inside the chart)
-    const overlayH = Math.round((this.priceBottom - this.priceTop) * 0.30);
-    const top = this.priceBottom - overlayH;
-    const bot = this.priceBottom;
+    const top = this.paneTop;
+    const bot = this.paneBottom;
     const left = this.chartLeft;
     const right = this.chartRight;
     const firstIdx = Math.max(0, Math.floor(this.xToIndex(this.chartLeft)));
@@ -3176,22 +3207,24 @@ class TradingChart {
 
     ctx.save();
 
-    // Translucent backdrop so candles behind are dimmed but still visible
-    ctx.fillStyle = this.theme.panelBg;
-    ctx.globalAlpha = 0.75;
+    // Solid section background — a real pane, NOT an overlay over the candles
+    ctx.fillStyle = this.theme.bg;
     ctx.fillRect(left, top, right - left, bot - top);
-    ctx.globalAlpha = 1;
 
-    // Separator line at the top of the overlay
-    ctx.strokeStyle = this.theme.axisBorder;
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(left, Math.floor(top) + 0.5);
-    ctx.lineTo(right, Math.floor(top) + 0.5);
-    ctx.stroke();
-
-    // Grid (pane scale marks within the overlay)
+    // Vertical time grid lines continue through the section (visual continuity)
     ctx.strokeStyle = this.theme.grid;
+    ctx.lineWidth = 1;
+    const timeMarks = this.getTimeMarks();
+    for (const m of timeMarks) {
+      const x = this.indexToX(m.index);
+      if (x < left || x > right) continue;
+      ctx.beginPath();
+      ctx.moveTo(Math.floor(x) + 0.5, top);
+      ctx.lineTo(Math.floor(x) + 0.5, bot);
+      ctx.stroke();
+    }
+
+    // Horizontal grid (pane scale marks)
     const pmarks = this.paneScale.marks();
     for (const m of pmarks) {
       const y = top + m.coord;
@@ -3202,13 +3235,12 @@ class TradingChart {
       ctx.stroke();
     }
 
-    // Clip to overlay region and render each active pane indicator
+    // Clip to the section and render each active pane indicator
     ctx.beginPath();
     ctx.rect(left, top, right - left, bot - top);
     ctx.clip();
 
     const helpers = this._indicatorHelpers(firstIdx, lastIdx);
-    // v2.6.0: Override the pane region so paneToY maps into the in-chart overlay
     helpers._paneRegion.top = top;
     helpers._paneRegion.bottom = bot;
     helpers.paneTop = top;
@@ -3224,17 +3256,7 @@ class TradingChart {
     }
     ctx.restore();
 
-    // Right-side value labels for the pane scale (inside the overlay)
-    ctx.font = '9px -apple-system, Segoe UI, Roboto, sans-serif';
-    ctx.fillStyle = this.theme.textDim;
-    ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
-    for (const m of pmarks) {
-      const y = top + m.coord;
-      if (y < top + 6 || y > bot - 4) continue;
-      ctx.fillText(m.label, right - ctx.measureText(m.label).width - 4, y);
-    }
-
-    // Indicator labels inside the overlay (top-left), stacked
+    // Indicator labels inside the section (top-left), stacked
     ctx.font = '11px -apple-system, Segoe UI, Roboto, sans-serif';
     ctx.textBaseline = 'top';
     const paneIdx = this.crosshairIndex !== null ?
@@ -3966,6 +3988,16 @@ class TradingChart {
       const y = this.priceTop + m.coord;
       if (y < this.priceTop - 1 || y > this.priceBottom + 1) continue;
       ctx.fillText(m.label, this.chartRight + 6, Math.floor(y));
+    }
+
+    // v2.9.0: pane section scale labels — same axis strip, beside the section
+    if (this.layout.paneH > 0 && this.paneScale && this.paneBottom > this.paneTop) {
+      ctx.fillStyle = this.theme.axisText;
+      for (const m of this.paneScale.marks()) {
+        const y = this.paneTop + m.coord;
+        if (y < this.paneTop + 7 || y > this.paneBottom - 5) continue;
+        ctx.fillText(m.label, this.chartRight + 6, Math.floor(y));
+      }
     }
   }
 
