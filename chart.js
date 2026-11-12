@@ -14,6 +14,27 @@
  *   - Crosshair, current price line, OHLC legend
  *   - Clipping for all chart areas (no overflow)
  *
+ * v2.13.0 — Multi-pane + countdown:
+ *   - MULTI-PANE: each pane-type indicator (RSI, MACD, Stoch, ...) gets its
+ *     OWN small window below the price area — its own background, grid,
+ *     scale, mini price-axis labels, separator, and grab handle. They are
+ *     NOT overlaid on each other. The price area shrinks to fit ALL panes
+ *     (guaranteed ≥120px); each pane is clamped to [60, 200]px. All panes
+ *     share the time axis + the offscreen-cache pipeline so panning/zooming
+ *     stay smooth. Resizing is per-pane (drag the divider above pane[i] to
+ *     resize only pane[i]; double-click resets just that pane).
+ *     API: setPaneHeight(paneId, h) | setPaneHeight(h) | resetPaneHeight(id)
+ *          getPaneHeight() → array of {id, height, auto, userValue}
+ *   - COUNTDOWN: a 2-digit number that floats just to the right of the
+ *     forming candle, at the close-price Y level — no border, no card, no
+ *     background, just digits. Moves with the candle (X) and with the price
+ *     (Y). Counts down based on the timeframe: minutes for H1+, seconds for
+ *     sub-hourly, hours for D1+. Loop wakes up once per second (setInterval)
+ *     while enabled — zero extra CPU when disabled.
+ *     API: chart.showCountdown(bool) | chart.setCountdown({format,color,...})
+ *          constructor opt: { countdown: true | {...} }
+ *   - chart.destroy() — stops rAF + countdown interval + clears caches.
+ *
  * v2.12.0 — Resizable pane + extra hardening:
  *   - DRAG-TO-RESIZE bottom indicator section: grab the divider between the
  *     price area and the RSI/MACD section and drag it up or down — the section
@@ -110,7 +131,7 @@
 'use strict';
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.12.0';
+const VERSION = '2.13.0';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 
 /* ============================ THEME ========================================= */
@@ -895,13 +916,42 @@ class TradingChart {
     this._frameId = 0;                       // monotonic frame counter
     this._frameRebuilds = 0;                 // rebuilds done in the current frame
     this._MAX_FRAME_REBUILDS = 2;            // hard cap per frame
-    // v2.12.0: Resizable bottom pane (RSI/MACD section). null = auto (24%);
-    // a number = user-set height in CSS px. Changed by dragging the separator
-    // or via setPaneHeight(h) / resetPaneHeight(). Bounds are recomputed each
-    // layout so the price area can never collapse below ~120px.
-    this._paneHUser = null;                  // null (auto) | number (user override)
-    this._paneResize = null;                  // null | { startY, startH } while dragging
-    this._paneSepHover = false;               // separator grab-handle hovered (cursor + grip)
+    // v2.13.0: MULTI-PANE. Each pane-type indicator (RSI, MACD, ...) gets its
+    // OWN small window below the price area — its own separator, scale, grid,
+    // grab handle and mini price-axis labels — TradingView-style. _panes is
+    // rebuilt by updateLayout() in iteration order of activeIndicators; each
+    // entry is { id, top, bottom, height, userH, scale, sepHover }.
+    // _paneHUsers maps paneId → user-set height (null = auto). Dragging a
+    // separator resizes the pane BELOW it. Double-click resets that pane.
+    this._panes = [];                        // ordered list of visible pane regions
+    this._paneHUsers = {};                   // paneId → height (null/missing = auto)
+    this._paneResize = null;                  // null | { paneId, startY, startH } while dragging
+    this._paneSepHoverId = null;              // paneId whose separator is hovered (cursor + grip)
+    // v2.13.0: COUNTDOWN — a 2-digit number that floats just to the right of
+    // the forming candle, at the close-price Y level, with no border/card.
+    // Counts down based on the timeframe: minutes for H1+, seconds for sub-
+    // hourly, hours for D1+. Loop wakes up every second while enabled.
+    this._countdown = {
+      enabled: false,
+      format: 'auto',                         // 'auto' | 'mm' | 'ss' | 'hh'
+      color: null,                            // null = theme.textDim
+      fontSize: 11,
+      offsetX: 6,                             // px to the right of the candle body
+      offsetY: 0                              // px below the close price (positive = down)
+    };
+    this._countdownTimer = null;              // setInterval id (1s wakeup)
+    if (opts && opts.countdown) {
+      const cd = opts.countdown;
+      if (cd === true) this._countdown.enabled = true;
+      else if (typeof cd === 'object') {
+        this._countdown.enabled = cd.enabled !== false;
+        if (cd.format) this._countdown.format = cd.format;
+        if (cd.color) this._countdown.color = cd.color;
+        if (cd.fontSize) this._countdown.fontSize = cd.fontSize;
+        if (cd.offsetX != null) this._countdown.offsetX = cd.offsetX;
+        if (cd.offsetY != null) this._countdown.offsetY = cd.offsetY;
+      }
+    }
 
     // Layout — HEADLESS MODE (v2.0.0+)
     // The built-in toolbar has been REMOVED entirely. The library is now fully
@@ -954,7 +1004,7 @@ class TradingChart {
       base: 100
     });
 
-    this.paneScale = null;     // for RSI/MACD — set when needed
+    this.paneScale = null;     // v2.13.0: legacy — points to _panes[0].scale. Per-pane scales live in _panes[].scale.
 
     // Time tick marks
     this.timeTickMarks = new TimeTickMarks();
@@ -1044,6 +1094,8 @@ class TradingChart {
     this.computeTimeWeights();
     this.computeIndicators();
     this.autoScale();
+    // v2.13.0: if countdown was enabled in opts, start its 1s wakeup interval.
+    this._syncCountdownTimer();
   }
 
   /* ============================ PUBLIC API ================================ */
@@ -1655,45 +1707,77 @@ class TradingChart {
 
     const paneTop = this.layout.toolbarH;
     const bottomStart = this.H - this.layout.statusH - this.layout.timeAxisH;
-    // v2.9.0: pane indicators (RSI/MACD) get a DEDICATED SECTION inside the chart —
-    // carved out below the price area, TradingView-style. The price area SHRINKS to
-    // make room; nothing is ever overlaid on top of the candles (the v2.6.0
-    // translucent overlay mode is gone). The section shares the time axis, so
-    // panning/zooming stay perfectly smooth.
-    let hasPane = false, hasVolume = false;
+    // v2.13.0: MULTI-PANE. Each visible pane-type indicator gets its OWN window
+    // below the price area — stacked top-down (pane[0] hugs the price area,
+    // pane[N-1] hugs the volume). The price area shrinks to fit ALL panes;
+    // candles are NEVER covered. Each pane has its own scale, grid, separator
+    // and grab handle. Resizing one pane doesn't move the others (they're
+    // anchored to the bottom-up stack — only the price area absorbs the delta).
+    const paneIds = [];
+    let hasVolume = false;
     for (const id of this.activeIndicators) {
       const state = this.indicatorStates.get(id);
       if (!state || !state.def) continue;
-      if (state.def.type === 'pane' && state.visible !== false) hasPane = true;
+      if (state.def.type === 'pane' && state.visible !== false) paneIds.push(id);
       else if (state.def.type === 'volume') hasVolume = true;
     }
-    // Section height: ~24% of the chart height, clamped for usability.
-    // v2.12.0: if the user has dragged the separator (or called setPaneHeight),
-    // their value wins — clamped to safe bounds computed from the live layout
-    // so the price area can never collapse below ~120px and the pane can't
-    // grow past ~70% of the available height.
+    const N = paneIds.length;
+    const hasPane = N > 0;
+
+    // Sync the _panes array with paneIds (preserve user-set heights + scales
+    // across layout recalcs; drop entries for indicators no longer active).
+    const prevById = new Map();
+    for (const p of this._panes) prevById.set(p.id, p);
+    this._panes = paneIds.map(id => {
+      const prev = prevById.get(id);
+      const userH = this._paneHUsers[id];
+      return {
+        id: id,
+        top: 0, bottom: 0, height: 0,
+        userH: (userH == null || !isFinite(userH)) ? null : userH,
+        scale: (prev && prev.scale) || null,
+        sepHover: false
+      };
+    });
+    // Prune any user-height overrides for indicators that are no longer active
+    // (so re-adding one later starts from the auto height, not a stale value).
+    for (const k of Object.keys(this._paneHUsers)) {
+      if (!paneIds.includes(k)) delete this._paneHUsers[k];
+    }
+
+    // Per-pane height: user override wins, else auto. Auto is computed so the
+    // TOTAL pane stack stays within ~24% of usableH, divided equally among N
+    // panes (each clamped 60–200). The price area is guaranteed ≥120px.
     const MIN_PANE_H = 60;
     const MIN_PRICE_H = 120;
-    let paneH = 0;
-    if (hasPane) {
-      const usableH = bottomStart - (paneTop + 4);
-      const maxPaneH = Math.max(MIN_PANE_H, usableH - MIN_PRICE_H);
-      if (this._paneHUser != null && isFinite(this._paneHUser)) {
-        paneH = Math.max(MIN_PANE_H, Math.min(maxPaneH, Math.round(this._paneHUser)));
-        // If the user value is now out of bounds (e.g. window shrank), snap it
-        // back into range so the next drag starts from a valid value.
-        this._paneHUser = paneH;
+    const usableH = bottomStart - (paneTop + 4);
+    const maxTotalPaneH = Math.max(MIN_PANE_H, usableH - MIN_PRICE_H);
+    const autoEach = hasPane
+      ? Math.max(MIN_PANE_H, Math.min(200, Math.round((usableH * 0.24) / N)))
+      : 0;
+    let paneTotalH = 0;
+    for (const p of this._panes) {
+      let h;
+      if (p.userH != null) {
+        h = Math.max(MIN_PANE_H, Math.min(200, Math.round(p.userH)));
+        p.userH = h;   // snap into range
       } else {
-        const auto = Math.max(80, Math.min(200, Math.round(usableH * 0.24)));
-        paneH = Math.min(auto, maxPaneH);
+        h = autoEach;
       }
-    } else {
-      // No pane indicator visible → drop any user override so the next time a
-      // pane indicator is added, it starts from the auto height, not a stale
-      // value from a previous session.
-      this._paneHUser = null;
+      p.height = h;
+      paneTotalH += h;
     }
-    this.layout.paneH = paneH;
+    // If the total exceeds the budget (many user-set tall panes), scale them
+    // down proportionally — never collapse the price area below MIN_PRICE_H.
+    if (paneTotalH > maxTotalPaneH && N > 0) {
+      const scale = maxTotalPaneH / paneTotalH;
+      paneTotalH = 0;
+      for (const p of this._panes) {
+        p.height = Math.max(MIN_PANE_H, Math.round(p.height * scale));
+        paneTotalH += p.height;
+      }
+    }
+    this.layout.paneH = paneTotalH;    // legacy: total pane stack height
     const volH = hasVolume ? this.layout.volumeH : 0;
 
     this.chartLeft = this.layout.leftPad;
@@ -1701,13 +1785,21 @@ class TradingChart {
     this.chartTop = paneTop + 4;
     this.chartBottom = bottomStart;   // all sections live inside [chartTop, chartBottom]
 
-    // Bottom-up layout: volume hugs the time axis, the pane section sits above
-    // it, and the price area takes whatever remains.
+    // Bottom-up layout: volume hugs the time axis, panes stack above it
+    // (pane[N-1] at the bottom, pane[0] at the top, just below the price area).
     this.volBottom = this.chartBottom - 4;
     this.volTop = this.volBottom - volH;
-    if (paneH > 0) {
-      this.paneBottom = this.volTop - 4;
-      this.paneTop = this.paneBottom - paneH;
+    let cursor = this.volTop - 4;   // bottom of the pane stack
+    if (N > 0) {
+      // Place panes from LAST to FIRST so pane[0] ends up at the top.
+      for (let i = N - 1; i >= 0; i--) {
+        const p = this._panes[i];
+        p.bottom = cursor;
+        p.top = p.bottom - p.height;
+        cursor = p.top - 4;   // 4px gap between panes
+      }
+      this.paneTop = this._panes[0].top;        // legacy: top of pane stack
+      this.paneBottom = this._panes[N - 1].bottom;  // legacy: bottom of pane stack
       this.priceBottom = this.paneTop - this.layout.gap;
     } else {
       this.paneTop = 0;
@@ -1716,12 +1808,9 @@ class TradingChart {
     }
     this.priceTop = this.chartTop;
 
-    // v2.12.0: INTEGER-SNAP every layout edge. Sub-pixel boundaries (e.g.
-    // chartBottom = 423.5 after a fractional devicePixelRatio calculation, or
-    // paneTop = 311.4 when barSpacing produces fractional offsets) make the
-    // browser anti-alias the 1px separator differently each frame, which the
-    // eye perceives as a faint vibration. Flooring all edges to whole CSS
-    // pixels kills this permanently with zero visual cost.
+    // v2.12.0: INTEGER-SNAP every layout edge. Sub-pixel boundaries make the
+    // browser anti-alias the 1px separator differently each frame, perceived
+    // as a faint vibration. Flooring kills it permanently.
     this.chartLeft   = Math.floor(this.chartLeft);
     this.chartRight  = Math.floor(this.chartRight);
     this.chartTop    = Math.floor(this.chartTop);
@@ -1732,13 +1821,22 @@ class TradingChart {
     this.paneBottom  = Math.floor(this.paneBottom);
     this.volTop      = Math.floor(this.volTop);
     this.volBottom   = Math.floor(this.volBottom);
+    for (const p of this._panes) {
+      p.top = Math.floor(p.top);
+      p.bottom = Math.floor(p.bottom);
+      p.height = p.bottom - p.top;
+    }
 
     // Update scale heights
     this.priceScale.setHeight(this.priceBottom - this.priceTop);
     this.volScale.setHeight(this.volBottom - this.volTop);
-    // Keep the pane scale in sync between updateLayout() and the next autoScale()
-    // (e.g. after a window resize, which calls updateLayout() only)
-    if (paneH > 0 && this.paneScale) this.paneScale.setHeight(paneH);
+    // Keep each pane's scale height in sync (so a window resize, which calls
+    // only updateLayout, doesn't leave a stale scale height on the next render).
+    for (const p of this._panes) {
+      if (p.scale) p.scale.setHeight(p.height);
+    }
+    // Legacy: this.paneScale points to _panes[0].scale (set by autoScale).
+    this.paneScale = (N > 0 && this._panes[0].scale) ? this._panes[0].scale : null;
   }
 
   /* --------------------------- Events ------------------------------------ */
@@ -1996,31 +2094,30 @@ class TradingChart {
       }
     }
 
-    // v2.12.0: Pane separator hover state — drives the cursor style and the
-    // little grip handle highlight. Updated every move; cheap.
-    this._paneSepHover = (this.activeTool === 'cursor' && !this._paneResize &&
-                          this._hitPaneSeparator(x, y));
-    if (this._paneResize || this._paneSepHover) {
+    // v2.13.0: Pane separator hover state — drives the cursor style and the
+    // grip handle highlight for whichever pane's divider the cursor is over.
+    this._paneSepHoverId = (this.activeTool === 'cursor' && !this._paneResize) ?
+                            this._hitPaneSeparator(x, y) : null;
+    if (this._paneResize || this._paneSepHoverId != null) {
       try { this.canvas.style.cursor = 'ns-resize'; } catch (_) {}
     } else if (this.activeTool === 'cursor') {
       try { this.canvas.style.cursor = ''; } catch (_) {}
     }
 
-    // v2.12.0: Pane separator drag — handle BEFORE everything else so the
-    // divider doesn't fight pan/drawing handlers. Dragging DOWN grows y, which
-    // means the separator moves DOWN, which means the pane SHRINKS (its top
-    // edge moves toward its bottom edge). newH = startH - dy.
+    // v2.13.0: Per-pane separator drag — handle BEFORE everything else so the
+    // divider doesn't fight pan/drawing handlers. Dragging the divider above
+    // pane[i] DOWN grows y, which moves the separator DOWN, which SHRINKS
+    // pane[i] (its top edge moves toward its bottom edge). newH = startH - dy.
+    // Only THIS pane's height changes; the other panes (and the volume) stay
+    // put — the price area absorbs the delta.
     if (this._paneResize) {
       const dy = y - this._paneResize.startY;
       const newH = this._paneResize.startH - dy;
-      // Use the same clamping as updateLayout: [MIN_PANE_H, maxPaneH].
-      const bottomStart = this.H - this.layout.statusH - this.layout.timeAxisH;
-      const usableH = bottomStart - (this.layout.toolbarH + 4);
-      const MIN_PANE_H = 60, MIN_PRICE_H = 120;
-      const maxPaneH = Math.max(MIN_PANE_H, usableH - MIN_PRICE_H);
-      const clamped = Math.max(MIN_PANE_H, Math.min(maxPaneH, Math.round(newH)));
-      if (clamped !== this._paneHUser) {
-        this._paneHUser = clamped;
+      const MIN_PANE_H = 60, MAX_PANE_H = 200;
+      const clamped = Math.max(MIN_PANE_H, Math.min(MAX_PANE_H, Math.round(newH)));
+      const prev = this._paneHUsers[this._paneResize.paneId];
+      if (clamped !== prev) {
+        this._paneHUsers[this._paneResize.paneId] = clamped;
         this.updateLayout();
         this.autoScale();
         this.invalidate();
@@ -2263,17 +2360,23 @@ class TradingChart {
         this.dropdown = null; return;
       }
     }
-    // v2.12.0: Pane separator resize — takes priority over pan so dragging the
+    // v2.13.0: Pane separator resize — takes priority over pan so dragging a
     // divider doesn't also scroll the chart. Only the cursor tool can resize;
-    // an active drawing tool ignores the separator so clicks near it still
-    // place drawings.
-    if (this.activeTool === 'cursor' && this._hitPaneSeparator(x, y)) {
-      this._paneResize = { startY: y, startH: this.layout.paneH };
-      // Cancel any pending pan/draw state so we don't fight ourselves.
-      this.isDragging = false;
-      this._dragHandle = null;
-      this._dragWhole = null;
-      return;
+    // an active drawing tool ignores separators so clicks near them still
+    // place drawings. The divider above pane[i] resizes pane[i] only.
+    if (this.activeTool === 'cursor') {
+      const paneId = this._hitPaneSeparator(x, y);
+      if (paneId != null) {
+        const pane = this._panes.find(p => p.id === paneId);
+        if (pane) {
+          this._paneResize = { paneId: paneId, startY: y, startH: pane.height };
+          // Cancel any pending pan/draw state so we don't fight ourselves.
+          this.isDragging = false;
+          this._dragHandle = null;
+          this._dragWhole = null;
+          return;
+        }
+      }
     }
     if (this.activeTool === 'cursor') {
       if (this.inChartArea(x, y)) {
@@ -2428,14 +2531,15 @@ class TradingChart {
   // v2.10.0: double-click closes an in-progress polygon (trailing duplicate
   // vertices added by the two clicks are removed in finishDrawing()).
   onDblClick(e) {
-    // v2.12.0: double-click on the pane separator → reset to auto height.
-    // Quick and intuitive: drag to set, double-click to reset.
+    // v2.13.0: double-click on a pane separator → reset THAT pane's height
+    // to auto (other panes keep their user-set heights). Quick and intuitive.
     const r = this.canvas.getBoundingClientRect();
     const x = e.clientX - r.left;
     const y = e.clientY - r.top;
-    if (this._hitPaneSeparator(x, y)) {
-      if (this._paneHUser != null) {
-        this._paneHUser = null;
+    const paneId = this._hitPaneSeparator(x, y);
+    if (paneId != null) {
+      if (this._paneHUsers[paneId] != null) {
+        delete this._paneHUsers[paneId];
         this.updateLayout();
         this.autoScale();
         this.invalidate();
@@ -2448,16 +2552,19 @@ class TradingChart {
     }
   }
 
-  // v2.12.0: hit-test for the pane separator grab handle. Returns true when a
-  // pane is currently shown and (x, y) is within ±6 CSS pixels of the separator
-  // line (this.paneTop), across the full canvas width. The separator sits
-  // between the price area and the bottom indicator section.
+  // v2.13.0: hit-test for ANY pane separator. Returns the paneId whose
+  // separator (top edge) is within ±6 CSS pixels of (x, y), or null. Each pane
+  // has its own divider at its top edge; the topmost pane's divider sits
+  // between the price area and pane[0], the next between pane[0] and pane[1],
+  // etc. Dragging a divider resizes the pane BELOW it.
   _hitPaneSeparator(x, y) {
-    if (!this.layout.paneH || this.layout.paneH <= 0) return false;
-    if (!(this.paneBottom > this.paneTop)) return false;
-    if (y < this.paneTop - 6 || y > this.paneTop + 6) return false;
-    if (x < 0 || x > this.W) return false;
-    return true;
+    if (this._panes.length === 0) return null;
+    if (x < 0 || x > this.W) return null;
+    for (const pane of this._panes) {
+      if (y < pane.top - 6 || y > pane.top + 6) continue;
+      return pane.id;
+    }
+    return null;
   }
 
   onKeyDown(e) {
@@ -2728,20 +2835,13 @@ class TradingChart {
       this.volScale.rebuildMarks();
     }
 
-    // HEADLESS v2.9.0: pane scale for the DEDICATED in-chart section (see
-    // updateLayout). Based on the FIRST active visible pane-type indicator.
-    let paneId = null;
-    for (const id of this.activeIndicators) {
-      const state = this.indicatorStates.get(id);
-      if (state && state.def && state.def.type === 'pane' && state.visible !== false) {
-        paneId = id;
-        break;
-      }
-    }
-    if (paneId && this.layout.paneH > 0 && this.paneBottom > this.paneTop) {
-      const state = this.indicatorStates.get(paneId);
-      const values = this.indCache[paneId];
-      const overlayH = this.paneBottom - this.paneTop;   // v2.9.0: dedicated section height
+    // HEADLESS v2.13.0: MULTI-PANE — each pane indicator gets its OWN scale,
+    // built from THAT indicator's values + getRange(). All panes share the
+    // time axis with the price area (panning/zooming stay smooth).
+    for (const pane of this._panes) {
+      const state = this.indicatorStates.get(pane.id);
+      if (!state || !state.def) continue;
+      const values = this.indCache[pane.id];
       let pMin, pMax;
       if (typeof state.def.getRange === 'function') {
         try {
@@ -2764,14 +2864,16 @@ class TradingChart {
       if (!isFinite(pMin)) { pMin = -1; pMax = 1; }
       if (pMin === pMax) { pMin -= 1; pMax += 1; }
       const pad = (pMax - pMin) * 0.1;
-      this.paneScale = new PriceScale({scaleMargins: {top: 0.12, bottom: 0.08}, base: 100});
-      this.paneScale.setHeight(overlayH);
-      this.paneScale.setRange(pMin - pad, pMax + pad);
-      this.paneScale.setFormatter(new PriceFormatter(100, 1));
-      this.paneScale.rebuildMarks();
-    } else {
-      this.paneScale = null;
+      if (!pane.scale) {
+        pane.scale = new PriceScale({scaleMargins: {top: 0.12, bottom: 0.08}, base: 100});
+      }
+      pane.scale.setHeight(pane.height || 100);
+      pane.scale.setRange(pMin - pad, pMax + pad);
+      pane.scale.setFormatter(new PriceFormatter(100, 1));
+      pane.scale.rebuildMarks();
     }
+    // Legacy: this.paneScale points to _panes[0].scale (or null if no panes).
+    this.paneScale = (this._panes.length > 0 && this._panes[0].scale) ? this._panes[0].scale : null;
   }
 
   /* --------------------------- Indicator Cache --------------------------- */
@@ -2954,8 +3056,15 @@ class TradingChart {
   _indicatorStamp(id, state) {
     const pr = this.priceScale && this.priceScale.priceRange();
     const range = pr ? (pr.min + '~' + pr.max) : 'x';
-    const ps = this.paneScale;
+    // v2.13.0: per-pane scale + region. Look up the pane for this indicator
+    // so a pane indicator's cache rebuilds when ITS pane geometry/range
+    // changes — not when the legacy this.paneScale (which now points to
+    // _panes[0].scale) changes for an unrelated pane.
+    const pane = this._panes.find(p => p.id === id);
+    const ps = pane ? pane.scale : this.paneScale;
     const ppr = ps && ps.priceRange() ? (ps.priceRange().min + '~' + ps.priceRange().max) : 'x';
+    const paneTop = pane ? pane.top : (this.paneTop || 0);
+    const paneBottom = pane ? pane.bottom : (this.paneBottom || 0);
     const N = this.sim.candles.length;
     const last = N ? this.sim.candles[N - 1] : null;
     // v2.12.0: safe settings serialization. JSON.stringify throws on circular
@@ -2983,7 +3092,7 @@ class TradingChart {
       Math.round(this.rightOffset * 100) / 100,
       Math.round(this.W), Math.round(this.H), Math.round(this.dpr * 100) / 100,
       Math.round(this.priceTop), Math.round(this.priceBottom),
-      Math.round(this.paneTop || 0), Math.round(this.paneBottom || 0),
+      Math.round(paneTop), Math.round(paneBottom),
       Math.round(this.chartLeft), Math.round(this.chartRight),
       range, ppr,
       state.visible !== false ? 1 : 0,
@@ -3035,40 +3144,111 @@ class TradingChart {
   // Public alias — safe to call from user code / framework integrations.
   invalidateScene() { this._invalidateScene(); }
 
-  /* ---------- v2.12.0: Resizable pane public API ---------- */
-  // Set the bottom indicator section height in CSS pixels. Pass null to revert
-  // to the auto height (~24% of the chart, clamped 80–200). The value is
-  // always clamped to safe bounds on the next updateLayout() so the price area
-  // never collapses below ~120px. Has no effect when no pane indicator is
-  // currently visible (the section isn't shown) — the value is remembered and
-  // applies as soon as a pane indicator is added.
-  setPaneHeight(h) {
-    if (h == null || (typeof h === 'number' && isFinite(h))) {
-      this._paneHUser = (h == null) ? null : Math.round(h);
-      this.updateLayout();
-      this.autoScale();
-      this.invalidate();
+  /* ---------- v2.13.0: Multi-pane resizable API ---------- */
+  // Two calling conventions:
+  //   setPaneHeight(h)            → set height for ALL panes (legacy-friendly)
+  //   setPaneHeight(paneId, h)    → set height for ONE pane (paneId is the
+  //                                 indicator id, e.g. 'rsi' / 'macd')
+  // Pass null for h to revert that pane (or all panes) to the auto height.
+  // The value is clamped to [60, 200] on the next updateLayout(); the price
+  // area is guaranteed ≥120px regardless of how many panes are tall.
+  setPaneHeight(paneIdOrH, maybeH) {
+    let paneId, h;
+    if (typeof paneIdOrH === 'string') {
+      paneId = paneIdOrH;
+      h = maybeH;
+    } else {
+      h = paneIdOrH;
+      paneId = null;   // apply to all panes
     }
-    return this;
-  }
-  // Reset the pane height back to the auto default. Equivalent to
-  // setPaneHeight(null). Also reachable by double-clicking the separator.
-  resetPaneHeight() {
-    if (this._paneHUser === null) return this;
-    this._paneHUser = null;
+    if (h != null && !(typeof h === 'number' && isFinite(h))) return this;
+    const value = (h == null) ? null : Math.round(h);
+    if (paneId != null) {
+      if (value == null) delete this._paneHUsers[paneId];
+      else this._paneHUsers[paneId] = value;
+    } else {
+      // Apply to all currently-active panes
+      if (value == null) this._paneHUsers = {};
+      else for (const p of this._panes) this._paneHUsers[p.id] = value;
+    }
     this.updateLayout();
     this.autoScale();
     this.invalidate();
     return this;
   }
-  // Returns the current pane section height in CSS pixels (0 when no pane
-  // indicator is visible), and whether it's user-set or auto.
-  getPaneHeight() {
-    return {
-      height: this.layout.paneH || 0,
-      auto: this._paneHUser === null,
-      userValue: this._paneHUser
-    };
+  // Reset one pane's height (pass an id) or ALL panes (no arg) back to auto.
+  // Also reachable by double-clicking that pane's separator.
+  resetPaneHeight(paneId) {
+    if (paneId != null) {
+      if (this._paneHUsers[paneId] == null) return this;
+      delete this._paneHUsers[paneId];
+    } else {
+      if (Object.keys(this._paneHUsers).length === 0) return this;
+      this._paneHUsers = {};
+    }
+    this.updateLayout();
+    this.autoScale();
+    this.invalidate();
+    return this;
+  }
+  // Returns the current pane layout. With no arg: array of {id, height, auto,
+  // userValue} for every visible pane. With an id: that pane's info object,
+  // or null if not visible.
+  getPaneHeight(paneId) {
+    if (paneId != null) {
+      const p = this._panes.find(p => p.id === paneId);
+      if (!p) return null;
+      return { id: p.id, height: p.height, auto: p.userH == null, userValue: p.userH };
+    }
+    return this._panes.map(p => ({
+      id: p.id, height: p.height, auto: p.userH == null, userValue: p.userH
+    }));
+  }
+
+  /* ---------- v2.13.0: Countdown public API ---------- */
+  // Enable / disable / configure the floating countdown number. Accepts:
+  //   showCountdown(true | false)               → toggle on/off
+  //   setCountdown({ format, color, fontSize, offsetX, offsetY, enabled })
+  //     format:   'auto' (default) | 'mm' | 'ss' | 'hh'
+  //     color:    any CSS color string (null/omit = theme.textDim)
+  //     fontSize: number (default 11)
+  //     offsetX:  px right of the candle body (default 6)
+  //     offsetY:  px below the close price (default 0)
+  //     enabled:  boolean — same as showCountdown()
+  // While enabled, a 1-second interval wakes the render loop so the number
+  // updates precisely when the displayed value changes — no 60fps cost.
+  showCountdown(enabled) {
+    if (!this._countdown) return this;
+    this._countdown.enabled = !!enabled;
+    this._syncCountdownTimer();
+    this.invalidate();
+    return this;
+  }
+  setCountdown(opts) {
+    if (!this._countdown || !opts) return this;
+    if (opts.format != null) this._countdown.format = opts.format;
+    if (opts.color != null) this._countdown.color = opts.color;
+    if (opts.fontSize != null) this._countdown.fontSize = opts.fontSize;
+    if (opts.offsetX != null) this._countdown.offsetX = opts.offsetX;
+    if (opts.offsetY != null) this._countdown.offsetY = opts.offsetY;
+    if (opts.enabled != null) this._countdown.enabled = !!opts.enabled;
+    this._syncCountdownTimer();
+    this.invalidate();
+    return this;
+  }
+  // Internal: start/stop the 1s wakeup interval based on _countdown.enabled.
+  // The interval just calls invalidate() — the next rAF tick renders the new
+  // value. Stopped when disabled to keep the chart at zero CPU when idle.
+  _syncCountdownTimer() {
+    if (this._countdown && this._countdown.enabled && !this._countdownTimer) {
+      const self = this;
+      this._countdownTimer = setInterval(function () {
+        try { self.invalidate(); } catch (_) {}
+      }, 1000);
+    } else if ((!this._countdown || !this._countdown.enabled) && this._countdownTimer) {
+      clearInterval(this._countdownTimer);
+      this._countdownTimer = null;
+    }
   }
 
   // Build the helpers object passed to each indicator's render() function.
@@ -3425,6 +3605,7 @@ class TradingChart {
       this.drawPriceAxis();
       this.drawTimeAxis();
       this.drawCurrentPriceLine();  // After axes so the price label sits ON TOP
+      this.drawCountdown(now);     // v2.13.0: 2-digit countdown near forming candle
       this.drawCrosshair();
       this.drawLegend();
       this.drawSettingsCard();      // Settings popup (drawn last so it overlays everything)
@@ -3514,13 +3695,13 @@ class TradingChart {
       ctx.lineTo(Math.floor(x) + 0.5, this.chartBottom);
       ctx.stroke();
     }
-    // v2.12.0: Pane separator + grab handle. The divider line gets slightly
-    // brighter while hovered or dragged so the user can see it's interactive,
-    // and a small centered grip pill (TradingView-style) appears at the middle
-    // of the chart width to signal "drag me to resize the indicator section".
-    if (this.layout.paneH > 0) {
-      const sepY = Math.floor(this.paneTop) - 0.5;
-      const active = this._paneSepHover || !!this._paneResize;
+    // v2.13.0: One separator + grab handle PER pane (at each pane's top edge).
+    // Each divider is independently hoverable/draggable to resize the pane
+    // below it. The grip pill is centered on the chart width.
+    for (const pane of this._panes) {
+      const sepY = Math.floor(pane.top) - 0.5;
+      const active = (this._paneSepHoverId === pane.id) ||
+                     (this._paneResize && this._paneResize.paneId === pane.id);
       ctx.strokeStyle = active ? this.theme.axisBorder : this.theme.toolbarBorder;
       ctx.lineWidth = active ? 1.5 : 1;
       ctx.beginPath();
@@ -3529,13 +3710,11 @@ class TradingChart {
       ctx.stroke();
       ctx.lineWidth = 1;
       // Centered grip pill on the divider (only on cursor tool so it doesn't
-      // distract while drawing). v2.12.0: the default pill uses theme.textDim
-      // so it's actually visible against the dark background (the original
-      // toolbarBorder color was too close to bg and looked invisible). On
-      // hover/drag it switches to the accent color and grows slightly.
+      // distract while drawing). Default uses theme.textDim so it's visible
+      // against the dark background; on hover/drag it grows + turns accent.
       if (this.activeTool === 'cursor') {
         const gx = Math.floor(this.chartLeft + (this.chartRight - this.chartLeft) / 2);
-        const gy = Math.floor(this.paneTop);
+        const gy = Math.floor(pane.top);
         const gw = active ? 44 : 38, gh = active ? 6 : 5;
         ctx.fillStyle = active ? this.theme.accent : this.theme.textDim;
         this._roundRect(gx - gw / 2, gy - gh / 2, gw, gh, 2);
@@ -3823,87 +4002,84 @@ class TradingChart {
   // scale (autoScale → paneScale), grid, separator and axis labels, and shares
   // the time axis with the price area so panning/zooming stay smooth.
   drawPane() {
-    if (!this.layout.paneH || !this.paneScale || !(this.paneBottom > this.paneTop)) return;
-    // Any visible pane indicator?
-    let hasVisible = false;
-    for (const id of this.activeIndicators) {
-      const state = this.indicatorStates.get(id);
-      if (state && state.def && state.def.type === 'pane' && state.visible !== false) { hasVisible = true; break; }
-    }
-    if (!hasVisible) return;
+    // v2.13.0: MULTI-PANE. Each pane indicator renders in its OWN window with
+    // its own background, grid, scale, separator and label. All panes share
+    // the time axis (vertical grid lines) with the price area so panning/
+    // zooming stay perfectly smooth.
+    if (this._panes.length === 0) return;
 
     const ctx = this.ctx;
-    const top = this.paneTop;
-    const bot = this.paneBottom;
     const left = this.chartLeft;
     const right = this.chartRight;
     const firstIdx = Math.max(0, Math.floor(this.xToIndex(this.chartLeft)));
     const lastIdx = Math.min(this.sim.candles.length - 1, Math.ceil(this.xToIndex(this.chartRight)));
-
-    ctx.save();
-
-    // Solid section background — a real pane, NOT an overlay over the candles
-    ctx.fillStyle = this.theme.bg;
-    ctx.fillRect(left, top, right - left, bot - top);
-
-    // Vertical time grid lines continue through the section (visual continuity)
-    ctx.strokeStyle = this.theme.grid;
-    ctx.lineWidth = 1;
     const timeMarks = this.getTimeMarks();
-    for (const m of timeMarks) {
-      const x = this.indexToX(m.index);
-      if (x < left || x > right) continue;
-      ctx.beginPath();
-      ctx.moveTo(Math.floor(x) + 0.5, top);
-      ctx.lineTo(Math.floor(x) + 0.5, bot);
-      ctx.stroke();
-    }
-
-    // Horizontal grid (pane scale marks)
-    const pmarks = this.paneScale.marks();
-    for (const m of pmarks) {
-      const y = top + m.coord;
-      if (y < top - 1 || y > bot + 1) continue;
-      ctx.beginPath();
-      ctx.moveTo(left, Math.floor(y) + 0.5);
-      ctx.lineTo(right, Math.floor(y) + 0.5);
-      ctx.stroke();
-    }
-
-    // Clip to the section and render each active pane indicator
-    ctx.beginPath();
-    ctx.rect(left, top, right - left, bot - top);
-    ctx.clip();
-
-    const helpers = this._indicatorHelpers(firstIdx, lastIdx);
-    helpers._paneRegion.top = top;
-    helpers._paneRegion.bottom = bot;
-    helpers.paneTop = top;
-    helpers.paneBottom = bot;
-
-    for (const id of this.activeIndicators) {
-      const state = this.indicatorStates.get(id);
-      if (!state || !state.def) continue;
-      if (state.def.type !== 'pane') continue;
-      if (state.visible === false) continue;
-      if (typeof state.def.render !== 'function') continue;
-      this._safeRenderIndicator(id, state, helpers);   // v2.8.0: sandboxed
-    }
-    ctx.restore();
-
-    // Indicator labels inside the section (top-left), stacked
-    ctx.font = '11px -apple-system, Segoe UI, Roboto, sans-serif';
-    ctx.textBaseline = 'top';
     const paneIdx = this.crosshairIndex !== null ?
       clamp(Math.round(this.crosshairIndex), 0, this.sim.candles.length - 1) :
       this.sim.candles.length - 1;
-    let labelY = top + 4;
-    for (const id of this.activeIndicators) {
-      const state = this.indicatorStates.get(id);
-      if (!state || !state.def || state.def.type !== 'pane') continue;
-      const val = this._getIndicatorValueAt(id, paneIdx);
-      this._drawIndicatorLine(left + 6, labelY, id, state.def, state, val);
-      labelY += 22;
+    const helpers = this._indicatorHelpers(firstIdx, lastIdx);
+
+    for (const pane of this._panes) {
+      const state = this.indicatorStates.get(pane.id);
+      if (!state || !state.def) continue;
+      const top = pane.top;
+      const bot = pane.bottom;
+      if (!(bot > top)) continue;
+
+      ctx.save();
+      // Solid pane background — a real section, NOT an overlay over the candles
+      ctx.fillStyle = this.theme.bg;
+      ctx.fillRect(left, top, right - left, bot - top);
+
+      // Vertical time grid lines continue through this pane (visual continuity
+      // with the price area and the other panes).
+      ctx.strokeStyle = this.theme.grid;
+      ctx.lineWidth = 1;
+      for (const m of timeMarks) {
+        const x = this.indexToX(m.index);
+        if (x < left || x > right) continue;
+        ctx.beginPath();
+        ctx.moveTo(Math.floor(x) + 0.5, top);
+        ctx.lineTo(Math.floor(x) + 0.5, bot);
+        ctx.stroke();
+      }
+
+      // Horizontal grid lines from THIS pane's scale marks
+      if (pane.scale) {
+        const pmarks = pane.scale.marks();
+        for (const m of pmarks) {
+          const y = top + m.coord;
+          if (y < top - 1 || y > bot + 1) continue;
+          ctx.beginPath();
+          ctx.moveTo(left, Math.floor(y) + 0.5);
+          ctx.lineTo(right, Math.floor(y) + 0.5);
+          ctx.stroke();
+        }
+      }
+
+      // Clip to this pane and render the indicator (sandboxed).
+      ctx.beginPath();
+      ctx.rect(left, top, right - left, bot - top);
+      ctx.clip();
+
+      // Per-pane region: helpers.paneToY() maps into THIS pane. The helpers
+      // object is shared, but the mutable _paneRegion is overwritten per pane.
+      helpers._paneRegion.top = top;
+      helpers._paneRegion.bottom = bot;
+      helpers.paneTop = top;
+      helpers.paneBottom = bot;
+      helpers.paneScale = pane.scale;
+
+      if (typeof state.def.render === 'function') {
+        this._safeRenderIndicator(pane.id, state, helpers);   // v2.8.0: sandboxed
+      }
+      ctx.restore();
+
+      // Indicator label inside the pane (top-left)
+      ctx.font = '11px -apple-system, Segoe UI, Roboto, sans-serif';
+      ctx.textBaseline = 'top';
+      const val = this._getIndicatorValueAt(pane.id, paneIdx);
+      this._drawIndicatorLine(left + 6, top + 4, pane.id, state.def, state, val);
     }
   }
 
@@ -4623,6 +4799,65 @@ class TradingChart {
     ctx.textAlign = 'left';
   }
 
+  /* --------------------------- Countdown (v2.13.0) ----------------------- */
+  // A small 2-digit number that floats just to the RIGHT of the forming
+  // (last) candle, vertically aligned with its close price. No border, no
+  // card, no background — just digits. As the price moves, the number moves
+  // with it (same Y as the close); as the chart pans, it moves with the
+  // candle (same X via indexToX). The value counts down based on the
+  // timeframe: minutes remaining for H1+, seconds for sub-hourly, hours for
+  // D1+. Format is configurable via setCountdown({format: 'mm'|'ss'|'hh'|'auto'}).
+  drawCountdown(now) {
+    if (!this._countdown || !this._countdown.enabled) return;
+    const candles = this.sim.candles;
+    const N = candles.length;
+    if (N === 0) return;
+    const last = candles[N - 1];
+    if (!last || !last.time) return;
+    const tfMs = this.timeframe.ms || 60000;
+    const candleCloseSec = last.time + Math.round(tfMs / 1000);
+    const nowSec = Math.floor((now || performance.now()) / 1000);
+    let remainingSec = candleCloseSec - nowSec;
+    if (remainingSec < 0) remainingSec = 0;
+    // Pick the display unit. 'auto' chooses based on the timeframe so the
+    // displayed value fits in 2 digits and ticks smoothly through the whole
+    // candle duration. User can override with format: 'mm'/'ss'/'hh'.
+    let unit;   // 'ss' | 'mm' | 'hh'
+    if (this._countdown.format === 'auto') {
+      if (tfMs >= 24 * 3600 * 1000) unit = 'hh';        // ≥ 1 day → hours (max 24)
+      else if (tfMs >= 3600 * 1000) unit = 'mm';        // ≥ 1 hour → minutes (max 60)
+      else unit = 'ss';                                  // < 1 hour → seconds (max 60)
+    } else {
+      unit = this._countdown.format;
+    }
+    let value;
+    if (unit === 'hh') value = Math.floor(remainingSec / 3600);
+    else if (unit === 'mm') value = Math.floor(remainingSec / 60);
+    else value = remainingSec % 60;   // 'ss' → 0..59 (so it stays 2 digits)
+    // Clamp + zero-pad to exactly 2 digits
+    if (value > 99) value = 99;
+    if (value < 0) value = 0;
+    const text = (value < 10 ? '0' : '') + value;
+
+    // Position: just right of the forming candle body, at the close price Y.
+    // The chart's indexToX(lastIdx) gives the candle's CENTER; adding
+    // barSpacing/2 puts us at the right edge of its slot. +offsetX pushes us
+    // clear of the body so the number is "near, not stuck to" the candle.
+    const x = this.indexToX(N - 1) + this.barSpacing / 2 + this._countdown.offsetX;
+    const y = this.priceToY(last.close) + this._countdown.offsetY;
+    // Don't draw if the close is off-screen or the candle is off the right edge
+    if (y < this.priceTop - 6 || y > this.priceBottom + 6) return;
+    if (x < this.chartLeft - 4 || x > this.chartRight - 4) return;
+    const ctx = this.ctx;
+    ctx.save();
+    ctx.font = this._countdown.fontSize + 'px -apple-system, Segoe UI, Roboto, sans-serif';
+    ctx.fillStyle = this._countdown.color || this.theme.textDim;
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(text, Math.floor(x), Math.floor(y));
+    ctx.restore();
+  }
+
   /* --------------------------- Price Axis -------------------------------- */
   drawPriceAxis() {
     const ctx = this.ctx;
@@ -4649,12 +4884,15 @@ class TradingChart {
       ctx.fillText(m.label, this.chartRight + 6, Math.floor(y));
     }
 
-    // v2.9.0: pane section scale labels — same axis strip, beside the section
-    if (this.layout.paneH > 0 && this.paneScale && this.paneBottom > this.paneTop) {
+    // v2.13.0: Per-pane scale labels — same axis strip, beside each pane's
+    // region. Each pane has its own scale (RSI 0..100, MACD -∞..+∞, ...), so
+    // the labels in the strip change as you cross a pane boundary.
+    for (const pane of this._panes) {
+      if (!pane.scale || !(pane.bottom > pane.top)) continue;
       ctx.fillStyle = this.theme.axisText;
-      for (const m of this.paneScale.marks()) {
-        const y = this.paneTop + m.coord;
-        if (y < this.paneTop + 7 || y > this.paneBottom - 5) continue;
+      for (const m of pane.scale.marks()) {
+        const y = pane.top + m.coord;
+        if (y < pane.top + 7 || y > pane.bottom - 5) continue;
         ctx.fillText(m.label, this.chartRight + 6, Math.floor(y));
       }
     }
@@ -5526,7 +5764,12 @@ class TradingChart {
         this.toast = null;            // expired — one last repaint clears it
         this._needsRender = true;
       }
-      const continuous = !!this._momentum || !!this.toast || this._hasAnimatedIndicator();
+      // v2.13.0: countdown is a continuous condition (updates every second),
+      // but we drive it via a 1s setInterval that calls invalidate() — so we
+      // only need to keep the loop awake while the timer is active.
+      const continuous = !!this._momentum || !!this.toast ||
+                         this._hasAnimatedIndicator() ||
+                         (this._countdown && this._countdown.enabled);
       if (!continuous && !this._needsRender) return;   // idle — zero work
       // Throttle on mobile
       if (this._renderThrottleMs > 0) {
@@ -5543,6 +5786,21 @@ class TradingChart {
       }
     };
     this.rafId = requestAnimationFrame(loop);
+  }
+  // v2.13.0: Tear down the chart — stop the rAF loop, clear the countdown
+  // interval, and remove this instance from any global registries. Safe to
+  // call multiple times. Useful in SPA route changes to prevent leaks.
+  destroy() {
+    if (this.rafId) {
+      cancelAnimationFrame(this.rafId);
+      this.rafId = null;
+    }
+    if (this._countdownTimer) {
+      clearInterval(this._countdownTimer);
+      this._countdownTimer = null;
+    }
+    if (this._panes) this._panes = [];
+    if (this._indCache2) this._indCache2.clear();
   }
   // v2.4.0+: Apply momentum scrolling. Called every frame from the render loop.
   // Moves the chart by velocity * deltaTime, then applies friction. Stops when

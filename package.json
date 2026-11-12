@@ -1,6 +1,6 @@
 {
   "name": "badi-charts-v2",
-  "version": "2.12.0",
+  "version": "2.13.0",
   "description": "A lightweight, dependency-free, HEADLESS candlestick charting library built entirely with the HTML5 Canvas API. Pixel-perfect rendering, 14 drawing tools, custom indicators via API \u2014 no built-in UI, no built-in indicators.",
   "main": "chart.js",
   "module": "chart.js",

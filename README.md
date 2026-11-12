@@ -4,10 +4,50 @@
 >
 > Pixel-perfect rendering, 14 drawing tools, fully custom indicators via API — you bring the data, the UI, and the indicators. BADI-CHARTS-V2 renders the chart.
 
-[![Version](https://img.shields.io/badge/version-2.12.0-2962ff.svg)](#)
+[![Version](https://img.shields.io/badge/version-2.13.0-2962ff.svg)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-26a69a.svg)](LICENSE)
 [![No Dependencies](https://img.shields.io/badge/dependencies-zero-ff9800.svg)](#)
 [![Headless](https://img.shields.io/badge/UI-headless-9c27b0.svg)](#)
+
+---
+
+## ⚠️ What changed in v2.13.0
+
+**Multi-pane indicators + floating countdown timer.** Each pane indicator (RSI, MACD, Stoch…) now gets its OWN small window below the price area (TradingView-style) instead of all sharing one. Plus a 2-digit countdown that floats next to the forming candle.
+
+1. **Multiple pane indicators, each in its own window.** Add `chart.addIndicator({type:'pane', ...})` for RSI, then again for MACD — they render in **separate stacked panes**, each with its own background, grid, scale, mini price-axis labels, separator, and grab handle. They are NOT overlaid on each other. The price area shrinks to fit all panes (guaranteed ≥120px); each pane is clamped to [60, 200]px. Panning/zooming stays smooth — all panes share the time axis and the offscreen-cache pipeline.
+   ```js
+   chart.addIndicator({ id:'rsi',  type:'pane', ... });   // pane 0
+   chart.addIndicator({ id:'macd', type:'pane', ... });   // pane 1 (its own window)
+   chart.addIndicator({ id:'stoch',type:'pane', ... });   // pane 2 (its own window)
+   ```
+
+2. **Per-pane resizing.** Each pane has its own divider; drag the one above pane[i] to resize **only** pane[i] — the others stay put, the price area absorbs the delta. Double-click a divider to reset just that pane to auto height.
+   ```js
+   chart.setPaneHeight('rsi', 180);   // resize one pane
+   chart.setPaneHeight(140);          // resize ALL panes (legacy form)
+   chart.resetPaneHeight('macd');     // reset one pane
+   chart.getPaneHeight();             // → array of {id, height, auto, userValue}
+   chart.getPaneHeight('rsi');        // → that pane's info (or null)
+   ```
+
+3. **Floating countdown timer (per timeframe).** A small **2-digit** number that floats just to the right of the forming (last) candle, at the close-price Y level — no border, no card, no background, just digits. As price moves, the number moves with it (same Y); as the chart pans, it moves with the candle (same X). It counts down based on the timeframe:
+   - **H1 and up** → minutes remaining (60 → 00)
+   - **sub-hourly** (M1, M5, M15) → seconds remaining (60 → 00)
+   - **D1 and up** → hours remaining (24 → 00)
+   ```js
+   // Constructor option:
+   new BadiCharts(canvas, { countdown: true });
+   new BadiCharts(canvas, { countdown: { format:'auto', color:'#787b86', fontSize:11, offsetX:6, offsetY:0 } });
+   // Or at runtime:
+   chart.showCountdown(true);
+   chart.setCountdown({ format: 'mm', color: '#ff9800' });
+   ```
+   The loop wakes up **once per second** (via `setInterval`, not 60fps) while the countdown is enabled — zero extra CPU when disabled.
+
+4. **`chart.destroy()`** — stops the rAF loop + countdown interval + clears the offscreen cache. Use it in SPA route changes to prevent leaks.
+
+No breaking API changes from v2.12.0. `setPaneHeight(h)` / `resetPaneHeight()` / `getPaneHeight()` still work for the single-pane case (treat it as a 1-element array).
 
 ---
 
