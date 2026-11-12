@@ -4,10 +4,36 @@
 >
 > Pixel-perfect rendering, 14 drawing tools, fully custom indicators via API — you bring the data, the UI, and the indicators. BADI-CHARTS-V2 renders the chart.
 
-[![Version](https://img.shields.io/badge/version-2.11.0-2962ff.svg)](#)
+[![Version](https://img.shields.io/badge/version-2.12.0-2962ff.svg)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-26a69a.svg)](LICENSE)
 [![No Dependencies](https://img.shields.io/badge/dependencies-zero-ff9800.svg)](#)
 [![Headless](https://img.shields.io/badge/UI-headless-9c27b0.svg)](#)
+
+---
+
+## ⚠️ What changed in v2.12.0
+
+**Resizable bottom pane + extra stability hardening.** The RSI/MACD section can now be resized by dragging its separator up/down (TradingView-style), and the render pipeline got four more layers of defense so even pathological indicator code can't shake or blank the chart.
+
+1. **Drag-to-resize pane section.** Grab the divider between the price area and the bottom indicator section and drag it up or down — the section grows or shrinks live, the price area takes whatever remains, and the pane scale + grid reflow instantly. A small centered grip pill signals "drag me"; the cursor changes to `ns-resize` over it. **Double-click the divider** to reset to the auto height (~24%). Programmatic API:
+   ```js
+   chart.setPaneHeight(180);      // CSS pixels, clamped to safe bounds
+   chart.resetPaneHeight();        // back to auto
+   chart.getPaneHeight();          // { height, auto, userValue }
+   ```
+   The price area is guaranteed a minimum of ~120px and the pane a minimum of 60px — you can't collapse the chart by dragging too far.
+
+2. **Integer-snapped layout.** Every layout edge (`chartTop`, `paneTop`, `priceBottom`, `volTop`, …) is now floored to a whole CSS pixel at the end of `updateLayout()`. Sub-pixel boundaries (common with fractional `devicePixelRatio` or odd canvas heights) made the browser anti-alias the 1px separator and grid lines slightly differently each frame, which the eye reads as a faint vibration. Whole-pixel edges kill this permanently.
+
+3. **Per-frame cache rebuild budget.** At most **2** offscreen indicator bitmaps rebuild in a single rAF tick. If many indicators all need a rebuild at once (window resize, bulk `setData()`, theme switch), the rest blit their previous cached bitmap this frame and rebuild one-per-frame over the next few ticks — instead of a single 80ms+ hitch that drops a frame. Hover/pan cost stays one `drawImage` per indicator regardless.
+
+4. **Async `calculate()` guard.** If an indicator's `calculate()` returns a Promise (because the user declared it `async` or returned a thenable), the chart now detects it, flags a clear console error — *"calculate() must be synchronous — got a Promise. Use setData() + chart.invalidate() when async data arrives."* — and refuses to feed the Promise into `render()`. Previously this would produce garbage frames and the indicator would "disappear" intermittently as the Promise resolved into stale state.
+
+5. **More user-code defenses:**
+   - **Circular settings** can no longer crash the indicator fingerprint (`JSON.stringify` in `_indicatorStamp()` is wrapped — falls back to a key-hash).
+   - **Tight price range floor** — when the visible range collapses to ~0 (one candle in view, flat market), the scale marks could flip between adjacent tick spans on every mousemove and vibrate the grid by 1px; the range is now floored to a minimum width so the mark builder picks a stable span.
+
+No breaking API changes from v2.11.0.
 
 ---
 

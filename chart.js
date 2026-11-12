@@ -14,6 +14,31 @@
  *   - Crosshair, current price line, OHLC legend
  *   - Clipping for all chart areas (no overflow)
  *
+ * v2.12.0 — Resizable pane + extra hardening:
+ *   - DRAG-TO-RESIZE bottom indicator section: grab the divider between the
+ *     price area and the RSI/MACD section and drag it up or down — the section
+ *     grows/shrinks live, the price area takes the rest. A centered grip pill
+ *     and an ns-resize cursor signal the affordance. Double-click resets to
+ *     auto. setPaneHeight(h) / resetPaneHeight() / getPaneHeight() are the
+ *     programmatic equivalents. Safe bounds (price ≥ 120px, pane ≥ 60px)
+ *     prevent collapse.
+ *   - INTEGER-SNAP layout: every chart edge (chartTop/paneTop/priceBottom/…)
+ *     is floored to a whole CSS pixel in updateLayout(). Sub-pixel boundaries
+ *     were the source of the faint 1px vibration on the separator + grid lines
+ *     on fractional-DPR displays.
+ *   - PER-FRAME CACHE REBUILD BUDGET: at most 2 offscreen indicator bitmaps
+ *     rebuild in a single rAF tick. When many indicators all need a rebuild
+ *     at once (window resize, bulk setData, theme switch), the rest blit
+ *     their previous bitmap this frame and catch up over the next few ticks —
+ *     no more 80ms+ hitch that drops a frame.
+ *   - ASYNC-CALCULATE GUARD: if calculate() returns a Promise, the chart
+ *     refuses to feed it into render() and logs a clear error. Previously this
+ *     intermittently "disappeared" the indicator as the Promise resolved into
+ *     stale state.
+ *   - Safe JSON.stringify in the indicator fingerprint (circular settings no
+ *     longer crash the cache key) + tight price-range floor (kills grid-line
+ *     vibration when only one candle is in view).
+ *
  * v2.11.0 — Render robustness (anti-jitter + anti-disappear):
  *   - RENDER-ON-DEMAND: the chart no longer repaints 60 times per second
  *     forever. It renders exactly once per change (interaction, data update,
@@ -85,7 +110,7 @@
 'use strict';
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.11.0';
+const VERSION = '2.12.0';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 
 /* ============================ THEME ========================================= */
@@ -862,6 +887,21 @@ class TradingChart {
     this._cacheHits = 0; this._cacheMisses = 0;  // debug counters
     this._momentumThreshold = 0.05; // px/ms — below this, momentum stops
     this._momentumMaxVelocity = 1.2; // px/ms cap so flicks never fly across the chart
+    // v2.12.0: Per-frame offscreen-rebuild budget — at most 2 indicators rebuild
+    // their cached bitmap in a single frame. When many indicators all need a
+    // rebuild at once (window resize, bulk data reset), the rest are deferred
+    // to subsequent frames. Without this, a single rAF tick could spend 80ms
+    // rebuilding 5+ heavy indicator layers and cause a visible hitch.
+    this._frameId = 0;                       // monotonic frame counter
+    this._frameRebuilds = 0;                 // rebuilds done in the current frame
+    this._MAX_FRAME_REBUILDS = 2;            // hard cap per frame
+    // v2.12.0: Resizable bottom pane (RSI/MACD section). null = auto (24%);
+    // a number = user-set height in CSS px. Changed by dragging the separator
+    // or via setPaneHeight(h) / resetPaneHeight(). Bounds are recomputed each
+    // layout so the price area can never collapse below ~120px.
+    this._paneHUser = null;                  // null (auto) | number (user override)
+    this._paneResize = null;                  // null | { startY, startH } while dragging
+    this._paneSepHover = false;               // separator grab-handle hovered (cursor + grip)
 
     // Layout — HEADLESS MODE (v2.0.0+)
     // The built-in toolbar has been REMOVED entirely. The library is now fully
@@ -1627,11 +1667,31 @@ class TradingChart {
       if (state.def.type === 'pane' && state.visible !== false) hasPane = true;
       else if (state.def.type === 'volume') hasVolume = true;
     }
-    // Section height: ~24% of the chart height, clamped for usability
+    // Section height: ~24% of the chart height, clamped for usability.
+    // v2.12.0: if the user has dragged the separator (or called setPaneHeight),
+    // their value wins — clamped to safe bounds computed from the live layout
+    // so the price area can never collapse below ~120px and the pane can't
+    // grow past ~70% of the available height.
+    const MIN_PANE_H = 60;
+    const MIN_PRICE_H = 120;
     let paneH = 0;
     if (hasPane) {
       const usableH = bottomStart - (paneTop + 4);
-      paneH = Math.max(80, Math.min(200, Math.round(usableH * 0.24)));
+      const maxPaneH = Math.max(MIN_PANE_H, usableH - MIN_PRICE_H);
+      if (this._paneHUser != null && isFinite(this._paneHUser)) {
+        paneH = Math.max(MIN_PANE_H, Math.min(maxPaneH, Math.round(this._paneHUser)));
+        // If the user value is now out of bounds (e.g. window shrank), snap it
+        // back into range so the next drag starts from a valid value.
+        this._paneHUser = paneH;
+      } else {
+        const auto = Math.max(80, Math.min(200, Math.round(usableH * 0.24)));
+        paneH = Math.min(auto, maxPaneH);
+      }
+    } else {
+      // No pane indicator visible → drop any user override so the next time a
+      // pane indicator is added, it starts from the auto height, not a stale
+      // value from a previous session.
+      this._paneHUser = null;
     }
     this.layout.paneH = paneH;
     const volH = hasVolume ? this.layout.volumeH : 0;
@@ -1655,6 +1715,23 @@ class TradingChart {
       this.priceBottom = this.volTop - 4;
     }
     this.priceTop = this.chartTop;
+
+    // v2.12.0: INTEGER-SNAP every layout edge. Sub-pixel boundaries (e.g.
+    // chartBottom = 423.5 after a fractional devicePixelRatio calculation, or
+    // paneTop = 311.4 when barSpacing produces fractional offsets) make the
+    // browser anti-alias the 1px separator differently each frame, which the
+    // eye perceives as a faint vibration. Flooring all edges to whole CSS
+    // pixels kills this permanently with zero visual cost.
+    this.chartLeft   = Math.floor(this.chartLeft);
+    this.chartRight  = Math.floor(this.chartRight);
+    this.chartTop    = Math.floor(this.chartTop);
+    this.chartBottom = Math.floor(this.chartBottom);
+    this.priceTop    = Math.floor(this.priceTop);
+    this.priceBottom = Math.floor(this.priceBottom);
+    this.paneTop     = Math.floor(this.paneTop);
+    this.paneBottom  = Math.floor(this.paneBottom);
+    this.volTop      = Math.floor(this.volTop);
+    this.volBottom   = Math.floor(this.volBottom);
 
     // Update scale heights
     this.priceScale.setHeight(this.priceBottom - this.priceTop);
@@ -1919,6 +1996,38 @@ class TradingChart {
       }
     }
 
+    // v2.12.0: Pane separator hover state — drives the cursor style and the
+    // little grip handle highlight. Updated every move; cheap.
+    this._paneSepHover = (this.activeTool === 'cursor' && !this._paneResize &&
+                          this._hitPaneSeparator(x, y));
+    if (this._paneResize || this._paneSepHover) {
+      try { this.canvas.style.cursor = 'ns-resize'; } catch (_) {}
+    } else if (this.activeTool === 'cursor') {
+      try { this.canvas.style.cursor = ''; } catch (_) {}
+    }
+
+    // v2.12.0: Pane separator drag — handle BEFORE everything else so the
+    // divider doesn't fight pan/drawing handlers. Dragging DOWN grows y, which
+    // means the separator moves DOWN, which means the pane SHRINKS (its top
+    // edge moves toward its bottom edge). newH = startH - dy.
+    if (this._paneResize) {
+      const dy = y - this._paneResize.startY;
+      const newH = this._paneResize.startH - dy;
+      // Use the same clamping as updateLayout: [MIN_PANE_H, maxPaneH].
+      const bottomStart = this.H - this.layout.statusH - this.layout.timeAxisH;
+      const usableH = bottomStart - (this.layout.toolbarH + 4);
+      const MIN_PANE_H = 60, MIN_PRICE_H = 120;
+      const maxPaneH = Math.max(MIN_PANE_H, usableH - MIN_PRICE_H);
+      const clamped = Math.max(MIN_PANE_H, Math.min(maxPaneH, Math.round(newH)));
+      if (clamped !== this._paneHUser) {
+        this._paneHUser = clamped;
+        this.updateLayout();
+        this.autoScale();
+        this.invalidate();
+      }
+      return;
+    }
+
     // v2.7.0: Drawing handle drag takes priority over everything else
     if (this._dragHandle) {
       this._applyHandleDrag(x, y);
@@ -2154,6 +2263,18 @@ class TradingChart {
         this.dropdown = null; return;
       }
     }
+    // v2.12.0: Pane separator resize — takes priority over pan so dragging the
+    // divider doesn't also scroll the chart. Only the cursor tool can resize;
+    // an active drawing tool ignores the separator so clicks near it still
+    // place drawings.
+    if (this.activeTool === 'cursor' && this._hitPaneSeparator(x, y)) {
+      this._paneResize = { startY: y, startH: this.layout.paneH };
+      // Cancel any pending pan/draw state so we don't fight ourselves.
+      this.isDragging = false;
+      this._dragHandle = null;
+      this._dragWhole = null;
+      return;
+    }
     if (this.activeTool === 'cursor') {
       if (this.inChartArea(x, y)) {
         // v2.7.0: Handle drag takes priority over body hit
@@ -2210,6 +2331,13 @@ class TradingChart {
   }
 
   onMouseUp() {
+    // v2.12.0: Pane separator drag end — finalize the user height and let the
+    // cursor style revert on the next mousemove.
+    if (this._paneResize) {
+      this._paneResize = null;
+      try { this.canvas.style.cursor = ''; } catch (_) {}
+      this.invalidate();
+    }
     if (this.isDragging) {
       this.isDragging = false;
       // v2.4.0+: Start momentum scrolling if the pan velocity is significant
@@ -2300,9 +2428,36 @@ class TradingChart {
   // v2.10.0: double-click closes an in-progress polygon (trailing duplicate
   // vertices added by the two clicks are removed in finishDrawing()).
   onDblClick(e) {
+    // v2.12.0: double-click on the pane separator → reset to auto height.
+    // Quick and intuitive: drag to set, double-click to reset.
+    const r = this.canvas.getBoundingClientRect();
+    const x = e.clientX - r.left;
+    const y = e.clientY - r.top;
+    if (this._hitPaneSeparator(x, y)) {
+      if (this._paneHUser != null) {
+        this._paneHUser = null;
+        this.updateLayout();
+        this.autoScale();
+        this.invalidate();
+        this.showToast('Pane height reset');
+      }
+      return;
+    }
     if (this.currentDrawing && this.currentDrawing.type === 'poly') {
       this.finishDrawing();
     }
+  }
+
+  // v2.12.0: hit-test for the pane separator grab handle. Returns true when a
+  // pane is currently shown and (x, y) is within ±6 CSS pixels of the separator
+  // line (this.paneTop), across the full canvas width. The separator sits
+  // between the price area and the bottom indicator section.
+  _hitPaneSeparator(x, y) {
+    if (!this.layout.paneH || this.layout.paneH <= 0) return false;
+    if (!(this.paneBottom > this.paneTop)) return false;
+    if (y < this.paneTop - 6 || y > this.paneTop + 6) return false;
+    if (x < 0 || x > this.W) return false;
+    return true;
   }
 
   onKeyDown(e) {
@@ -2550,6 +2705,20 @@ class TradingChart {
       max = isFinite(max) ? max + 1 : 1;
       if (min === max) { min -= 1; max += 1; }
     }
+    // v2.12.0: RANGE-FLOOR — when the visible range is extremely tight (e.g.
+    // only one candle in view, or a flat-tick market), the scale marks computed
+    // from it can flip between two adjacent tick spans on every mousemove,
+    // making the horizontal grid lines vibrate by 1px. Expand any range below
+    // 0.0001% of the midpoint to a minimum width so the mark builder picks a
+    // stable span. The candle bodies still render correctly because the scale
+    // simply has more headroom.
+    const span = max - min;
+    const mid = (max + min) / 2;
+    const minSpan = Math.max(Math.abs(mid) * 1e-6, 1e-9);
+    if (span < minSpan) {
+      min = mid - minSpan / 2;
+      max = mid + minSpan / 2;
+    }
     this.priceScale.setRange(min, max);
     this.priceScale.rebuildMarks();
 
@@ -2615,7 +2784,23 @@ class TradingChart {
       const state = this.indicatorStates.get(id);
       if (!state || !state.def || typeof state.def.calculate !== 'function') continue;
       try {
-        this.indCache[id] = state.def.calculate(candles, state.settings);
+        const result = state.def.calculate(candles, state.settings);
+        // v2.12.0: ASYNC-CALCULATE GUARD. If calculate() returns a Promise
+        // (because the user declared it `async` or returned a thenable), the
+        // chart can't await it — feeding a Promise into render() would produce
+        // garbage frames and the indicator would "disappear" intermittently
+        // as the Promise resolves into a stale state. Detect and flag once,
+        // then keep indCache[id] = null so the auto-retry path keeps probing
+        // for a synchronous result if the user fixes their code at runtime.
+        if (result && typeof result === 'object' && typeof result.then === 'function') {
+          this.indCache[id] = null;
+          const err = new Error('calculate() must be synchronous — got a Promise. Use setData() + chart.invalidate() when async data arrives.');
+          state._lastCalcError = err;
+          state._lastCalcTry = performance.now();
+          this._flagIndicatorError(id, state, err, 'calculate()');
+          continue;
+        }
+        this.indCache[id] = result;
         this._clearIndicatorError(state);   // v2.8.0: recovered
       } catch (e) {
         this.indCache[id] = null;
@@ -2666,9 +2851,15 @@ class TradingChart {
         state._lastCalcTry = now;
         try {
           const v = state.def.calculate(this.sim.candles, state.settings);
-          if (v != null) {
+          // v2.12.0: same async-Promise guard as computeIndicators() — the
+          // auto-retry path could otherwise store a Promise as the value.
+          if (v != null && !(typeof v === 'object' && typeof v.then === 'function')) {
             this.indCache[id] = v;
             this._clearIndicatorError(state);
+          } else if (v && typeof v === 'object' && typeof v.then === 'function') {
+            // Promise again — keep the cooldown so we don't spin the CPU.
+            state._lastCalcError = new Error('calculate() must be synchronous — got a Promise.');
+            this._flagIndicatorError(id, state, state._lastCalcError, 'calculate()');
           }
         } catch (e) { /* episode already logged by _flagIndicatorError */ }
       }
@@ -2699,6 +2890,14 @@ class TradingChart {
     }
 
     // ---------- per-indicator offscreen cache (v2.11.0) ----------
+    // v2.12.0: per-frame rebuild budget. If we've already rebuilt too many
+    // indicator bitmaps in THIS frame, defer the rebuild of this one to a
+    // later frame and instead blit the previously cached bitmap (if any).
+    // This keeps a single rAF tick from spending 80ms+ rebuilding 5+ heavy
+    // layers at once (e.g. right after a window resize) and causing a visible
+    // hitch. The first indicator to need a rebuild always gets it; subsequent
+    // ones rebuild one-per-frame until they catch up. Hover/interaction cost
+    // stays one drawImage per indicator regardless.
     const pxW = Math.max(1, Math.floor(this.W * this.dpr));
     const pxH = Math.max(1, Math.floor(this.H * this.dpr));
     const stamp = this._indicatorStamp(id, state);
@@ -2709,8 +2908,11 @@ class TradingChart {
       this._indCache2.set(id, entry);
       this._evictIndicatorCache();
     }
-    if (entry.stamp !== stamp || entry.canvas.width !== pxW || entry.canvas.height !== pxH) {
+    const needsRebuild = entry.stamp !== stamp || entry.canvas.width !== pxW || entry.canvas.height !== pxH;
+    const budgetExhausted = this._frameRebuilds >= this._MAX_FRAME_REBUILDS;
+    if (needsRebuild && !budgetExhausted) {
       // Rebuild: render the indicator into its own bitmap, sandboxed.
+      this._frameRebuilds++;
       entry.canvas.width = pxW; entry.canvas.height = pxH;
       const octx = entry.octx;
       octx.setTransform(1, 0, 0, 1, 0, 0);
@@ -2731,6 +2933,12 @@ class TradingChart {
       // Failed renders are NOT cached — they retry next frame (v2.8.0 behavior).
       entry.stamp = ok ? stamp : null;
       this._cacheMisses++;
+      // v2.12.0: force another frame so deferred indicators get their turn.
+      this.invalidate();
+    } else if (needsRebuild && budgetExhausted) {
+      // Defer: keep the old bitmap on screen this frame, retry next frame.
+      this._cacheMisses++;
+      this.invalidate();
     } else {
       this._cacheHits++;
     }
@@ -2750,6 +2958,23 @@ class TradingChart {
     const ppr = ps && ps.priceRange() ? (ps.priceRange().min + '~' + ps.priceRange().max) : 'x';
     const N = this.sim.candles.length;
     const last = N ? this.sim.candles[N - 1] : null;
+    // v2.12.0: safe settings serialization. JSON.stringify throws on circular
+    // settings objects (some user frameworks stash parent refs in settings),
+    // which would crash the stamp → crash _safeRenderIndicator → kill the whole
+    // frame even though every other indicator is fine. Fall back to a key+value
+    // hash that can't throw.
+    let settingsKey;
+    try {
+      settingsKey = JSON.stringify(state.settings || {});
+    } catch (_) {
+      const s = state.settings || {};
+      const parts = [];
+      for (const k of Object.keys(s)) {
+        const t = typeof s[k];
+        parts.push(k + ':' + (t === 'object' ? '[obj]' : String(s[k])));
+      }
+      settingsKey = parts.join(',') || '{}';
+    }
     return [
       this._sceneVersion,
       N,
@@ -2762,7 +2987,7 @@ class TradingChart {
       Math.round(this.chartLeft), Math.round(this.chartRight),
       range, ppr,
       state.visible !== false ? 1 : 0,
-      JSON.stringify(state.settings || {})
+      settingsKey
     ].join('|');
   }
   // v2.11.0: keep at most 8 offscreen bitmaps alive (removed indicators evict
@@ -2809,6 +3034,42 @@ class TradingChart {
   _invalidateScene() { this._sceneVersion++; this.invalidate(); }
   // Public alias — safe to call from user code / framework integrations.
   invalidateScene() { this._invalidateScene(); }
+
+  /* ---------- v2.12.0: Resizable pane public API ---------- */
+  // Set the bottom indicator section height in CSS pixels. Pass null to revert
+  // to the auto height (~24% of the chart, clamped 80–200). The value is
+  // always clamped to safe bounds on the next updateLayout() so the price area
+  // never collapses below ~120px. Has no effect when no pane indicator is
+  // currently visible (the section isn't shown) — the value is remembered and
+  // applies as soon as a pane indicator is added.
+  setPaneHeight(h) {
+    if (h == null || (typeof h === 'number' && isFinite(h))) {
+      this._paneHUser = (h == null) ? null : Math.round(h);
+      this.updateLayout();
+      this.autoScale();
+      this.invalidate();
+    }
+    return this;
+  }
+  // Reset the pane height back to the auto default. Equivalent to
+  // setPaneHeight(null). Also reachable by double-clicking the separator.
+  resetPaneHeight() {
+    if (this._paneHUser === null) return this;
+    this._paneHUser = null;
+    this.updateLayout();
+    this.autoScale();
+    this.invalidate();
+    return this;
+  }
+  // Returns the current pane section height in CSS pixels (0 when no pane
+  // indicator is visible), and whether it's user-set or auto.
+  getPaneHeight() {
+    return {
+      height: this.layout.paneH || 0,
+      auto: this._paneHUser === null,
+      userValue: this._paneHUser
+    };
+  }
 
   // Build the helpers object passed to each indicator's render() function.
   // Contains coordinate-conversion functions and current chart geometry.
@@ -3138,6 +3399,11 @@ class TradingChart {
     if (!now) now = performance.now();
     const savedTheme = THEME;
     THEME = this.theme;
+    // v2.12.0: reset the per-frame cache rebuild budget at the START of each
+    // rendered frame. _safeRenderIndicator() reads this to decide whether to
+    // rebuild an indicator's offscreen bitmap now or defer to a later frame.
+    this._frameId++;
+    this._frameRebuilds = 0;
     try {
       // No auto-tick. User must call update() with real data.
       const ctx = this.ctx;
@@ -3248,13 +3514,39 @@ class TradingChart {
       ctx.lineTo(Math.floor(x) + 0.5, this.chartBottom);
       ctx.stroke();
     }
-    // Pane separator
+    // v2.12.0: Pane separator + grab handle. The divider line gets slightly
+    // brighter while hovered or dragged so the user can see it's interactive,
+    // and a small centered grip pill (TradingView-style) appears at the middle
+    // of the chart width to signal "drag me to resize the indicator section".
     if (this.layout.paneH > 0) {
-      ctx.strokeStyle = this.theme.toolbarBorder;
+      const sepY = Math.floor(this.paneTop) - 0.5;
+      const active = this._paneSepHover || !!this._paneResize;
+      ctx.strokeStyle = active ? this.theme.axisBorder : this.theme.toolbarBorder;
+      ctx.lineWidth = active ? 1.5 : 1;
       ctx.beginPath();
-      ctx.moveTo(0, this.paneTop - 0.5);
-      ctx.lineTo(this.W, this.paneTop - 0.5);
+      ctx.moveTo(0, sepY);
+      ctx.lineTo(this.W, sepY);
       ctx.stroke();
+      ctx.lineWidth = 1;
+      // Centered grip pill on the divider (only on cursor tool so it doesn't
+      // distract while drawing). v2.12.0: the default pill uses theme.textDim
+      // so it's actually visible against the dark background (the original
+      // toolbarBorder color was too close to bg and looked invisible). On
+      // hover/drag it switches to the accent color and grows slightly.
+      if (this.activeTool === 'cursor') {
+        const gx = Math.floor(this.chartLeft + (this.chartRight - this.chartLeft) / 2);
+        const gy = Math.floor(this.paneTop);
+        const gw = active ? 44 : 38, gh = active ? 6 : 5;
+        ctx.fillStyle = active ? this.theme.accent : this.theme.textDim;
+        this._roundRect(gx - gw / 2, gy - gh / 2, gw, gh, 2);
+        ctx.fill();
+        // Three little dots inside the pill for the classic "grip" look.
+        ctx.fillStyle = this.theme.bg;
+        ctx.beginPath();
+        ctx.arc(gx - 7, gy, 0.9, 0, Math.PI * 2); ctx.fill();
+        ctx.arc(gx,     gy, 0.9, 0, Math.PI * 2); ctx.fill();
+        ctx.arc(gx + 7, gy, 0.9, 0, Math.PI * 2); ctx.fill();
+      }
     }
   }
 
