@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.11.0 — Pixel-Perfect Pure JavaScript Trading Chart Library
+ * BADI-CHARTS-V2 v2.15.0 — Pixel-Perfect Pure JavaScript Trading Chart Library
  *
  * A lightweight, dependency-free candlestick charting library built entirely
  * with the HTML5 Canvas API. Inspired by TradingView Lightweight Charts.
@@ -13,6 +13,56 @@
  *   - Responsive (desktop + mobile with touch/pinch support)
  *   - Crosshair, current price line, OHLC legend
  *   - Clipping for all chart areas (no overflow)
+ *
+ * v2.15.0 — Regression fixes from field testing of v2.14.0 + leftover audit
+ *   items. Highlights:
+ *   - WHEEL ZOOM DIRECTION restored: wheel up = zoom IN (v2.14.0 inverted it);
+ *     ctrl+wheel (trackpad pinch) unchanged — both now use -e.deltaY.
+ *   - update() normalizes EVERY tick through _norm() again — the v2.14.0
+ *     fast path stored the RAW caller object (Binance string prices,
+ *     uncorrected high/low, NaN risk) and kept a live reference to it.
+ *   - History pinning sign fixed: rightOffset -= appended when rightOffset < 0
+ *     (was += at > 12 — scrolled the WRONG way AND at the WRONG time);
+ *     _lastDataLen is now reset by setData/setSymbol/setTimeframe.
+ *   - layout.paneBottom = chartBottom again — the v2.14.0 alias pointed at
+ *     the pane-stack bottom and dropped the time axis INTO the volume strip.
+ *   - DPR cap restored in resize() (mobile 2, desktop 3).
+ *   - ResizeObserver feedback loop killed: canvas CSS size is pinned from the
+ *     first measurement and no-op resizes are skipped (a hidden-sized canvas
+ *     used to double its bitmap by DPR every observer cycle).
+ *   - _paneResize is cleared on touchend (a single-finger drag used to keep
+ *     resizing the pane FOREVER after the first separator touch).
+ *   - PriceFormatter contract fixed everywhere: base = 10^decimals, minMove=1
+ *     (v2.14.0 passed decimals AS minMove → 2 rounded prices to 0.02 steps,
+ *     0 produced NaN; pane base was hard 100 → MACD on forex showed "0").
+ *     Outlier legacy priceScale bases snap to the nearest power of 10 instead
+ *     of throwing 'unexpected base' inside the render frame.
+ *   - Finished drawings keep their own color (the preview no longer bakes the
+ *     active/orange color into the drawing object).
+ *   - Right-click deletes a drawing only when the cursor is actually OVER it.
+ *   - Countdown no longer keeps the loop at 60fps — the 1s interval alone
+ *     drives it (render-on-demand is real again).
+ *   - invalidate() added to addDrawing / clearDrawings / removeDrawing /
+ *     selectDrawingById / removeMarker; background image repaints on onload.
+ *   - computeIndicators() is batched at most once per animation frame
+ *     (_scheduleCompute) instead of O(N) on every tick.
+ *   - Time snapping is skipped for weekly/monthly timeframes (snapTime) —
+ *     week candles no longer move to Thursday, months no longer merge; the
+ *     50,000-candle cap trims in batches instead of shift() per tick.
+ *   - Crosshair time label derives its format from timeframe.ms (no more
+ *     '1D'/'1W'/'1S' string matching); time-axis steps are nice numbers and
+ *     getTimeMarks() is cached once per frame instead of built 3 times.
+ *   - The per-frame rebuild budget is bypassed for 400ms after wheel/pinch/
+ *     momentum too (previously only during mouse drags → indicators 3+
+ *     lagged behind during zoom).
+ *   - volumeProfile: zero price range no longer discards ALL volume; bounds
+ *     and numBins are clamped.
+ *   - prompt() replaced by an inline DOM editor for settings-card fields.
+ *   - W/H get sane defaults when the canvas is hidden at construction.
+ *   - destroy() removes the window resize listener (registered in
+ *     _listeners) and cancels the queued indicator computation.
+ *   - hline/vline/text switch back to cursor via setTool() (onToolChange
+ *     fires) and repaint immediately.
  *
  * v2.14.0 — Correctness & robustness release (40+ audit fixes). Highlights:
  *   - paneToY per-pane scale (2nd/3rd pane indicator was drawn through the
@@ -147,7 +197,7 @@
 'use strict';
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.14.0';
+const VERSION = '2.15.0';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 // v2.14.0 (audit #12): tracks the chart the user last hovered/touched, so
 // window-level keyboard shortcuts only apply to ONE chart on multi-chart pages.
@@ -485,7 +535,9 @@ class PriceFormatter {
       fracString = '.' + numberToStringWithLeadingZero(
         +fracPart.toFixed(fracLength) * this._minMove, fracLength);
     } else {
-      intPart = Math.round(intPart * base) / base;
+      // v2.15.0 FIX: round the PRICE, not the floored integer — a symbol with
+      // decimals = 0 used to display 1234.56 as "1234" (silent floor).
+      intPart = Math.round(price * base) / base;
       if (fracLength > 0) fracString = '.' + numberToStringWithLeadingZero(0, fracLength);
     }
     return intPart.toFixed(0) + fracString;
@@ -717,18 +769,32 @@ const Indicators = {
   // Volume Profile: builds histogram of volume by price level over visible range.
   // Returns {bins: [{priceLow, priceHigh, volume, isUp}], maxVol, vwap, pocPrice}
   volumeProfile(candles, firstIdx, lastIdx, numBins = 24) {
-    if (firstIdx >= lastIdx || lastIdx <= 0) return null;
+    // v2.15.0 FIX: clamp the window and the bin count — callers used to pass
+    // raw visible indices that could be negative / beyond the array (NaN
+    // min/max → a broken profile) and arbitrary numBins (0 → division by
+    // zero, huge values → thousands of allocations).
+    if (!Array.isArray(candles) || candles.length === 0) return null;
+    firstIdx = Math.max(0, Math.floor(firstIdx || 0));
+    lastIdx = Math.min(candles.length - 1, Math.floor(lastIdx || 0));
+    numBins = Math.max(1, Math.min(500, Math.floor(numBins || 24)));
+    if (firstIdx >= lastIdx) return null;
     let minP = Infinity, maxP = -Infinity;
     let totalVol = 0, totalPV = 0;
     for (let i = firstIdx; i <= lastIdx; i++) {
       const c = candles[i];
+      if (!c) continue;
       if (c.low < minP) minP = c.low;
       if (c.high > maxP) maxP = c.high;
       const typical = (c.high + c.low + c.close) / 3;
       totalVol += c.volume;
       totalPV += typical * c.volume;
     }
-    if (minP === Infinity || maxP === minP) return null;
+    // v2.15.0 FIX: a ZERO range (every candle high === low, e.g. a flat line
+    // or a single price level) previously returned null and DISCARDED all the
+    // volume of the window. Give the range a tiny epsilon so everything
+    // aggregates into bin 0 instead.
+    if (minP === Infinity) return null;
+    if (maxP === minP) maxP = minP + (Math.abs(minP) > 0 ? Math.abs(minP) * 1e-6 : 1e-6);
     const range = maxP - minP;
     const binSize = range / numBins;
     const bins = new Array(numBins).fill(0).map((_, i) => ({
@@ -741,18 +807,26 @@ const Indicators = {
     // Distribute each candle's volume across the bins it spans (using high-low range)
     for (let i = firstIdx; i <= lastIdx; i++) {
       const c = candles[i];
+      if (!c) continue;
       const cLow = c.low, cHigh = c.high;
-      const cRange = cHigh - cLow || 1;
+      const cRange = cHigh - cLow;
       const firstBin = Math.max(0, Math.floor((cLow - minP) / binSize));
       const lastBin = Math.min(numBins - 1, Math.floor((cHigh - minP) / binSize));
       const isUp = c.close >= c.open;
       for (let b = firstBin; b <= lastBin; b++) {
         const binLow = bins[b].priceLow;
         const binHigh = bins[b].priceHigh;
-        const overlapLow = Math.max(cLow, binLow);
-        const overlapHigh = Math.min(cHigh, binHigh);
-        const overlap = Math.max(0, overlapHigh - overlapLow);
-        const portion = overlap / cRange;
+        // v2.15.0 FIX: a ZERO-RANGE candle (high === low) produced
+        // overlap = 0 → portion = 0 → its volume vanished entirely. A point
+        // candle now contributes its whole volume to the bin holding it.
+        let portion;
+        if (cRange <= 0) {
+          portion = (cLow >= binLow && cLow <= binHigh) ? 1 : 0;
+        } else {
+          const overlapLow = Math.max(cLow, binLow);
+          const overlapHigh = Math.min(cHigh, binHigh);
+          portion = Math.max(0, overlapHigh - overlapLow) / cRange;
+        }
         const vol = c.volume * portion;
         bins[b].volume += vol;
         if (isUp) bins[b].upVol += vol;
@@ -778,6 +852,12 @@ class DataLayer {
   constructor() {
     this.candles = [];          // sorted array of candles
     this.timeframeMs = 60 * 60 * 1000; // default 1H, updated via setTimeframe
+    // v2.15.0: when true, _norm() snaps incoming times to the timeframe
+    // boundary (intraday behavior). Weekly/monthly candles arrive from the
+    // exchange ALIGNED to their (irregular) boundaries — snapping a weekly
+    // candle to the epoch-week boundary moved it to THURSDAY, and a monthly
+    // "tf" merged two real months into one Map key. The chart sets this to
+    // false automatically for timeframes >= 1 week (see setTimeframe).
   }
   // v2.5.0+: Normalize + clone a candle object.
   // - Converts time to a number (and from ms to seconds if > 1e11)
@@ -793,9 +873,10 @@ class DataLayer {
     if (!Number.isFinite(t)) return null;
     // Auto-convert millisecond timestamps to seconds (Binance uses ms; most APIs use s)
     if (t > 1e11) t = Math.floor(t / 1000);
-    // Snap time to the candle's open boundary (align to timeframe)
+    // Snap time to the candle's open boundary (align to timeframe) —
+    // skipped when snapTime is false (weekly/monthly data, v2.15.0)
     const tf = this.timeframeMs / 1000;
-    if (tf > 0) t = Math.floor(t / tf) * tf;
+    if (tf > 0 && this.snapTime !== false) t = Math.floor(t / tf) * tf;
     const o = +raw.open, h = +raw.high, l = +raw.low, cl = +raw.close;
     if (![o, h, l, cl].every(Number.isFinite)) return null;
     const v = +raw.volume;
@@ -829,7 +910,13 @@ class DataLayer {
     const last = this.candles[this.candles.length - 1];
     if (!last || c.time > last.time) {
       this.candles.push(c);
-      if (this.candles.length > 50000) this.candles.shift();
+      // v2.15.0: batched cap trim. The old `shift()` fired on EVERY new candle
+      // once the array held 50,000 items — an O(N) array move per tick. Now
+      // the array is trimmed back in one splice per 1,000 candles (memory
+      // stays bounded at ~51,000, worst-case amortized cost is 100× lower).
+      // NOTE: trimming shifts indices — index-anchored drawings/markers keep
+      // the pre-existing (documented) behavior of following the array.
+      if (this.candles.length > 51000) this.candles.splice(0, this.candles.length - 50000);
     } else if (c.time === last.time) {
       this.candles[this.candles.length - 1] = c;
     }
@@ -896,6 +983,14 @@ class PriceScale {
   }
   setFormatter(f) { this._formatter = f; }
   formatter() { return this._formatter; }
+  // v2.15.0: change the tick base at runtime — the mark builder caches the
+  // base at construction, so it must be rebuilt (pane scales derive their
+  // base from the indicator's value span).
+  setBase(b) {
+    if (!(isFinite(b) && b > 0) || this._opts.base === b) return;
+    this._opts.base = b;
+    this._markBuilder = null;
+  }
   formatLogical(logical) {
     if (this._formatter) return this._formatter.format(logical);
     return String(logical);
@@ -985,6 +1080,15 @@ class TradingChart {
     this._frameId = 0;                       // monotonic frame counter
     this._frameRebuilds = 0;                 // rebuilds done in the current frame
     this._MAX_FRAME_REBUILDS = 2;            // hard cap per frame
+    // v2.15.0: the rebuild budget is bypassed not only during mouse drags but
+    // for a short window after ANY fast interaction (wheel zoom, pinch,
+    // momentum) — otherwise indicators 3+ kept showing stale bitmaps while
+    // barSpacing changed every frame.
+    this._interactUntil = 0;                 // performance.now() until which the budget is bypassed
+    // v2.15.0: indicator computation batching — update()/append() queue ONE
+    // compute per animation frame instead of recomputing O(N) on every tick.
+    this._computeQueued = false;
+    this._computeRaf = null;
     // v2.13.0: MULTI-PANE. Each pane-type indicator (RSI, MACD, ...) gets its
     // OWN small window below the price area — its own separator, scale, grid,
     // grab handle and mini price-axis labels — TradingView-style. _panes is
@@ -1047,6 +1151,9 @@ class TradingChart {
     this.timeframe = opts.timeframe || {label: '1H', ms: 60 * 60 * 1000};
     this.sim = new DataLayer();
     this.sim.setTimeframeMs(this.timeframe.ms);
+    // v2.15.0: weekly/monthly data must NOT be snapped (see setTimeframe).
+    this.sim.snapTime = (opts && opts.snapTime != null) ? !!opts.snapTime :
+      this.timeframe.ms < 7 * 24 * 3600 * 1000;
     this._autoTick = false; // disabled by default; user controls updates
 
     // Background: image or video URL (drawn behind the chart)
@@ -1062,11 +1169,15 @@ class TradingChart {
     this.rightOffset = 4;      // bars of empty space on the right (LWC default ~4-5)
 
     // Price scales
+    // v2.15.0 FIX: base = 10^decimals with minMove = 1 (the v2.14.0-era code
+    // formatted with PriceFormatter(priceScale, decimals) — decimals misused
+    // as minMove rounded prices to 0.02 steps / NaN). See _symbolBase().
+    const _pBase = this._symbolBase();
     this.priceScale = new PriceScale({
       scaleMargins: {top: 0.15, bottom: 0.15},
-      base: this.symbol.priceScale
+      base: _pBase
     });
-    this.priceScale.setFormatter(new PriceFormatter(this.symbol.priceScale, 1));
+    this.priceScale.setFormatter(new PriceFormatter(_pBase, 1));
 
     this.volScale = new PriceScale({
       scaleMargins: {top: 0.0, bottom: 0.0},
@@ -1161,6 +1272,21 @@ class TradingChart {
     this.tickInterval = 1000;
     this.lastTickAt = 0;
 
+    // v2.15.0 FIX: W/H stayed undefined when the canvas was hidden
+    // (display:none) at construction — updateLayout produced NaN everywhere
+    // until the first ResizeObserver callback. Sane fallbacks (canvas bitmap
+    // size when set, else 800×450) keep the layout valid immediately; the
+    // first real resize replaces them.
+    this.W = this.canvas.width > 1 ? Math.min(2000, this.canvas.width) : 800;
+    this.H = this.canvas.height > 1 ? Math.min(2000, this.canvas.height) : 450;
+
+    // v2.15.0 FIX: _listeners must exist BEFORE setupHiDPICanvas() registers
+    // the window resize listener — previously that listener was stored in a
+    // separate field and destroy() never removed it (a destroyed chart kept
+    // re-resizing itself on every window resize).
+    this._listeners = [];   // [target, type, fn, options]
+    this._fieldEditor = null;                  // v2.15.0: inline DOM editor for settings fields
+
     this.setupHiDPICanvas();
     this.setupEvents();
     this.updateLayout();
@@ -1179,6 +1305,10 @@ class TradingChart {
   setData(candles, opts) {
     this.sim.setData(candles);
     this._dataVersion++;                       // v2.14.0: stamp invalidation
+    // v2.15.0 FIX: _lastDataLen was never reset here (nor in setSymbol /
+    // setTimeframe) — the first update() after a symbol change computed
+    // appended = newLen - staleOldLen and made the viewport jump violently.
+    this._lastDataLen = this.sim.candles.length;
     this.computeIndicators();
     if (opts && opts.keepView) {
       this.constrainRightOffset();
@@ -1191,48 +1321,58 @@ class TradingChart {
   // Append or update a single candle (real-time tick).
   // v2.14.0 FIX (audit #20): a LATE update to a PREVIOUS candle (the classic
   // "candle closed" WebSocket message that arrives after the new candle
-  // already opened) used to be ignored/appended as garbage. update() now
-  // matches the incoming candle's time against the LAST 300 candles and
-  // replaces it in place when found; only a genuinely new time is appended.
+  // already opened) matches the incoming time against the LAST 300 candles
+  // and replaces it in place; only a genuinely new time is appended.
+  // v2.15.0 FIX (CRITICAL regression): the in-place branch stored the RAW
+  // candle object — it skipped _norm() entirely, so Binance's STRING prices
+  // ('123.45') were drawn as NaN, high/low were never corrected against
+  // open/close, NaN slipped through, and the chart kept a LIVE REFERENCE to
+  // the caller's object (mutating it mutated the chart's history). Every
+  // input is normalized through sim._norm() again; the stored object is
+  // always a private clone.
   update(candle) {
-    if (candle && typeof candle === 'object' && isFinite(candle.time)) {
-      const cs = this.sim.candles;
-      const N = cs.length;
-      for (let i = N - 1, k = 0; i >= 0 && k < 300; i--, k++) {
-        if (cs[i].time === candle.time) {
-          cs[i] = candle;                       // in-place correction
-          this._dataVersion++;
-          this.computeIndicators();
-          this.autoScale();
-          this.invalidate();
-          return this;
-        }
-      }
+    const c = this.sim._norm(candle);
+    if (!c) return this;                       // invalid input — ignore (was: stored raw)
+    const cs = this.sim.candles;
+    let matched = false;
+    for (let i = cs.length - 1, k = 0; i >= 0 && k < 300; i--, k++) {
+      if (cs[i].time === c.time) { cs[i] = c; matched = true; break; }
     }
-    this.sim.update(candle);
+    if (!matched) {
+      const last = cs[cs.length - 1];
+      if (last && c.time < last.time) return this;   // stale tick older than the 300-bar window
+      cs.push(c);
+      if (cs.length > 51000) cs.splice(0, cs.length - 50000);   // batched trim (see DataLayer.update)
+    }
     this._dataVersion++;
-    // v2.14.0 FIX (audit #40): when the user is browsing history (well away
-    // from the live edge), appending a candle must NOT scroll the view one
-    // bar. indexToX() is relative to the last candle, so we compensate by
-    // shifting rightOffset when the user is NOT pinned to the live edge.
-    // (When they ARE at the live edge, the chart follows normally.)
-    const appended = this.sim.candles.length - (this._lastDataLen || this.sim.candles.length);
-    if (appended > 0 && this.rightOffset > 12) this.rightOffset += appended;
-    this._lastDataLen = this.sim.candles.length;
-    this.computeIndicators();
+    // v2.14.0 FIX (audit #40) + v2.15.0 SIGN FIX: when the user is browsing
+    // history, appending a candle must NOT scroll the view one bar.
+    // indexToX() is anchored to the LAST candle, so compensating with
+    // rightOffset -= appended keeps the visible candles pixel-stationary.
+    // The v2.14.0 condition was backwards (rightOffset > 12 = AT the live
+    // edge with future space) and the sign was wrong (+= scrolled history
+    // FORWARD by 2 bars per append). "Browsing history" = the last candle is
+    // off-screen to the right = rightOffset < 0.
+    const appended = cs.length - (this._lastDataLen || cs.length);
+    if (appended > 0 && this.rightOffset < 0) this.rightOffset -= appended;
+    this._lastDataLen = cs.length;
+    this.invalidateTimeMarks();                // future marks shift with the new candle
+    this._scheduleCompute();                   // v2.15.0: batched O(N) indicator compute (once per frame)
     this.autoScale();
     this.invalidate();
     return this;
   }
   // Append multiple candles
   append(candles) {
+    if (!Array.isArray(candles)) return this;
     const before = this.sim.candles.length;
     this.sim.append(candles);
     const appended = this.sim.candles.length - before;
     this._dataVersion++;
-    if (appended > 0 && this.rightOffset > 12) this.rightOffset += appended;  // v2.14.0: pin history view
+    if (appended > 0 && this.rightOffset < 0) this.rightOffset -= appended;  // v2.15.0: pin history view (sign fixed)
     this._lastDataLen = this.sim.candles.length;
-    this.computeIndicators();
+    this.invalidateTimeMarks();
+    this._scheduleCompute();                   // v2.15.0: batched indicator compute
     this.autoScale();
     this.invalidate();
     return this;
@@ -1243,11 +1383,38 @@ class TradingChart {
   // v2.14.0 FIX (audit #18): also clears markers + all interaction state —
   // previously a selected/hovered drawing or pending preview from the old
   // symbol survived the switch and pointed at stale data.
+  // v2.15.0: the price-scale BASE must be 10^decimals (LWC contract:
+  // base = 10^fractionalDigits, minMove = 1). v2.14.0 passed `decimals`
+  // AS minMove → decimals=2 rounded every price to multiples of 0.02 and
+  // decimals=0 produced Infinity/NaN in the formatter. A legacy priceScale
+  // that is not of the form 2^a·5^b (e.g. 3, 7, 12.5) used to throw
+  // 'unexpected base' from PriceTickSpanCalculator INSIDE the render frame —
+  // it is now snapped to the nearest power of 10.
+  _symbolBase() {
+    const dec = (this.symbol.decimals != null && isFinite(+this.symbol.decimals)) ?
+      clamp(Math.floor(+this.symbol.decimals), 0, 12) : null;
+    if (dec != null) return Math.pow(10, dec);
+    const ps = +this.symbol.priceScale;
+    if (!(isFinite(ps) && ps > 0)) return 100;
+    // Validate 2^a·5^b; snap to the nearest power of 10 when invalid.
+    let n = Math.round(ps);
+    if (Math.abs(ps - n) < 1e-9 && n > 0) {
+      for (const p of [2, 5]) { while (n % p === 0) n /= p; }
+      if (n === 1) return Math.round(ps);
+    }
+    const snapped = Math.pow(10, Math.round(Math.log10(ps)));
+    if (BADI_DEBUG) console.warn('[BadiCharts] symbol.priceScale ' + ps +
+      ' is not of the form 2^a*5^b — snapping to ' + snapped);
+    return snapped;
+  }
   setSymbol(sym) {
     this.sim.clear();
     this.symbol = Object.assign({}, this.symbol, sym);
-    this.priceScale = new PriceScale({scaleMargins:{top:0.15,bottom:0.15}, base: this.symbol.priceScale});
-    this.priceScale.setFormatter(new PriceFormatter(this.symbol.priceScale, this.symbol.decimals != null ? this.symbol.decimals : 1));
+    // v2.15.0 FIX: base = 10^decimals with minMove = 1 (was
+    // PriceFormatter(priceScale, decimals) — decimals misused as minMove).
+    const base = this._symbolBase();
+    this.priceScale = new PriceScale({scaleMargins:{top:0.15,bottom:0.15}, base: base});
+    this.priceScale.setFormatter(new PriceFormatter(base, 1));
     this.priceScale.setHeight(this.priceBottom - this.priceTop);
     this.drawings = [];
     this.markers = [];
@@ -1257,6 +1424,7 @@ class TradingChart {
     this._drawAnchor = null;
     this.deselectDrawing();
     this._dataVersion++;
+    this._lastDataLen = 0;                     // v2.15.0: fresh dataset → no phantom append
     this.computeIndicators();
     this.resetView();
     this.invalidate();
@@ -1274,6 +1442,13 @@ class TradingChart {
       ms: (tf && isFinite(tf.ms) && tf.ms > 0) ? tf.ms : 60000
     };
     this.sim.setTimeframeMs(this.timeframe.ms);
+    // v2.15.0: skip time snapping for weekly+ timeframes — weekly candles
+    // arrive Monday-aligned (floor-to-epoch-week moved them to Thursday) and
+    // monthly candles have irregular boundaries (a fixed ms "month" merged
+    // two real months into one Map key and DROPPED candles). Intraday keeps
+    // snapping. Override with {snapTime: true/false} if needed.
+    this.sim.snapTime = (tf && tf.snapTime != null) ? !!tf.snapTime :
+      this.timeframe.ms < 7 * 24 * 3600 * 1000;
     this.drawings = [];
     this.markers = [];
     this.selectedDrawing = null;
@@ -1282,6 +1457,7 @@ class TradingChart {
     this._drawAnchor = null;
     this.deselectDrawing();
     this._dataVersion++;
+    this._lastDataLen = 0;                     // v2.15.0: fresh dataset → no phantom append
     this.computeIndicators();
     this.resetView();
     this.invalidate();
@@ -1426,9 +1602,19 @@ class TradingChart {
     drawing.lineWidth = drawing.lineWidth || 1.5;
     drawing.locked = false;
     this.drawings.push(drawing);
+    this.invalidate();   // v2.15.0: the chart was previously not repainted
   }
   // Clear all drawings
-  clearDrawings() { this.drawings = []; }
+  // v2.15.0 FIX: clearDrawings() used to leave the stale drawing on screen
+  // until the next unrelated interaction (no repaint was scheduled).
+  clearDrawings() {
+    this.drawings = [];
+    this.selectedDrawing = null;
+    this.hoverDrawing = null;
+    this.currentDrawing = null;
+    this._drawAnchor = null;
+    this.invalidate();
+  }
   // Set the active drawing tool by id.
   // Accepts built-in tool ids (see getTools()) or any custom tool registered
   // via addDrawingTool(). Calling setTool() fires onToolChange callbacks.
@@ -1501,6 +1687,7 @@ class TradingChart {
         const removed = this.drawings.splice(i, 1)[0];
         if (this.selectedDrawing === removed) this.selectedDrawing = null;
         if (this.hoverDrawing === removed) this.hoverDrawing = null;
+        this.invalidate();   // v2.15.0: repaint
         return removed;
       }
     }
@@ -1509,7 +1696,12 @@ class TradingChart {
   // Get the currently selected drawing (clicked by the user), or null.
   getSelectedDrawing() { return this.selectedDrawing; }
   // Programmatically select a drawing by id.
-  selectDrawingById(id) { this.selectedDrawing = this.getDrawing(id); }
+  // v2.15.0 FIX: selectDrawingById() never scheduled a repaint — the
+  // selection handles appeared only after the next mouse move.
+  selectDrawingById(id) {
+    this.selectedDrawing = this.getDrawing(id);
+    this.invalidate();
+  }
   // List all available indicators with their active state.
   // Returns: [ { id, label, type, color, active } ]
   getIndicators() {
@@ -1579,6 +1771,11 @@ class TradingChart {
       // Only set it when the caller opts in via data-crossorigin.
       if (typeof url === 'string' && url.includes('crossorigin=anonymous')) img.crossOrigin = 'anonymous';
       // v2.14.0: report load errors instead of failing silently.
+      // v2.15.0 FIX: repaint once the image HAS loaded — with render-on-
+      // demand nothing else triggers a frame, so a background image used to
+      // appear only after the next interaction.
+      const self = this;
+      img.onload = function () { self.invalidate(); };
       img.onerror = function () { console.warn('[BadiCharts] Background image failed to load:', url); };
       img.src = url;
       this._bgImage = img;
@@ -1660,9 +1857,15 @@ class TradingChart {
     return this.markers.length;
   }
   // Remove a marker by id. Returns the removed marker or null.
+  // v2.15.0 FIX: the found-branch returned BEFORE invalidate() — the marker
+  // stayed visible until some other interaction repainted the chart.
   removeMarker(id) {
     for (let i = 0; i < this.markers.length; i++) {
-      if (this.markers[i].id === id) return this.markers.splice(i, 1)[0];
+      if (this.markers[i].id === id) {
+        const removed = this.markers.splice(i, 1)[0];
+        this.invalidate();
+        return removed;
+      }
     }
     this.invalidate();
     return null;
@@ -1676,8 +1879,11 @@ class TradingChart {
   _indexForTime(t) {
     if (typeof t !== 'number' || !isFinite(t)) return -1;
     if (t > 1e11) t = Math.floor(t / 1000); // ms epoch → seconds
+    // v2.15.0: respect snapTime — for weekly/monthly data the raw candle
+    // times are NOT multiples of a fixed tf, and flooring marker times onto
+    // that grid mapped them to the WRONG candle (or to -1).
     const tf = this.sim.timeframeMs / 1000;
-    const ts = tf > 0 ? Math.floor(t / tf) * tf : t;
+    const ts = (tf > 0 && this.sim.snapTime !== false) ? Math.floor(t / tf) * tf : t;
     const arr = this.sim.candles;
     let lo = 0, hi = arr.length - 1, res = -1;
     while (lo <= hi) {
@@ -1902,11 +2108,30 @@ class TradingChart {
       const h = Math.floor(rect.height);
       // v2.14.0 FIX: DPR was read once at construction — moving the tab to a
       // screen with a different zoom left the bitmap blurry. Re-read it.
-      const dpr = (window.devicePixelRatio && isFinite(window.devicePixelRatio)) ? window.devicePixelRatio : 1;
+      // v2.15.0 FIX (regression): the DPR CAP was lost — a phone with
+      // devicePixelRatio = 3 rendered (and cached every indicator bitmap)
+      // at full 3×. The cap is applied again on every re-read.
+      const rawDpr = (window.devicePixelRatio && isFinite(window.devicePixelRatio)) ? window.devicePixelRatio : 1;
+      const dpr = Math.min(rawDpr, this._isMobile ? 2 : 3);
+      // v2.15.0 FIX (ResizeObserver FEEDBACK LOOP): when the canvas had no
+      // CSS size, writing canvas.width changed its DISPLAY size (bitmaps
+      // size a canvas without CSS), which fired the observer again, which
+      // multiplied the bitmap by DPR again… until the browser cap. Two guards:
+      //   1) skip no-op resizes (same CSS size + same bitmap size);
+      //   2) pin canvas.style.width/height from the first measured rect so
+      //      bitmap changes can never alter the display size again.
+      if (w === this.W && h === this.H && dpr === this.dpr &&
+          this.canvas.width === Math.floor(w * dpr) &&
+          this.canvas.height === Math.floor(h * dpr)) return;
+      if (!this.canvas.style.width && !this.canvas.style.height) {
+        this.canvas.style.width = w + 'px';
+        this.canvas.style.height = h + 'px';
+      }
       if (dpr !== this.dpr) this.dpr = dpr;
       this.canvas.width = Math.floor(w * this.dpr);
       this.canvas.height = Math.floor(h * this.dpr);
-      // Don't override CSS width/height — let the user's CSS control the display size.
+      // Don't override user CSS width/height — but the pin above guarantees
+      // a fallback display size exists when none was specified.
       this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
       this.W = w;
       this.H = h;
@@ -1919,10 +2144,12 @@ class TradingChart {
       this.invalidate();
     };
     resize();
-    // v2.14.0: keep listener refs so destroy() can remove them (anonymous
-    // listeners could never be removed before).
-    this._onWindowResize = resize;
-    window.addEventListener('resize', this._onWindowResize);
+    // v2.15.0 FIX: register the window resize listener in _listeners so
+    // destroy() removes it (it used to live in _onWindowResize, which
+    // destroy() ignored — a destroyed chart kept re-running resize() on
+    // every window resize forever).
+    window.addEventListener('resize', resize);
+    this._listeners.push([window, 'resize', resize]);
     // v2.14.0: ResizeObserver catches container-driven resizes (flex/grid
     // layout changes, sidebar toggles) that never fire window.resize.
     if (typeof ResizeObserver !== 'undefined') {
@@ -2134,10 +2361,14 @@ class TradingChart {
     for (const p of this._panes) {
       if (p.scale) p.scale.setHeight(Math.max(1, p.height));
     }
-    // Legacy alias used at ~8 render sites as `this.layout.paneBottom`:
-    // v2.14.0 FIX (audit #61): that property never existed — every site fell
-    // back to chartBottom (the pane stack bottom is what they intended).
-    this.layout.paneBottom = this.paneBottom;
+    // Legacy alias used at ~10 render sites as `this.layout.paneBottom`:
+    // v2.15.0 FIX (regression): v2.14.0 set it to the PANE-STACK bottom —
+    // sites like drawTimeAxis (axisTop), drawPriceAxis, the crosshair and
+    // background sizing then fell INTO the volume strip when panes + volume
+    // were combined (time labels in the middle of the volume bar). The
+    // intended semantic of every one of those sites is "top of the time-axis
+    // strip" = chartBottom. The pane-stack bottom remains this.paneBottom.
+    this.layout.paneBottom = this.chartBottom;
     // Legacy: this.paneScale points to _panes[0].scale (set by autoScale).
     this.paneScale = (N > 0 && this._panes[0].scale) ? this._panes[0].scale : null;
   }
@@ -2151,7 +2382,10 @@ class TradingChart {
     // removed — a destroyed chart kept reacting to window keydown/resize
     // forever and leaked across SPA navigations).
     const act = () => this.invalidate();
-    this._listeners = [];   // [target, type, fn, options]
+    // v2.15.0: _listeners is created in the CONSTRUCTOR (before
+    // setupHiDPICanvas registers the window resize listener) — do NOT reset
+    // it here or the resize listener would leak again.
+    if (!this._listeners) this._listeners = [];   // [target, type, fn, options]
     const on = (target, type, fn, options) => {
       target.addEventListener(type, fn, options);
       this._listeners.push([target, type, fn, options]);
@@ -2353,6 +2587,7 @@ class TradingChart {
     if (this.isPinching && touches.length === 2) {
       const t1 = touches[0], t2 = touches[1];
       const dist = Math.hypot(t2.clientX - t1.clientX, t2.clientY - t1.clientY);
+      this._touchInteract();   // v2.15.0: bypass the rebuild budget while pinching
       if (this.pinchStartDist > 0) {
         const factor = dist / this.pinchStartDist;
         const oldSpacing = this.pinchStartBarSpacing;
@@ -2414,6 +2649,14 @@ class TradingChart {
     e.preventDefault();
     if (this.isPinching) {
       this.isPinching = false;
+    }
+    // v2.15.0 FIX (regression): _paneResize survived touchend FOREVER — after
+    // the first separator touch, every later single-finger drag kept resizing
+    // the pane instead of panning the chart (the mouse path cleared it in
+    // onMouseUp, the touch path never did).
+    if (this._paneResize) {
+      this._paneResize = null;
+      try { this.canvas.style.cursor = ''; } catch (_) {}
     }
     // v2.7.0: clear drawing drag states
     this._dragHandle = null;
@@ -2621,6 +2864,68 @@ class TradingChart {
     return null;
   }
 
+  // v2.15.0: inline DOM editor for a settings-card field — replaces the old
+  // window.prompt() (blocking, unstyleable, blocked in sandboxed iframes).
+  // The <input> is positioned exactly over the field's canvas rect and is
+  // fully removed from the DOM on commit/cancel/destroy.
+  _openFieldEditor(field, rect) {
+    if (typeof document === 'undefined') return;   // headless — keep current value
+    this._closeFieldEditor(false);
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.value = String(field.value);
+    input.setAttribute('data-badi-field-editor', '1');
+    const hostRect = this.canvas.getBoundingClientRect();
+    const s = input.style;
+    s.position = 'fixed';
+    s.left = (hostRect.left + rect.x) + 'px';
+    s.top = (hostRect.top + rect.y) + 'px';
+    s.width = Math.max(40, rect.w) + 'px';
+    s.height = Math.max(18, rect.h) + 'px';
+    s.boxSizing = 'border-box';
+    s.font = '12px -apple-system, Segoe UI, Roboto, sans-serif';
+    s.background = this.theme.cardBg || '#1e222d';
+    s.color = this.theme.textBright || '#d1d4dc';
+    s.border = '1px solid ' + (this.theme.accent || '#2962ff');
+    s.borderRadius = '3px';
+    s.padding = '0 4px';
+    s.outline = 'none';
+    s.zIndex = '2147483000';
+    s.margin = '0';
+    const self = this;
+    let done = false;   // blur fires AFTER remove() in some browsers — guard
+    const commit = function () {
+      if (done) return;
+      done = true;
+      const num = parseFloat(input.value);
+      if (input.value.trim() !== '' && isFinite(num)) field.value = num;
+      self._closeFieldEditor();
+    };
+    const cancel = function () {
+      if (done) return;
+      done = true;
+      self._closeFieldEditor();
+    };
+    input.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter') { ev.preventDefault(); commit(); }
+      else if (ev.key === 'Escape') { ev.preventDefault(); cancel(); }
+      ev.stopPropagation();   // never leak keys into the chart shortcuts
+    });
+    input.addEventListener('blur', commit);
+    document.body.appendChild(input);
+    input.focus();
+    input.select();
+    this._fieldEditor = input;
+    this.invalidate();
+  }
+  _closeFieldEditor() {
+    const input = this._fieldEditor;
+    if (!input) return;
+    this._fieldEditor = null;
+    try { input.remove(); } catch (_) {}
+    this.invalidate();
+  }
+
   // Handle a click on an indicator icon
   _handleIconClick(indId, iconId) {
     // Handle the collapse/expand arrow
@@ -2714,7 +3019,7 @@ class TradingChart {
           this.showToast('Settings saved');
         }
       } else if (scHit.action === 'field') {
-        // Cycle field value via prompt (simple editor) — for number/color
+        // Cycle field value — for number/color
         const sc = this.settingsCard;
         const f = sc.fields[scHit.index];
         if (f.type === 'color') {
@@ -2722,13 +3027,17 @@ class TradingChart {
           const colors = ['#2962ff','#ff9800','#e91e63','#26a69a','#9c27b0','#ef5350','#7e57c2'];
           const idx = colors.indexOf(f.value);
           f.value = colors[(idx + 1) % colors.length];
+          this.invalidate();
         } else {
-          // Prompt for new number value
-          const newVal = prompt(f.label + ' (current: ' + f.value + '):', String(f.value));
-          if (newVal !== null) {
-            const num = parseFloat(newVal);
-            if (!isNaN(num)) f.value = num;
-          }
+          // v2.15.0 FIX: window.prompt() is blocking, unstyleable, breaks
+          // headless/embedded usage and is blocked in some sandboxed iframes.
+          // A small inline DOM <input> is overlaid exactly on the field box;
+          // Enter/blur commits, Esc cancels. Requires a document (headless
+          // callers keep the current value, same as prompt returning null).
+          const fy = sc.y + 36 + scHit.index * 30;
+          this._openFieldEditor(f, {
+            x: sc.x + 90, y: fy, w: sc.w - 100, h: 20
+          });
         }
       }
       return;
@@ -2894,34 +3203,32 @@ class TradingChart {
   }
 
   onWheel(e) {
-    // v2.14.0 FIXES (audit #36):
-    //   - preventDefault() was called BEFORE the area check, hijacking page
-    //     scroll whenever the wheel crossed the canvas edge. Now the area is
-    //     checked FIRST and only in-chart wheels are captured.
-    //   - deltaY magnitude was ignored (every wheel tick = fixed 10%) — a
-    //     violent trackpad fling zoomed identically to one gentle notch. The
-    //     factor is now derived from |deltaY| (clamped, exponential curve).
-    //   - deltaX (horizontal trackpad scroll) started a zoom — it should pan.
-    //   - Ctrl+wheel (trackpad pinch gesture) now zooms too (its deltaY is
-    //     inverted, so the sign is flipped).
-    //   - the event's own Y coordinate is used, not a stale this.mouseY.
+    // v2.14.0: preventDefault() only AFTER the area check, so page scrolling
+    // is never hijacked when the wheel crosses the canvas edge.
+    // v2.15.0 FIX (regression): the zoom DIRECTION was inverted for the plain
+    // wheel — scrolling UP (deltaY < 0) zoomed OUT. The original behavior
+    // (wheel up = zoom in) is restored. ctrl+wheel (trackpad pinch) already
+    // reported the natural sign, so BOTH cases now simply use -e.deltaY:
+    //   wheel up  (deltaY < 0) → delta > 0 → factor > 1 → zoom IN
+    //   pinch out (ctrl+wheel, deltaY < 0) → delta > 0 → zoom IN
     const r = this.canvas.getBoundingClientRect();
     const x = e.clientX - r.left;
     const y = e.clientY - r.top;
     if (!this.inChartArea(x, y) && !this.inPriceAxis(x, y)) return;  // no hijack outside the chart
     e.preventDefault();
-    // Horizontal wheel / shift+wheel = pan instead of zoom
+    this._touchInteract();   // v2.15.0: bypass the rebuild budget while zooming
+    // Horizontal wheel / shift+wheel = pan instead of zoom.
+    // v2.15.0: same "content follows the pointer" metaphor as mouse-drag
+    // panning (drag right reveals the past, deltaX > 0 does the same).
     if (Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
       const panBars = (e.deltaX || 0) * 0.05;
       this.rightOffset -= panBars;
       this.constrainRightOffset();
-      this.invalidateTimeMarks();
       this.autoScale();
       this.invalidate();
       return;
     }
-    let delta = e.deltaY;
-    if (e.ctrlKey) delta = -delta;   // trackpad pinch reports as ctrl+wheel
+    let delta = -e.deltaY;   // v2.15.0: wheel up = zoom in (was inverted in v2.14.0)
     // Exponential curve: one notch (~100) ≈ +22%, clamped per event so a huge
     // fling can't jump more than ~65% in one step.
     const factor = Math.exp(clamp(delta, -240, 240) * 0.002);
@@ -2956,13 +3263,17 @@ class TradingChart {
       this.showToast('Drawing cancelled');
       return;
     }
-    // v2.14.0 FIX (audit #10): right-click deletes the SELECTED drawing —
-    // hoverDrawing is only populated in eraser mode, so the old branch was
-    // dead for users of the normal cursor tool.
+    // v2.14.0 FIX (audit #10): right-click deletes a drawing — hoverDrawing
+    // is only populated in eraser mode, so the old branch was dead for users
+    // of the normal cursor tool.
+    // v2.15.0 FIX (regression): right-clicking ANYWHERE deleted the currently
+    // selected drawing even when it was on the other side of the chart. The
+    // click position is hit-tested first (findDrawingAt); only a drawing
+    // under the cursor is deleted. Clicking empty space keeps the selection.
     const r = this.canvas.getBoundingClientRect();
     const x = e.clientX - r.left;
     const y = e.clientY - r.top;
-    const target = this.selectedDrawing ||
+    const target = this.findDrawingAt(x, y) ||
                    (this.activeTool === 'eraser' ? this.hoverDrawing : null);
     if (target) {
       this.drawings = this.drawings.filter(d => d !== target);
@@ -3154,22 +3465,28 @@ class TradingChart {
   invalidateTimeMarks() { this._timeMarksCache = null; }
 
   getTimeMarks() {
-    // Simple approach: generate time marks at regular intervals across the
-    // visible range (including future/past areas). This is simpler and more
-    // reliable than the weight-based LWC system for free-scrolling charts.
+    // v2.15.0: this method was called up to 3× per frame (drawTimeAxis,
+    // drawPane, background) and REBUILT the mark array every time. The result
+    // is now cached in _timeMarksCache; autoScale() clears it whenever the
+    // viewport or data changes, so all call sites within one frame share
+    // exactly one build.
+    if (this._timeMarksCache) return this._timeMarksCache;
     const visibleBars = Math.ceil((this.chartRight - this.chartLeft) / this.barSpacing);
     const firstIdx = Math.floor(this.xToIndex(this.chartLeft));
     const lastIdx = Math.ceil(this.xToIndex(this.chartRight));
-    // Choose a step so we get ~8-12 marks
-    let step = 1;
+    // v2.15.0: pick the step from NICE numbers. The old loop only doubled
+    // (step = 1, 2, 4, 8, 16…) so labels landed at awkward bar counts and the
+    // niceSteps array right below was dead code. The step is in BARS; since
+    // one bar = one timeframe, index multiples stay time-aligned for regular
+    // (exchange) data.
     const targetMarks = 10;
-    while (Math.ceil(visibleBars / step) > targetMarks * 1.5) {
-      step *= 2;
-      if (step > visibleBars) break;
+    let step = Math.max(1, Math.ceil(visibleBars / targetMarks));
+    const niceSteps = [1, 2, 3, 5, 10, 15, 20, 30, 60, 120, 240, 300, 480, 600,
+                       960, 1200, 1920, 2400, 3840, 4800];
+    let stepInBars = niceSteps.find(n => n >= step);
+    if (stepInBars == null) {
+      stepInBars = Math.ceil(step / 4800) * 4800;   // beyond the table: keep rounding to multiples of 4800
     }
-    // Round step to nice numbers (5, 10, 15, 30, 60, 120, 240, 360, 720)
-    const niceSteps = [1, 2, 3, 5, 6, 10, 15, 30, 60, 120, 240, 360, 720, 1440];
-    const stepInBars = step;
     // Build marks
     const marks = [];
     const startMark = Math.ceil(firstIdx / stepInBars) * stepInBars;
@@ -3182,12 +3499,17 @@ class TradingChart {
       const w = assignTimeWeight(prevT, t);
       marks.push({index: i, time: t, weight: w});
     }
+    this._timeMarksCache = marks;
     return marks;
   }
 
   /* --------------------------- Auto Scale -------------------------------- */
   autoScale() {
     this.invalidate();   // v2.11.0: any scale change must schedule a repaint
+    // v2.15.0: choke point for the time-marks cache — every pan/zoom/resize/
+    // data change flows through here, and marks are rebuilt lazily on the
+    // next getTimeMarks() call (once per frame, see getTimeMarks()).
+    this._timeMarksCache = null;
     // If no data, set a safe default range and skip
     if (this.sim.candles.length === 0) {
       this.priceScale.setRange(0, 1);
@@ -3321,6 +3643,24 @@ class TradingChart {
             if (v > pMax) pMax = v;
           }
         }
+      } else if (values && typeof values === 'object') {
+        // v2.15.0: multi-series objects ({macd:[], signal:[], hist:[]}) —
+        // scan every numeric array member. Previously anything that was not
+        // a plain array fell into the 0..100 fallback, so a MACD on a forex
+        // symbol (values ±0.003) was "graded" on 0..100 and showed 0.0-style
+        // labels nowhere near its data.
+        pMin = Infinity; pMax = -Infinity;
+        for (const key of Object.keys(values)) {
+          const arr = values[key];
+          if (!Array.isArray(arr)) continue;
+          for (let i = firstIdx; i <= lastIdx && i < arr.length; i++) {
+            const v = arr[i];
+            if (v !== null && v !== undefined && typeof v === 'number' && isFinite(v)) {
+              if (v < pMin) pMin = v;
+              if (v > pMax) pMax = v;
+            }
+          }
+        }
       } else {
         pMin = 0; pMax = 100;
       }
@@ -3332,20 +3672,20 @@ class TradingChart {
       }
       pane.scale.setHeight(pane.height || 100);
       pane.scale.setRange(pMin - pad, pMax + pad);
-      // v2.14.0 FIX (audit #50): the pane formatter was hardcoded
-      // PriceFormatter(100, 1) — a pane whose values are small (e.g. a
-      // spread indicator ranging ±0.05) showed every label as "0.00".
-      // Derive the base/decimals from the pane's own range: base = the
-      // largest power of 10 within the span (LWC-style), decimals scale so
-      // labels keep 2-3 significant digits.
+      // v2.15.0 FIX (regression): the pane formatter was built as
+      // PriceFormatter(pBase, pDecimals) — pDecimals was misused as minMove,
+      // so pDecimals < 10 rounded every label to even values or "0" (MACD on
+      // forex ALWAYS showed 0) and pDecimals >= 1000 produced "n/a". The LWC
+      // contract is base = 10^decimals with minMove = 1, and the PriceScale
+      // base must match so tick spans grade at 10^-decimals multiples.
       const pSpan = Math.max(1e-12, pMax - pMin);
-      let pBase = Math.pow(10, Math.floor(Math.log10(pSpan)));
-      if (!isFinite(pBase) || pBase <= 0) pBase = 100;
-      let pDecimals = 0;
-      if (pBase < 1) pDecimals = Math.min(8, Math.max(2, Math.ceil(-Math.log10(pBase)) + 2));
-      else if (pBase < 10) pDecimals = 2;
-      else if (pBase < 1000) pDecimals = 1;
-      pane.scale.setFormatter(new PriceFormatter(pBase, pDecimals));
+      let pDec = 0;
+      if (pSpan < 1) pDec = clamp(Math.ceil(-Math.log10(pSpan)) + 2, 2, 8);
+      else if (pSpan < 10) pDec = 2;
+      else if (pSpan < 1000) pDec = 1;
+      const pBase = Math.pow(10, pDec);
+      pane.scale.setBase(pBase);                              // v2.15.0: was fixed 100 → no grading for small values
+      pane.scale.setFormatter(new PriceFormatter(pBase, 1));  // v2.15.0: (10^dec, 1) contract
       pane.scale.rebuildMarks();
     }
     // Legacy: this.paneScale points to _panes[0].scale (or null if no panes).
@@ -3510,7 +3850,13 @@ class TradingChart {
       this._evictIndicatorCache();
     }
     const needsRebuild = entry.stamp !== stamp || entry.canvas.width !== pxW || entry.canvas.height !== pxH;
-    const interacting = this.isDragging || !!this._dragHandle || !!this._dragWhole || !!this._paneResize;
+    // v2.15.0 FIX (regression): "interacting" covered only mouse/touch DRAG
+    // states — wheel zoom, pinch zoom and momentum changed barSpacing every
+    // frame WITHOUT setting any of them, so the 2-rebuild budget applied and
+    // indicators 3+ kept showing bitmaps one frame behind (visible lag).
+    // Fast interactions now open a 400ms budget-bypass window (_interactUntil).
+    const interacting = this.isDragging || !!this._dragHandle || !!this._dragWhole ||
+      !!this._paneResize || performance.now() < this._interactUntil;
     const budgetExhausted = !interacting && this._frameRebuilds >= this._MAX_FRAME_REBUILDS;
     // v2.14.0 FIX (audit #14d): a persistently FAILING render retried every
     // frame FOREVER (stamp=null → needsRebuild → invalidate → 60fps loop).
@@ -3657,6 +4003,34 @@ class TradingChart {
   invalidate() {
     this._needsRender = true;              // v2.11.0: schedule exactly one repaint
     this._lastActivity = performance.now();
+  }
+  // v2.15.0: open a short window during which the per-frame indicator-rebuild
+  // budget is bypassed. Fast interactions (wheel zoom, pinch, momentum) change
+  // barSpacing every frame without ever entering a drag state — without this
+  // window the 3rd+ indicator kept rendering its previous bitmap (lag).
+  _touchInteract() {
+    this._interactUntil = performance.now() + 400;
+  }
+  // v2.15.0: BATCH indicator computation — update()/append() used to call
+  // computeIndicators() synchronously on EVERY tick, so a burst of WebSocket
+  // messages recomputed every indicator O(N) several times per frame. Now
+  // ticks only queue the work; ONE rAF callback (coalesced with the render
+  // frame) runs computeIndicators() + autoScale() at most once per frame.
+  _scheduleCompute() {
+    this._computeQueued = true;
+    if (this._computeRaf != null) return;
+    const run = () => {
+      this._computeRaf = null;
+      if (this._destroyed || !this._computeQueued) return;
+      this._computeQueued = false;
+      this.computeIndicators();
+      this.autoScale();   // overlay ranges may have changed → re-fit + invalidate
+    };
+    if (typeof requestAnimationFrame === 'function') {
+      this._computeRaf = requestAnimationFrame(run);
+    } else {
+      run();   // headless / Node — no frames to batch into, compute now
+    }
   }
   // v2.11.0: Force every cached indicator to rebuild on the next render.
   // Called when something that affects indicator OUTPUT (but not its geometry
@@ -3878,15 +4252,19 @@ class TradingChart {
     const tool = this.activeTool;
     if (tool === 'hline') {
       this.drawings.push({type:'hline', price, color: this.theme.drawing, id: Date.now()});
-      this.activeTool = 'cursor';
+      // v2.15.0 FIX: setTool() (not a raw assignment) so onToolChange fires
+      // and any pending preview state is cleaned up; + repaint immediately.
+      this.setTool('cursor');
       this.showToast('Horizontal line added');
       this.autoScale();
+      this.invalidate();
       return;
     }
     if (tool === 'vline') {
       this.drawings.push({type:'vline', index: idx, color: this.theme.drawing, id: Date.now()});
-      this.activeTool = 'cursor';
+      this.setTool('cursor');   // v2.15.0: fires onToolChange
       this.showToast('Vertical line added');
+      this.invalidate();
       return;
     }
     if (tool === 'text') {
@@ -3894,16 +4272,21 @@ class TradingChart {
       // Here we'll add a text drawing with a default label the user can change.
       const txt = 'Text ' + (this.drawings.length + 1);
       this.drawings.push({type:'text', i: idx, p: price, text: txt, color: this.theme.drawing, id: Date.now()});
-      this.activeTool = 'cursor';
+      this.setTool('cursor');   // v2.15.0: fires onToolChange
       this.showToast('Text added');   // v2.14.0 FIX (audit drawing-72): no text editing exists — the old promise was misleading
+      this.invalidate();
       return;
     }
     // Tools that use single drag (i1,p1) → (i2,p2)
+    // v2.15.0 FIX (regression): the PREVIEW color (drawingActive/orange) was
+    // baked into the drawing object, and finishDrawing only fills a MISSING
+    // color — so every finished drawing stayed orange forever. The preview
+    // look comes from drawOne(d, isActive=true); the object stores NO color.
     if (tool === 'trend' || tool === 'ray' || tool === 'channel' || tool === 'arrow' ||
         tool === 'rect' || tool === 'band' || tool === 'fib') {
       this.currentDrawing = {
         type: tool, i1: idx, p1: price, i2: idx, p2: price,
-        color: this.theme.drawingActive, id: Date.now()
+        id: Date.now()
       };
       return;
     }
@@ -3912,7 +4295,7 @@ class TradingChart {
       this.currentDrawing = {
         type: tool,
         points: [{i: idx, p: price, x, y}],
-        color: this.theme.drawingActive, id: Date.now(),
+        id: Date.now(),
         closed: false
       };
       return;
@@ -3938,7 +4321,7 @@ class TradingChart {
           type: tool,
           i1: idx, p1: price, i2: idx, p2: price,
           x1: x, y1: y, x2: x, y2: y,
-          color: ds.color || this.theme.drawingActive,
+          color: ds.color || this.theme.drawing,
           lineWidth: ds.lineWidth || 1.5,
           id: Date.now()
         };
@@ -3947,7 +4330,9 @@ class TradingChart {
         // Ensure required fields
         newDrawing.type = newDrawing.type || tool;
         newDrawing.id = newDrawing.id || Date.now();
-        newDrawing.color = newDrawing.color || (customTool.defaultStyle && customTool.defaultStyle.color) || this.theme.drawingActive;
+        // v2.15.0: fall back to the DEFAULT drawing color (not the active
+        // preview color) — a finished custom tool must not stay orange.
+        newDrawing.color = newDrawing.color || (customTool.defaultStyle && customTool.defaultStyle.color) || this.theme.drawing;
         newDrawing.lineWidth = newDrawing.lineWidth || (customTool.defaultStyle && customTool.defaultStyle.lineWidth) || 1.5;
         this.currentDrawing = newDrawing;
       }
@@ -5571,13 +5956,20 @@ class TradingChart {
     ctx.setLineDash([]);
 
     // Time label on axis — use _timeAtIndex for future/past support
+    // v2.15.0 FIX: the format matched the timeframe LABEL ('1D'/'1W'/'1S') —
+    // any other naming ('D1', 'H4', '1d', custom labels) silently fell into
+    // the wrong branch. The format now derives from timeframe.ms itself:
+    //   >= 1 day  → YYYY-MM-DD
+    //   < 1 min   → HH:MM:SS
+    //   else      → MM-DD HH:MM
     const t = this._timeAtIndex(idx);
     const date = new Date(t * 1000);
     const pad2 = (n) => n < 10 ? '0' + n : '' + n;
+    const tfSec = (this.timeframe.ms || 60000) / 1000;
     let timeStr;
-    if (this.timeframe.label === '1D' || this.timeframe.label === '1W') {
+    if (tfSec >= 86400) {
       timeStr = date.getUTCFullYear() + '-' + pad2(date.getUTCMonth() + 1) + '-' + pad2(date.getUTCDate());
-    } else if (this.timeframe.label === '1S') {
+    } else if (tfSec < 60) {
       timeStr = pad2(date.getUTCHours()) + ':' + pad2(date.getUTCMinutes()) + ':' + pad2(date.getUTCSeconds());
     } else {
       timeStr = pad2(date.getUTCMonth() + 1) + '-' + pad2(date.getUTCDate()) + ' ' + pad2(date.getUTCHours()) + ':' + pad2(date.getUTCMinutes());
@@ -5819,8 +6211,19 @@ class TradingChart {
       return '—';
     }
 
-    if (!values || idx < 0 || idx >= values.length) return '—';
-    const v = values[idx];
+    if (!values || idx < 0) return '—';
+    // v2.15.0: multi-series objects ({macd:[], signal:[], hist:[]}) — the
+    // header reads the FIRST numeric array member (MACD → values.macd).
+    // Previously the object itself was indexed → undefined → the pane header
+    // showed "—" forever even with perfectly good data.
+    let series = values;
+    if (!Array.isArray(series) && typeof series === 'object') {
+      for (const k of Object.keys(series)) {
+        if (Array.isArray(series[k])) { series = series[k]; break; }
+      }
+    }
+    if (!Array.isArray(series) || idx >= series.length) return '—';
+    const v = series[idx];
     if (v === null || v === undefined) return '—';
 
     // Custom formatValue() hook
@@ -5833,6 +6236,12 @@ class TradingChart {
     if (typeof v === 'number') {
       // For price-like values, use the price formatter if available
       if (def.type === 'overlay') return this.priceScale.formatLogical(v);
+      if (def.type === 'pane') {
+        // v2.15.0: pane values use the PANE's own formatter (decimals derived
+        // from the pane's value span) instead of a blind toFixed(2).
+        const pane = this._panes.find(p => p.id === id);
+        if (pane && pane.scale) return pane.scale.formatLogical(v);
+      }
       return v.toFixed(2);
     }
     if (typeof v === 'object' && v !== null) {
@@ -6398,12 +6807,14 @@ class TradingChart {
         this.toast = null;            // expired — one last repaint clears it
         this._needsRender = true;
       }
-      // v2.13.0: countdown is a continuous condition (updates every second),
-      // but we drive it via a 1s setInterval that calls invalidate() — so we
-      // only need to keep the loop awake while the timer is active.
+      // v2.13.0: countdown is driven ONLY by its 1-second setInterval, which
+      // calls invalidate() → the loop renders once per second and idles the
+      // other ~59 frames.
+      // v2.15.0 FIX (regression): the countdown was listed as a "continuous"
+      // condition, which woke the loop EVERY frame (constant 60fps even with
+      // nothing moving) and silently defeated render-on-demand.
       const continuous = !!this._momentum || !!this.toast ||
-                         this._hasAnimatedIndicator() ||
-                         (this._countdown && this._countdown.enabled);
+                         this._hasAnimatedIndicator();
       if (!continuous && !this._needsRender) return;   // idle — zero work
       // Throttle on mobile
       if (this._renderThrottleMs > 0) {
@@ -6448,6 +6859,13 @@ class TradingChart {
       try { this._resizeObserver.disconnect(); } catch (_) {}
       this._resizeObserver = null;
     }
+    // v2.15.0: cancel a queued indicator computation + close the field editor
+    if (this._computeRaf != null && typeof cancelAnimationFrame === 'function') {
+      cancelAnimationFrame(this._computeRaf);
+      this._computeRaf = null;
+      this._computeQueued = false;
+    }
+    if (this._fieldEditor) this._closeFieldEditor(false);
     if (_lastActiveChartInstance === this) _lastActiveChartInstance = null;
     this._panes = [];
     if (this._indCache2) this._indCache2.clear();
@@ -6469,6 +6887,9 @@ class TradingChart {
     const barsPerMs = m.velocity / this.barSpacing;
     this.rightOffset -= barsPerMs * dt;
     this.constrainRightOffset();
+    // v2.15.0: momentum changes the viewport every frame without a drag state
+    // — keep the rebuild budget bypassed while it is active.
+    this._touchInteract();
     // Apply friction (per-frame, approximated for dt)
     const frictionPerFrame = Math.pow(this._momentumFriction, dt / 16.67);
     m.velocity *= frictionPerFrame;

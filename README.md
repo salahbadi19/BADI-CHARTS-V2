@@ -4,10 +4,44 @@
 >
 > Pixel-perfect rendering, 14 drawing tools, fully custom indicators via API — you bring the data, the UI, and the indicators. BADI-CHARTS-V2 renders the chart.
 
-[![Version](https://img.shields.io/badge/version-2.14.0-2962ff.svg)](#)
+[![Version](https://img.shields.io/badge/version-2.15.0-2962ff.svg)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-26a69a.svg)](LICENSE)
 [![No Dependencies](https://img.shields.io/badge/dependencies-zero-ff9800.svg)](#)
 [![Headless](https://img.shields.io/badge/UI-headless-9c27b0.svg)](#)
+
+---
+
+## ⚠️ What changed in v2.15.0
+
+**Regression-fix release.** Field testing of v2.14.0 found 10 regressions introduced by the audit fixes, plus several audit items that had survived untouched. All fixed and covered by a 57-assertion automated test suite.
+
+### Regressions introduced by v2.14.0 (all fixed)
+1. **Wheel zoom direction inverted** — wheel UP now zooms IN again (v2.14.0 flipped the sign for the plain wheel while leaving ctrl+wheel correct; both now use `-e.deltaY`). Horizontal wheel panning uses the same "content follows the pointer" metaphor as mouse-drag (verified consistent in tests).
+2. **`update()` fast path skipped normalization** — the in-place tick branch stored the RAW candle: Binance STRING prices (`"124.00"`) were never converted to numbers, high/low were never corrected against open/close, NaN slipped through, and the chart kept a LIVE REFERENCE to the caller's object (mutating it mutated the chart's history). Every tick passes through `_norm()` again; the stored object is always a private clone.
+3. **History pinning was doubly wrong** — the condition (`rightOffset > 12` = AT the live edge) and the sign (`+=`) were both backwards: appending a candle scrolled the view FORWARD two bars. Correct rule: `rightOffset -= appended` **only when `rightOffset < 0`** (browsing history, last candle off-screen); at the live edge the view follows normally. `_lastDataLen` is now also reset by `setData`/`setSymbol`/`setTimeframe` (a symbol change used to make the first update jump violently).
+4. **`layout.paneBottom` broke the time axis** — the new alias pointed at the PANE-STACK bottom, so with panes + volume the time axis, crosshair and price-axis strip dropped INTO the volume strip. It is `chartBottom` again (the pane-stack bottom stays on `this.paneBottom`).
+5. **DPR cap lost** — `resize()` re-read `devicePixelRatio` without the cap; a DPR-3 phone rendered (and cached every indicator bitmap) at 3×. Cap re-applied on every re-read (mobile 2, desktop 3).
+6. **ResizeObserver growth loop** — a canvas WITHOUT a CSS size grows its bitmap by DPR on every observer callback (setting `canvas.width` changes the display size → observer fires again → …). The CSS size is now pinned from the first measurement and no-op resizes are skipped.
+7. **Touch pane-resize stuck forever** — `_paneResize` survived `touchend`, so after one separator touch every later single-finger drag kept resizing the pane instead of panning. Cleared on touchend (and touchcancel).
+8. **Price formats misused `PriceFormatter(base, minMove)`** — `setSymbol` passed `decimals` AS `minMove`: `decimals: 2` rounded every price to multiples of **0.02**, `decimals: 0` produced NaN. The LWC contract is `base = 10^decimals, minMove = 1`; `decimals: 0` now rounds (1234.56 → "1235", was silently floored to "1234"). Pane scales: base follows `10^dec` (was a fixed 100 → MACD on forex graded "0.0"); the pane auto-range scans multi-series objects (`{macd, signal, hist}`) instead of falling back to 0..100; the pane header reads `values.macd` (showed "—" forever) formatted through the pane's own formatter. A legacy `priceScale` that is not 2^a·5^b (3, 7, 12.5…) snaps to the nearest power of 10 instead of throwing `unexpected base` inside the render frame.
+9. **Finished drawings stayed orange** — the preview color (`drawingActive`) was baked into the drawing object and `finishDrawing` only filled a MISSING color. The preview look now comes from the render path; the object stores no color. (Custom-tool generic drawings fall back to the default drawing color.)
+10. **Right-click deleted the selected drawing from anywhere** — the click position is now hit-tested (`findDrawingAt`) first; only a drawing under the cursor is deleted, clicking empty space keeps the selection.
+
+### Audit items that v2.14.0 had missed (now done)
+11. **Countdown kept the loop at 60fps** — the countdown was listed as a "continuous" condition, silently defeating render-on-demand. The 1-second interval alone drives it now (measured: 1–2 renders per 1.25s, not 75).
+12. **Missing `invalidate()`** — `addDrawing`, `clearDrawings`, `removeDrawing`, `selectDrawingById`, `removeMarker` now repaint immediately; background images repaint on `onload` (with render-on-demand nothing else would trigger the frame).
+13. **`computeIndicators()` batched once per frame** — update()/append() queue ONE compute per animation frame (`_scheduleCompute`); a burst of 5 WebSocket ticks recomputes indicators once, not 5×.
+14. **Weekly/monthly time snapping removed** — flooring a weekly candle onto the epoch-week boundary moved it to THURSDAY, and a fixed-ms "month" merged two real months into one Map key and DROPPED candles. `snapTime` is off automatically for timeframes ≥ 1 week (override with `{label, ms, snapTime}`); marker time→index mapping respects it too. The 50,000-candle cap now trims in one batched splice per 1,000 candles (was `shift()` per tick).
+15. **Time axis & crosshair formats** — the crosshair label derives its format from `timeframe.ms` (≥1d → date, <1m → HH:MM:SS, else MM-DD HH:MM) instead of matching the strings '1D'/'1W'/'1S'; time-axis steps come from a nice-numbers table (1, 2, 3, 5, 10, 15, 20, 30, 60…) instead of powers of two; `getTimeMarks()` is cached per frame (was rebuilt up to 3× per frame) with invalidation riding on `autoScale()`/data changes.
+16. **Rebuild budget bypassed for wheel/pinch/momentum too** — those change `barSpacing` every frame without entering a drag state, so indicators 3+ lagged one frame behind. Any fast interaction opens a 400ms budget-bypass window.
+17. **`Indicators.volumeProfile`** — a zero price range (every candle high === low) kept ALL the volume (was discarded, bins all 0); window bounds are clamped into the array (no NaN from out-of-range indices); `numBins` clamped 1..500.
+18. **`prompt()` removed from settings** — editing a settings-card field opens an inline DOM `<input>` positioned exactly over the field box (Enter/blur commits, Esc cancels, headless-safe: silently keeps the current value when no `document`).
+19. **Hidden canvas at construction** — W/H fell back to finite defaults (canvas bitmap size or 800×450) instead of `undefined` → NaN layout until the first observer callback.
+20. **`destroy()` removes the window resize listener** — it is registered in `_listeners` now (it previously lived outside and kept re-running `resize()` on a destroyed chart); the queued indicator computation is cancelled and the field editor is closed as well.
+21. **`hline`/`vline`/`text` placement goes through `setTool('cursor')`** — `onToolChange` fires and the chart repaints immediately.
+22. Header version comment updated (was still v2.11.0).
+
+No breaking API changes. 57 automated assertions cover every item above.
 
 ---
 
@@ -473,7 +507,7 @@ const chart = new BadiCharts(canvas, { /* options */ });
 <body>
   <canvas id="chart"></canvas>
   <!-- Load from CDN (headless, no built-in UI or indicators) -->
-  <script src="https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@v2.7.0/chart.js"></script>
+  <script src="https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@v2.15.0/chart.js"></script>
   <script>
     const canvas = document.getElementById('chart');
     const chart = new BadiCharts(canvas, {
