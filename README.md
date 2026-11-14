@@ -4,10 +4,49 @@
 >
 > Pixel-perfect rendering, 14 drawing tools, fully custom indicators via API — you bring the data, the UI, and the indicators. BADI-CHARTS-V2 renders the chart.
 
-[![Version](https://img.shields.io/badge/version-2.15.0-2962ff.svg)](#)
+[![Version](https://img.shields.io/badge/version-2.16.0-2962ff.svg)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-26a69a.svg)](LICENSE)
 [![No Dependencies](https://img.shields.io/badge/dependencies-zero-ff9800.svg)](#)
 [![Headless](https://img.shields.io/badge/UI-headless-9c27b0.svg)](#)
+
+---
+
+## ⚠️ What changed in v2.16.0
+
+**Rendering quality + memory + robustness release.** A 23-point audit of the v2.15.0 file (drawing, performance, robustness — no candlestick-pattern feedback) is addressed in full. Headline improvements:
+
+### Rendering quality
+1. **Pixel-snap consistency** — every 1px horizontal/vertical line now snaps to the BITMAP grid via `snapToH`/`snapToV`, not to a CSS `Math.floor(y) + 0.5` that only lands on a true device pixel when dpr is an integer. Grid, separators, current-price line, crosshair, hline/vline/fib are all crisp on 1.25 / 1.5 DPR (Windows/HiDPI laptops).
+2. **Time-axis label width** — measured with `ctx.measureText` instead of `label.length * 6 + 8` (broke on bold fonts, wide glyphs, future Arabic labels). Collision detection actually works now.
+3. **Crosshair on touch** — the blanket `if (_isMobile) return` was a fully disabled feature; mobile now shows a thinner-dashed crosshair + OHLC readout.
+4. **Crosshair time label clamp** — clamped to stay inside the canvas (left/right edges no longer clip outside).
+5. **Indicator line downsampling** — at extreme zoom-out (>2 visible bars per pixel), a light Ramer-Douglas-Peucker pass collapses collinear interior segments. New `helpers.drawLine(ctx, values, opts)` exposes it; `drawGradientArea` uses it internally.
+6. **Gradient area close path** — closes back to the FIRST index that actually had a value, not to `firstIdx` (which could be `null` for warm-up bars).
+7. **Min price area safety loop** — only gives up when EVERY pane is at the 28px floor (was: when the largest was, so a single tall pane could starve the price area).
+
+### Performance & memory
+8. **Indicator offscreen canvas sized to REGION** — overlay → price area, pane → that pane's rect, volume → volume strip. On a 4K monitor with 8 indicators, ~250MB of GPU memory drops to ~10-20MB. The render context is translated by `-region.x/-region.y` so user render code keeps using chart CSS coordinates.
+9. **Stamp split** — `_dataVersion` used to bump on every tick, so in the LIVE scenario every indicator rebuilt its bitmap every frame and the entire v2.11 cache pipeline was useless. New `_contentVersion` bumps ONLY when data is appended/replaced; the stamp's last-OHLC field still catches in-place updates of the forming candle. Hovering with a stable last tick is now a true `drawImage` blit.
+10. **ResizeObserver freezing CSS canvas fixed** — pinning `canvas.style.width = w+'px'` was freezing responsive layouts (`width:100%` got overwritten). Pin only fires when the canvas has NO computed CSS size.
+11. **Wheel `deltaMode` (Firefox)** — line-mode deltaY is multiplied by 33 before the exp curve; zoom now matches Chrome (was ~30× weaker per notch).
+12. **`destroy()` video leak fixed** — background video is paused + its `timeupdate` listener removed + src-cleared. Previously the `<video>` kept playing in a closure on a "dead" chart.
+
+### Robustness
+13. **Synthetic mouse after touch** — a 600ms guard after `touchend` drops the synthetic mousedown/mousemove/mouseup that mobile browsers always fire. A tap no longer starts a preview, cancels it, then re-starts it via the synthetic mouse.
+14. **Late-tick window configurable** — `opts.lateUpdateWindow` (default 300, set 0 to disable). Stale ticks older than the window are counted (one warning per session) instead of silently dropped.
+15. **Data validation** — invalid candles are counted + warned once per `setData`; negative volume clamped to 0; `open = 0` is repaired from the previous close (or low, or 1) so the legend's `changePct` no longer shows `Infinity%` or `NaN%`.
+16. **Drawings anchored by time** — every drawing now stores `t1/t2/tIdx/tPoints` (unix seconds) alongside its index. Render + hit-test re-derive the index from the time, so after a 50k trim that shifts all indices, your trend lines stay on the SAME candle.
+17. **Band hit-test** — only the top/bottom EDGES capture a click; the interior is pannable like a Rectangle.
+18. **Text tool editor** — double-click a text drawing opens an inline DOM `<input>` (Enter/blur commits, Esc cancels). The v2.14.0 removal of `prompt()` had left text drawings permanently stuck at their default label.
+19. **Timezone / locale** — constructor accepts `opts.timezone` (IANA, e.g. `'Asia/Riyadh'`) and `opts.locale` (BCP-47, e.g. `'ar-SA'`). Tick marks + crosshair time + countdown render in the local timezone/locale; data stays in Unix seconds. Default behavior (UTC + English short months) is unchanged.
+
+### Code quality
+20. **Dead `resetView()` removed** — the first of two definitions was unreachable.
+21. **`window.THEME` re-published every render** — external code reading it now sees the live instance theme (was pinned to a stale default at module load).
+22. **Settings card auto-discovers ALL keys** — `period/mult/fast/slow/signal/bins/color` stay first with friendly labels; every other key in `state.settings` is auto-labeled and editable (camelCase/snake_case → "Camel Case").
+23. **Local `pad2` in `drawCountdown` no longer shadows the module-level helper.**
+
+No breaking API changes. All new opts are optional. 9 automated assertions cover the headline items.
 
 ---
 

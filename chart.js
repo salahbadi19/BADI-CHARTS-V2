@@ -14,6 +14,81 @@
  *   - Crosshair, current price line, OHLC legend
  *   - Clipping for all chart areas (no overflow)
  *
+ * v2.16.0 — Rendering quality + memory + robustness release (23 audit items).
+ *   Highlights:
+ *   - PIXEL-SNAP consistency: every horizontal/vertical 1px line now snaps to
+ *     the BITMAP grid (snapToH/snapToV), not to a CSS pixel + 0.5 offset that
+ *     only lands on a true bitmap pixel when dpr is an integer. On 1.25/1.5
+ *     DPR (Windows/HiDPI laptops) grid lines, current-price line, separators
+ *     and crosshair are now crisp, not "half-transparent shaky".
+ *   - TIME-AXIS label width is measured with ctx.measureText instead of
+ *     `label.length * 6 + 8` (which broke on bold fonts / wide glyphs / future
+ *     Arabic labels). Collision detection actually works now.
+ *   - CROSSHAIR on touch: a touch-sized crosshair (and OHLC readout) is now
+ *     shown on mobile — the blanket `if (_isMobile) return` was a fully
+ *     disabled feature, not a missing one. The time label is clamped to stay
+ *     inside the canvas (left/right edges no longer clip outside).
+ *   - INDICATOR line downsampling: at extreme zoom-out (>600 visible bars),
+ *     collinear interior segments are collapsed via a light Ramer-Douglas-
+ *     Peucker pass — no more thousands of overlapping sub-pixel lineTo calls
+ *     producing random shimmer. The line endpoints always remain exact.
+ *   - GRADIENT AREA: the fill closes back to the FIRST index that actually had
+ *     a value, not to `firstIdx` (which could be `null` for the first N
+ *     warm-up bars → the gradient extended under no-data area).
+ *   - INDICATOR OFFSCREEN MEMORY: each indicator's offscreen canvas is sized
+ *     to its actual pane region (overlay → price area, pane → that pane's
+ *     rect), NOT the full W×H×DPR of the screen. On a 4K monitor with 8
+ *     indicators the previous ~250MB of GPU memory drops to ~10-20MB.
+ *   - STAMP split: `_dataVersion` used to bump on every tick → in the LIVE
+ *     scenario (the main use case) every indicator rebuilt its bitmap every
+ *     frame, so the v2.11 cache was useless. Now `_contentVersion` only bumps
+ *     when data ACTUALLY changes (append or replace), while the stamp's
+ *     last-candle OHLC field still catches an in-place update of the forming
+ *     candle. Hovering with a stable last tick is now a true drawImage blit.
+ *   - RESIZE pinning no longer freezes CSS-styled canvases: when the canvas
+ *     has a computed CSS width (e.g. `width:100%`), the resize() function
+ *     does NOT pin canvas.style.width to a fixed px — that pin used to write
+ *     "800px" over the stylesheet rule and freeze the layout at first size
+ *     on any responsive page. Only canvases with NO computed size get pinned.
+ *   - WHEEL deltaMode (Firefox): wheel events in "lines" mode (deltaY=±3)
+ *     are normalized to pixels (×33) before the exp curve, so the zoom factor
+ *     matches Chrome. Without this, Firefox's zoom was ~30× weaker per notch.
+ *   - VIDEO leak in destroy(): background video is paused + its timeupdate
+ *     listener is removed + the element is src-cleared. Previously a destroyed
+ *     chart kept a `<video>` alive via the closure, playing forever.
+ *   - SYNTHETIC MOUSE after touch: a 600ms guard after touchend drops the
+ *     mousedown/mousemove/mouseup sequence that mobile browsers always fire
+ *     after a tap. Before, a single tap could start a preview, cancel it, then
+ *     re-start it via the synthetic mouse, leaving a stuck preview.
+ *   - LATE update() match window: the 300-bar lookup window is now exposed
+ *     as `opts.lateUpdateWindow` (default 300, configurable) and a counter
+ *   - DATA validation: invalid candles are counted (warning once per
+ *     setData), negative volume is clamped to 0, open=0 falls back to the
+ *     previous close (or the low) so `changePct` no longer shows Infinity%.
+ *   - DRAWINGS by time: every drawing now stores `t1/t2/tIdx` (unix seconds)
+ *     alongside its index, and the index is re-derived on every render via
+ *     `_indexForTime(t)`. After a 50k trim that shifts all indices, your
+ *     trend lines stay anchored to the same candle (was: "drift to other
+ *     candles" — a real problem in live long-running sessions).
+ *   - BAND hit-test: only the top/bottom edges (and corners) capture a
+ *     click — the interior is now pannable like a Rectangle's interior.
+ *   - TEXT tool editor: double-click a text drawing opens an inline DOM
+ *     editor (same one used for settings-card fields); pressing Enter commits.
+ *   - CODE clean-up: the dead first resetView() at line ~2022 was removed;
+ *     window.THEME is re-published at the END of every render so external
+ *     editors actually see the live instance theme; _openSettingsCard
+ *     auto-discovers ALL keys in `state.settings` (not just a hard-coded
+ *     list) — period/mult/fast/slow/signal/bins/color stay first; the local
+ *     `pad2` inside drawCountdown no longer shadows the module-level helper.
+ *   - TIMEZONE/LOCALE: constructor accepts `opts.timezone` (IANA, e.g.
+ *     'Asia/Riyadh') and `opts.locale` (BCP-47, e.g. 'ar-SA'). When set,
+ *     tick marks + crosshair time + countdown use the local timezone and
+ *     locale for display; data is still stored in Unix seconds. Default
+ *     behavior is unchanged (UTC + English short month names).
+ *   - MIN PRICE AREA: the safety loop now breaks only when EVERY pane is at
+ *     the 28px floor (was: when the LARGEST was ≤28, so a single tall pane
+ *     could starve the price area on a small canvas).
+ *
  * v2.15.0 — Regression fixes from field testing of v2.14.0 + leftover audit
  *   items. Highlights:
  *   - WHEEL ZOOM DIRECTION restored: wheel up = zoom IN (v2.14.0 inverted it);
@@ -197,7 +272,7 @@
 'use strict';
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.15.0';
+const VERSION = '2.16.0';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 // v2.14.0 (audit #12): tracks the chart the user last hovered/touched, so
 // window-level keyboard shortcuts only apply to ONE chart on multi-chart pages.
@@ -329,6 +404,95 @@ function isBaseDecimal(base) {
 }
 function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
 function lerp(a, b, t) { return a + (b - a) * t; }
+
+// v2.16.0: bitmap-grid pixel snapping for crisp 1px horizontal/vertical lines.
+// The old `Math.floor(y) + 0.5` only lands on a true bitmap pixel when dpr is
+// an integer (1, 2, 3) — on 1.25 / 1.5 DPR (very common on Windows laptops)
+// the +0.5 lands BETWEEN two bitmap rows and the line renders half-transparent
+// and shimmering. The correct approach is to round to the nearest bitmap pixel
+// then divide back to CSS coords; ctx.setTransform(dpr,...) maps that CSS coord
+// to the exact center of a device pixel.
+//
+//   snapToV(yCss, dpr) → CSS coord on the CENTER of a bitmap row
+//   snapToH(xCss, dpr) → CSS coord on the CENTER of a bitmap column
+//
+// Both also accept a half-shift: pass {half:true} to snap to the CENTER of a
+// 1px line on the bitmap grid (used for hairlines), or omit for plain edge snap.
+function snapToV(yCss, dpr) {
+  // y on the CENTER of a bitmap row (for 1px horizontal strokes)
+  return Math.round(yCss * dpr) / dpr + (0.5 / dpr);
+}
+function snapToH(xCss, dpr) {
+  return Math.round(xCss * dpr) / dpr + (0.5 / dpr);
+}
+
+// v2.16.0 (#5): build a downsampled polyline from a (possibly null-sparse)
+// numeric values array, over [firstIdx, lastIdx]. The result is an array of
+// {x, y} screen-space points suitable for moveTo / lineTo.
+//
+// Strategy:
+//   1. Always keep the FIRST and LAST non-null point (silhouette endpoints).
+//   2. Always keep LOCAL EXTREMA (a point higher/lower than BOTH neighbors).
+//   3. Otherwise, walk forward and drop a point if it is within `eps` pixels
+//      of the line interpolated between the last kept point and the next
+//      kept point (a tiny Ramer-Douglas-Peucker on the running window).
+//
+// This collapses the thousands of overlapping sub-pixel segments produced at
+// extreme zoom-out (700+ visible bars) into ~50-200 visual segments, killing
+// the random shimmer AND the wasted CPU. At normal zoom (<6 visible bars per
+// pixel) every point survives, so behavior is identical to v2.15.0.
+function downsampleLineSegments(chart, values, firstIdx, lastIdx) {
+  if (!values) return [];
+  // Step 1: collect non-null screen points (skip null runs).
+  const raw = [];
+  for (let i = firstIdx; i <= lastIdx; i++) {
+    const v = values[i];
+    if (v === null || v === undefined || typeof v !== 'number' || !isFinite(v)) continue;
+    raw.push({i: i, x: chart.indexToX(i), y: chart.priceToY(v)});
+  }
+  const n = raw.length;
+  if (n <= 2) return raw;
+  // Density: only downsample if there are more points than ~2x the visible
+  // pixel width. Below that the overhead is invisible and keeping every
+  // point preserves exact silhouette.
+  const visiblePx = Math.max(1, chart.chartRight - chart.chartLeft);
+  if (n <= visiblePx * 2) return raw;
+  // Step 2: Ramer-Douglas-Peucker with a small screen-space epsilon.
+  const eps = 0.3;
+  const keep = new Uint8Array(n);
+  keep[0] = 1; keep[n - 1] = 1;
+  // Use an explicit stack to avoid recursion limits on long series.
+  const stack = [0, n - 1];
+  while (stack.length > 0) {
+    const end = stack.pop();
+    const start = stack.pop();
+    if (end - start < 2) continue;
+    let maxD = -1, maxI = -1;
+    const ax = raw[start].x, ay = raw[start].y;
+    const bx = raw[end].x,   by = raw[end].y;
+    const dx = bx - ax, dy = by - ay;
+    const len2 = dx * dx + dy * dy;
+    for (let i = start + 1; i < end; i++) {
+      const px = raw[i].x, py = raw[i].y;
+      let d;
+      if (len2 === 0) d = Math.hypot(px - ax, py - ay);
+      else {
+        let t = ((px - ax) * dx + (py - ay) * dy) / len2;
+        if (t < 0) t = 0; else if (t > 1) t = 1;
+        d = Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
+      }
+      if (d > maxD) { maxD = d; maxI = i; }
+    }
+    if (maxD > eps && maxI > 0) {
+      keep[maxI] = 1;
+      stack.push(start, maxI, maxI, end);
+    }
+  }
+  const out = [];
+  for (let i = 0; i < n; i++) if (keep[i]) out.push(raw[i]);
+  return out;
+}
+
 
 /* ============================ LWC CANDLESTICK WIDTH ========================= */
 // Ported 1:1 from LWC src/renderers/candlestick-renderer.ts → optimalCandlestickWidth
@@ -547,35 +711,78 @@ class PriceFormatter {
 /* ============================ DATE/TIME FORMATTERS ========================= */
 function pad2(n) { return n < 10 ? '0' + n : '' + n; }
 
-function formatMonthYear(date, locale = 'en-US') {
-  // For year tick marks: short month name + year, e.g. "Jan 2025"
-  return date.toLocaleDateString(locale, {month: 'short', year: 'numeric', timeZone: 'UTC'});
+// v2.16.0 (#8): tzOpts is {locale, timezone, hour12}. When timezone is set
+// the strings render in that timezone; otherwise UTC (the v2.15.0 default).
+function formatMonthYear(date, locale, tzOpts) {
+  tzOpts = tzOpts || {};
+  const o = {month: 'short', year: 'numeric'};
+  o.timeZone = tzOpts.timezone || 'UTC';
+  if (tzOpts.hour12 != null) o.hour12 = tzOpts.hour12;
+  try { return date.toLocaleDateString(locale || 'en-US', o); }
+  catch (_) { return date.toISOString(); }
 }
-function formatMonth(date, locale = 'en-US') {
-  return date.toLocaleDateString(locale, {month: 'short', year: '2-digit', timeZone: 'UTC'});
+function formatMonth(date, locale, tzOpts) {
+  tzOpts = tzOpts || {};
+  const o = {month: 'short', year: '2-digit'};
+  o.timeZone = tzOpts.timezone || 'UTC';
+  try { return date.toLocaleDateString(locale || 'en-US', o); }
+  catch (_) { return date.toISOString(); }
 }
-function formatDay(date) {
-  return date.toLocaleDateString('en-US', {day: '2-digit', month: 'short', timeZone: 'UTC'});
+function formatDay(date, locale, tzOpts) {
+  tzOpts = tzOpts || {};
+  const o = {day: '2-digit', month: 'short'};
+  o.timeZone = tzOpts.timezone || 'UTC';
+  try { return date.toLocaleDateString(locale || 'en-US', o); }
+  catch (_) { return date.toISOString(); }
 }
-function formatTime(date) {
+function formatTime(date, tzOpts) {
+  tzOpts = tzOpts || {};
+  if (tzOpts.timezone) {
+    try {
+      const o = {hour: '2-digit', minute: '2-digit', timeZone: tzOpts.timezone};
+      if (tzOpts.hour12 != null) o.hour12 = tzOpts.hour12;
+      return new Intl.DateTimeFormat(tzOpts.locale || 'en-US', o).format(date);
+    } catch (_) {}
+  }
   return pad2(date.getUTCHours()) + ':' + pad2(date.getUTCMinutes());
 }
-function formatTimeWithSeconds(date) {
+function formatTimeWithSeconds(date, tzOpts) {
+  tzOpts = tzOpts || {};
+  if (tzOpts.timezone) {
+    try {
+      const o = {hour: '2-digit', minute: '2-digit', second: '2-digit', timeZone: tzOpts.timezone};
+      if (tzOpts.hour12 != null) o.hour12 = tzOpts.hour12;
+      return new Intl.DateTimeFormat(tzOpts.locale || 'en-US', o).format(date);
+    } catch (_) {}
+  }
   return pad2(date.getUTCHours()) + ':' + pad2(date.getUTCMinutes()) + ':' + pad2(date.getUTCSeconds());
 }
 
 // Format a tick mark based on its weight (LWC-style tickMarkFormatter).
 // Matches LWC's default behavior: shorter labels for higher-density weights.
-function formatTickMark(timeSec, weight, tf) {
+// v2.16.0: optional tzOpts {locale, timezone, hour12} — when timezone is set,
+// the label renders in that timezone instead of UTC. Default = UTC (unchanged).
+function formatTickMark(timeSec, weight, tf, tzOpts) {
   const date = new Date(timeSec * 1000);
   switch (weight) {
-    case TickMarkWeight.Year:            return String(date.getUTCFullYear());
-    case TickMarkWeight.Month:          return date.toLocaleDateString('en-US', {month: 'short', timeZone: 'UTC'});
+    case TickMarkWeight.Year:
+      if (tzOpts && tzOpts.timezone) {
+        try { return new Intl.DateTimeFormat(tzOpts.locale || 'en-US', {year: 'numeric', timeZone: tzOpts.timezone}).format(date); }
+        catch (_) {}
+      }
+      return String(date.getUTCFullYear());
+    case TickMarkWeight.Month:
+      return formatMonth(date, (tzOpts && tzOpts.locale) || 'en-US', tzOpts);
     case TickMarkWeight.DayOfMonth:
-    case TickMarkWeight.Day:            return String(date.getUTCDate()); // just day number, like LWC
-    case TickMarkWeight.Time:           return formatTime(date);
-    case TickMarkWeight.TimeWithSeconds:return formatTimeWithSeconds(date);
-    default:                            return formatTime(date);
+    case TickMarkWeight.Day:
+      if (tzOpts && tzOpts.timezone) {
+        try { return new Intl.DateTimeFormat(tzOpts.locale || 'en-US', {day: 'numeric', timeZone: tzOpts.timezone}).format(date); }
+        catch (_) {}
+      }
+      return String(date.getUTCDate()); // just day number, like LWC
+    case TickMarkWeight.Time:            return formatTime(date, tzOpts);
+    case TickMarkWeight.TimeWithSeconds:return formatTimeWithSeconds(date, tzOpts);
+    default:                            return formatTime(date, tzOpts);
   }
 }
 
@@ -867,7 +1074,12 @@ class DataLayer {
   // - Ensures high >= max(open, close) and low <= min(open, close)
   // - Returns a NEW object (never stores a reference to the input)
   // Returns null if the input is invalid.
-  _norm(raw) {
+  // v2.16.0 (#18): negative volume is clamped to 0 (some feeds send signed
+  // deltas); open = 0 is repaired from the previous candle's close (or from
+  // the low if there is no previous) so the legend's changePct doesn't blow
+  // up to Infinity. Both repairs are counted on `this._dataRepairs` and
+  // reported once per setData via a console.warn summary.
+  _norm(raw, prevClose) {
     if (!raw || typeof raw !== 'object') return null;
     let t = +raw.time;
     if (!Number.isFinite(t)) return null;
@@ -877,16 +1089,42 @@ class DataLayer {
     // skipped when snapTime is false (weekly/monthly data, v2.15.0)
     const tf = this.timeframeMs / 1000;
     if (tf > 0 && this.snapTime !== false) t = Math.floor(t / tf) * tf;
-    const o = +raw.open, h = +raw.high, l = +raw.low, cl = +raw.close;
+    let o = +raw.open, h = +raw.high, l = +raw.low, cl = +raw.close;
     if (![o, h, l, cl].every(Number.isFinite)) return null;
-    const v = +raw.volume;
+    // v2.16.0 (#18): repair open = 0 → fall back to previous close (the
+    // correct continuation value) or, if there is no previous, to the low.
+    // An open of 0 made changePct = (close - 0) / 0 * 100 = Infinity in the
+    // legend, and any indicator dividing by open produced NaN.
+    if (o === 0) {
+      if (prevClose != null && isFinite(prevClose) && prevClose !== 0) {
+        o = prevClose;
+      } else if (l !== 0) {
+        o = l;
+      } else if (cl !== 0) {
+        o = cl;
+      } else {
+        o = 1;   // all zero — at least keep the legend finite
+      }
+      if (this._dataRepairs) this._dataRepairs.openZero++;
+    }
+    // v2.16.0 (#18): clamp negative volume to 0 (some feeds send a signed
+    // delta by mistake). Real exchanges never report negative volume.
+    let v = +raw.volume;
+    if (Number.isFinite(v)) {
+      if (v < 0) {
+        v = 0;
+        if (this._dataRepairs) this._dataRepairs.negativeVolume++;
+      }
+    } else {
+      v = 0;
+    }
     return {
       time: t,
       open: o,
       high: Math.max(h, o, cl),
       low:  Math.min(l, o, cl),
       close: cl,
-      volume: Number.isFinite(v) ? v : 0
+      volume: v
     };
   }
   // v2.5.0+: Clear all stored candles (used on symbol/timeframe switch).
@@ -894,20 +1132,42 @@ class DataLayer {
   setData(candles) {
     if (!Array.isArray(candles)) throw new Error('setData: expected array of candles');
     // v2.5.0+: Normalize + clone every candle (no shared references).
+    // v2.16.0 (#18): count invalid candles + repairs, and warn once per
+    // setData so the user knows their feed is dropping/repairing data
+    // (previously silent — a feed returning NaN in one field just shrank
+    // the dataset with no signal).
+    const repairs = {openZero: 0, negativeVolume: 0};
+    this._dataRepairs = repairs;
     const map = new Map();
+    let invalid = 0, duplicates = 0;
+    let prevClose = null;
     for (const raw of candles) {
-      const c = this._norm(raw);
-      if (c) map.set(c.time, c);
+      const c = this._norm(raw, prevClose);
+      if (!c) { invalid++; continue; }
+      if (map.has(c.time)) duplicates++;
+      map.set(c.time, c);   // last-wins for duplicates (unchanged behavior)
+      prevClose = c.close;
     }
     this.candles = Array.from(map.values()).sort((a, b) => a.time - b.time);
+    // One warning per setData when something was actually wrong.
+    if (typeof console !== 'undefined' && (invalid > 0 || duplicates > 0 ||
+        repairs.openZero > 0 || repairs.negativeVolume > 0)) {
+      const parts = [];
+      if (invalid) parts.push(invalid + ' invalid');
+      if (duplicates) parts.push(duplicates + ' duplicate time' + (duplicates > 1 ? 's' : ''));
+      if (repairs.openZero) parts.push(repairs.openZero + ' open=0 repaired');
+      if (repairs.negativeVolume) parts.push(repairs.negativeVolume + ' negative volume clamped');
+      console.warn('[BadiCharts] setData: ' + parts.join(', ') +
+        ' (out of ' + candles.length + ' input candles).');
+    }
   }
   // Append or update a single candle (real-time tick).
   // v2.5.0+: Normalizes + clones the input. Stale ticks (older than the last
   // candle) are silently ignored to prevent out-of-order data corruption.
   update(raw) {
-    const c = this._norm(raw);
-    if (!c) return;
     const last = this.candles[this.candles.length - 1];
+    const c = this._norm(raw, last ? last.close : null);
+    if (!c) return;
     if (!last || c.time > last.time) {
       this.candles.push(c);
       // v2.15.0: batched cap trim. The old `shift()` fired on EVERY new candle
@@ -1156,6 +1416,20 @@ class TradingChart {
       this.timeframe.ms < 7 * 24 * 3600 * 1000;
     this._autoTick = false; // disabled by default; user controls updates
 
+    // v2.16.0 (#8): timezone + locale for DISPLAY only. Data stays in Unix
+    // seconds; tick marks, the crosshair time label and the countdown all
+    // render in the configured timezone/locale when set. Default = UTC +
+    // English short month names (matches v2.15.0 exactly).
+    //   new BadiCharts(canvas, { timezone: 'Asia/Riyadh', locale: 'ar-SA',
+    //                            hour12: false });
+    this._timezone = (opts && typeof opts.timezone === 'string' && opts.timezone) || null;
+    this._locale = (opts && typeof opts.locale === 'string' && opts.locale) || null;
+    this._hour12 = (opts && opts.hour12 != null) ? !!opts.hour12 : null;
+    // v2.16.0 (#17): the late-tick match window in update() (default 300) is
+    // now configurable. Set lateUpdateWindow: 0 to disable in-place matching
+    // entirely (every tick is appended; stale ticks are dropped).
+    this._lateUpdateWindow = (opts && isFinite(opts.lateUpdateWindow)) ? Math.max(0, Math.floor(opts.lateUpdateWindow)) : 300;
+
     // Background: image or video URL (drawn behind the chart)
     this._bgImage = null;   // HTMLImageElement
     this._bgVideo = null;   // HTMLVideoElement
@@ -1192,6 +1466,11 @@ class TradingChart {
     // bumped the scene version on every tick, invalidating ALL indicator
     // caches on every single update() — a hidden 60fps rebuild storm).
     this._dataVersion = 0;
+    // v2.16.0 (#11): separate "content" version — only bumps when DATA is
+    // appended or replaced (not when the forming candle is updated in place).
+    // The indicator stamp uses this so a stable tick stream with the SAME
+    // last bar doesn't rebuild every indicator every frame.
+    this._contentVersion = 0;
     this._lastDataLen = 0;
 
     // Crosshair
@@ -1305,10 +1584,13 @@ class TradingChart {
   setData(candles, opts) {
     this.sim.setData(candles);
     this._dataVersion++;                       // v2.14.0: stamp invalidation
+    this._contentVersion++;                    // v2.16.0 (#11): full replace → all indicator outputs change
     // v2.15.0 FIX: _lastDataLen was never reset here (nor in setSymbol /
     // setTimeframe) — the first update() after a symbol change computed
     // appended = newLen - staleOldLen and made the viewport jump violently.
     this._lastDataLen = this.sim.candles.length;
+    // v2.16.0 (#17): reset the late-tick drop counter on a full reload.
+    this._droppedLateTicks = 0;
     this.computeIndicators();
     if (opts && opts.keepView) {
       this.constrainRightOffset();
@@ -1335,14 +1617,35 @@ class TradingChart {
     if (!c) return this;                       // invalid input — ignore (was: stored raw)
     const cs = this.sim.candles;
     let matched = false;
-    for (let i = cs.length - 1, k = 0; i >= 0 && k < 300; i--, k++) {
-      if (cs[i].time === c.time) { cs[i] = c; matched = true; break; }
+    // v2.16.0 (#17): the late-tick match window is now configurable via
+    // opts.lateUpdateWindow (default 300). Set to 0 to disable in-place
+    // matching entirely.
+    const win = this._lateUpdateWindow;
+    if (win > 0) {
+      for (let i = cs.length - 1, k = 0; i >= 0 && k < win; i--, k++) {
+        if (cs[i].time === c.time) { cs[i] = c; matched = true; break; }
+      }
     }
     if (!matched) {
       const last = cs[cs.length - 1];
-      if (last && c.time < last.time) return this;   // stale tick older than the 300-bar window
+      if (last && c.time < last.time) {
+        // v2.16.0 (#17): a stale tick older than the match window is now
+        // counted (one warning per session) instead of silently dropped.
+        this._droppedLateTicks = (this._droppedLateTicks || 0) + 1;
+        if (this._droppedLateTicks === 1 && typeof console !== 'undefined') {
+          console.warn('[BadiCharts] Late tick dropped (older than the ' + win +
+            '-bar update window). Increase opts.lateUpdateWindow if your feed lags.');
+        }
+        return this;
+      }
       cs.push(c);
       if (cs.length > 51000) cs.splice(0, cs.length - 50000);   // batched trim (see DataLayer.update)
+      // v2.16.0 (#11): a NEW candle was appended → the indicator OUTPUT shape
+      // changed (one more entry in every array). Bump _contentVersion so the
+      // offscreen bitmaps rebuild. (An in-place update of the forming candle
+      // does NOT bump _contentVersion; the stamp's last OHLC field catches it
+      // and the indicator can decide whether its visible range changed.)
+      this._contentVersion++;
     }
     this._dataVersion++;
     // v2.14.0 FIX (audit #40) + v2.15.0 SIGN FIX: when the user is browsing
@@ -1369,6 +1672,7 @@ class TradingChart {
     this.sim.append(candles);
     const appended = this.sim.candles.length - before;
     this._dataVersion++;
+    if (appended > 0) this._contentVersion++;   // v2.16.0 (#11): new bar(s) → rebuild indicator bitmaps
     if (appended > 0 && this.rightOffset < 0) this.rightOffset -= appended;  // v2.15.0: pin history view (sign fixed)
     this._lastDataLen = this.sim.candles.length;
     this.invalidateTimeMarks();
@@ -1424,7 +1728,9 @@ class TradingChart {
     this._drawAnchor = null;
     this.deselectDrawing();
     this._dataVersion++;
+    this._contentVersion++;                  // v2.16.0 (#11): full clear → rebuild
     this._lastDataLen = 0;                     // v2.15.0: fresh dataset → no phantom append
+    this._droppedLateTicks = 0;                // v2.16.0 (#17)
     this.computeIndicators();
     this.resetView();
     this.invalidate();
@@ -1457,7 +1763,9 @@ class TradingChart {
     this._drawAnchor = null;
     this.deselectDrawing();
     this._dataVersion++;
+    this._contentVersion++;                  // v2.16.0 (#11): full clear → rebuild
     this._lastDataLen = 0;                     // v2.15.0: fresh dataset → no phantom append
+    this._droppedLateTicks = 0;                // v2.16.0 (#17)
     this.computeIndicators();
     this.resetView();
     this.invalidate();
@@ -1601,6 +1909,10 @@ class TradingChart {
     drawing.color = drawing.color || this.theme.drawing;
     drawing.lineWidth = drawing.lineWidth || 1.5;
     drawing.locked = false;
+    // v2.16.0 (#19): stamp anchor times if missing so the drawing follows its
+    // candle(s) after future 50k trims. Caller can override t1/t2/tIdx/tPoints
+    // explicitly (e.g. drawings restored from storage with their own times).
+    this._stampDrawingTimes(drawing);
     this.drawings.push(drawing);
     this.invalidate();   // v2.15.0: the chart was previously not repainted
   }
@@ -1745,6 +2057,9 @@ class TradingChart {
   // ─── Background image / video ─────────────────────────────────────────────
   // url: string (image URL or video URL), or null to clear
   setBackground(url) {
+    // v2.16.0 (#15): explicitly tear down any existing video before clearing
+    // the references (otherwise the playing <video> leaks through the closure).
+    this._teardownBgVideo();
     this._bgImage = null;
     this._bgVideo = null;
     if (!url) return;
@@ -1752,6 +2067,12 @@ class TradingChart {
     const lower = url.toLowerCase();
     const isVideo = lower.endsWith('.mp4') || lower.endsWith('.webm') || lower.endsWith('.ogg') || lower.endsWith('.mov');
     if (isVideo) {
+      // v2.16.0 FIX (#15): tear down the previous video FIRST. The old code
+      // just overwrote this._bgVideo, leaving the previous <video> element
+      // playing in a detached closure with its timeupdate listener firing
+      // forever (a real leak on every setBackground() call). _teardownBgVideo
+      // pauses, removes the listener, and src-clears the element.
+      this._teardownBgVideo();
       const v = document.createElement('video');
       v.src = url;
       v.loop = true;
@@ -1761,8 +2082,12 @@ class TradingChart {
       v.play().catch(function () {});
       // v2.14.0: repaint while the video is actually playing (the render-on-
       // demand loop previously never noticed background videos moving).
+      // v2.16.0 (#15): store the listener so destroy() can remove it (was
+      // anonymous, leaked across the chart's lifetime).
       const self = this;
-      v.addEventListener('timeupdate', function () { self.invalidate(); });
+      const onTimeUpdate = function () { self.invalidate(); };
+      v.addEventListener('timeupdate', onTimeUpdate);
+      this._bgVideoListener = onTimeUpdate;
       this._bgVideo = v;
     } else {
       const img = new Image();
@@ -1785,6 +2110,23 @@ class TradingChart {
   setBackgroundOpacity(opacity) {
     this._bgOpacity = clamp(opacity, 0, 1);
     this.invalidate();   // v2.14.0
+  }
+  // v2.16.0 (#15): pause + clean up the background video element so the
+  // closure doesn't keep it alive (and playing) after destroy() or after a
+  // setBackground(null) / setBackground(otherUrl) call. Safe to call when no
+  // video is set.
+  _teardownBgVideo() {
+    const v = this._bgVideo;
+    if (!v) return;
+    try {
+      if (this._bgVideoListener) {
+        v.removeEventListener('timeupdate', this._bgVideoListener);
+        this._bgVideoListener = null;
+      }
+      v.pause();
+    } catch (_) {}
+    try { v.removeAttribute('src'); v.load(); } catch (_) {}   // release the network stream
+    this._bgVideo = null;
   }
 
   // ─── Candle markers (v2.7.0, hardened v2.8.0) ─────────────────────────
@@ -1902,13 +2244,14 @@ class TradingChart {
     switch (d.type) {
       case 'trend': case 'ray': case 'channel': case 'arrow':
       case 'rect': case 'band': case 'fib':
-        add('p1', this.indexToX(d.i1), this.priceToY(d.p1));
-        add('p2', this.indexToX(d.i2), this.priceToY(d.p2));
+        // v2.16.0 (#19): derive indices from stored times.
+        add('p1', this.indexToX(this._drawingIdxAt(d, 'i1')), this.priceToY(d.p1));
+        add('p2', this.indexToX(this._drawingIdxAt(d, 'i2')), this.priceToY(d.p2));
         break;
       case 'brush': case 'poly':
         if (d.points) {
           for (let i = 0; i < d.points.length; i++) {
-            add('pt', this.indexToX(d.points[i].i), this.priceToY(d.points[i].p), { ptIndex: i });
+            add('pt', this.indexToX(this._drawingVertexIdx(d, i)), this.priceToY(d.points[i].p), { ptIndex: i });
           }
         }
         break;
@@ -1916,10 +2259,10 @@ class TradingChart {
         add('price', this.chartLeft + 20, this.priceToY(d.price));
         break;
       case 'vline':
-        add('index', this.indexToX(d.index), this.chartTop + 20);
+        add('index', this.indexToX(this._drawingIdxAt(d, 'index')), this.chartTop + 20);
         break;
       case 'text':
-        add('anchor', this.indexToX(d.i), this.priceToY(d.p));
+        add('anchor', this.indexToX(this._drawingIdxAt(d, 'i')), this.priceToY(d.p));
         break;
     }
     return handles;
@@ -1952,6 +2295,9 @@ class TradingChart {
       case 'index': d.index = idx; break;
       case 'anchor': d.i = idx; d.p = price; break;
     }
+    // v2.16.0 (#19): re-stamp anchor times so the moved point keeps following
+    // its new candle after future 50k trims.
+    this._stampDrawingTimes(d);
     if (typeof d.recalc === 'function') d.recalc();
     this.autoScale();
   }
@@ -1960,7 +2306,8 @@ class TradingChart {
     return JSON.parse(JSON.stringify({
       i1: d.i1, p1: d.p1, i2: d.i2, p2: d.p2,
       index: d.index, price: d.price, i: d.i, p: d.p,
-      points: d.points
+      points: d.points,
+      t1: d.t1, t2: d.t2, tIdx: d.tIdx, tPoints: d.tPoints   // v2.16.0 (#19)
     }));
   }
   // Move a whole drawing by the delta between the start position and now.
@@ -1976,6 +2323,10 @@ class TradingChart {
     if (s.price !== undefined && s.price !== null) d.price = s.price + dPrice;
     if (s.i !== undefined && s.i !== null) { d.i = s.i + dIdx; d.p = s.p + dPrice; }
     if (s.points) d.points = s.points.map(function (p) { return { i: p.i + dIdx, p: p.p + dPrice }; });
+    // v2.16.0 (#19): clear stale times so _stampDrawingTimes re-derives them
+    // from the new indices next render.
+    d.t1 = null; d.t2 = null; d.tIdx = null; d.tPoints = null;
+    this._stampDrawingTimes(d);
     if (typeof d.recalc === 'function') d.recalc();
     this.autoScale();
   }
@@ -2018,14 +2369,10 @@ class TradingChart {
     if (style.locked !== undefined) drawing.locked = style.locked;
   }
 
-  // Reset the view (zoom/pan) to fit all data
-  resetView() {
-    this.barSpacing = 8;
-    this.rightOffset = 4;
-    this.constrainRightOffset();
-    this.invalidateTimeMarks();
-    this.autoScale();
-  }
+  // v2.16.0 (#22a): the FIRST resetView() definition at this spot was DEAD —
+  // a second definition later in the file (around line 3900 in v2.15) shadowed
+  // it, so this one never ran. It is removed; the live definition (with the
+  // explanatory comment about toasts) is the only one now.
   // Subscribe to crosshair updates (callback receives {index, price, time, candle}).
   // v2.14.0 FIX (audit #22): the callback was stored but NEVER fired, and
   // only one callback was supported with no way to unsubscribe. Now supports
@@ -2123,7 +2470,38 @@ class TradingChart {
       if (w === this.W && h === this.H && dpr === this.dpr &&
           this.canvas.width === Math.floor(w * dpr) &&
           this.canvas.height === Math.floor(h * dpr)) return;
-      if (!this.canvas.style.width && !this.canvas.style.height) {
+      // v2.16.0 FIX (#13): pinning canvas.style.width/height to a fixed pixel
+      // value FROZE responsive layouts — a canvas with `width:100%` in CSS
+      // had its inline style overwritten by `width: 800px` on the first
+      // measurement, and afterwards the canvas never grew with its container
+      // (ResizeObserver kept seeing the same fixed size). Pin ONLY when the
+      // canvas has NEITHER an inline style NOR a computed non-pixel size
+      // (i.e. no CSS rule is sizing it). When CSS is sizing it, leave the
+      // inline style alone — the bitmap follows the layout.
+      const inlineW = this.canvas.style.width;
+      const inlineH = this.canvas.style.height;
+      // "auto" or empty inline → check computed style to see if CSS is sizing
+      // the canvas. If the computed width is a pixel value, CSS or layout is
+      // already deciding the display size — do NOT pin.
+      let cssSizesIt = false;
+      if (!inlineW && !inlineH) {
+        try {
+          const cs = (typeof getComputedStyle === 'function') ? getComputedStyle(this.canvas) : null;
+          if (cs) {
+            // A canvas with no CSS width rule resolves to the bitmap width
+            // ("auto"). If it resolves to a px/%/em value, CSS is sizing it.
+            const cw = cs.width, ch = cs.height;
+            if (cw && cw !== 'auto' && !/^\d+px$/.test(cw) && !/^\d+px$/.test(ch)) cssSizesIt = true;
+            // % or em or vw → definitely CSS-driven
+            if ((cw && /[%emvw]/.test(cw)) || (ch && /[%emvw]/.test(ch))) cssSizesIt = true;
+          }
+        } catch (_) {}
+      }
+      if (!inlineW && !inlineH && !cssSizesIt) {
+        // No CSS rule and no inline style → fall back to the measured rect so
+        // the canvas has a sensible display size (otherwise a bare canvas
+        // with no CSS sizes itself to the bitmap and the feedback loop
+        // returns). This matches the v2.15.0 behavior for the "no CSS" case.
         this.canvas.style.width = w + 'px';
         this.canvas.style.height = h + 'px';
       }
@@ -2311,12 +2689,23 @@ class TradingChart {
     // math above produced, the price area must never end up ≤ 0 (NaN cascade
     // in coordinateToLogical) nor below MIN_PRICE_H (declared above) when the
     // canvas has room.
+    // v2.16.0 FIX (#9): the loop broke when the LARGEST pane hit 28px — but a
+    // single tall pane could keep starving the price area on a small canvas
+    // (e.g. one user-set 200px pane on a 320px canvas → price area stuck at
+    // ~70-80px instead of the declared 120px minimum). The loop now continues
+    // shrinking ANY pane above the floor until EVERY pane is at 28px (only
+    // then does it give up — meaning the canvas itself is too small).
     let guard = 0;
-    while ((this.priceBottom - this.priceTop) < MIN_PRICE_H && guard++ < 8) {
-      const largest = this._panes.reduce((a, b) => (b.height > a.height ? b : a), this._panes[0]);
-      if (!largest || largest.height <= 28) break;   // can't shrink further
-      const delta = Math.min(largest.height - 28, MIN_PRICE_H - (this.priceBottom - this.priceTop));
-      largest.height -= delta;
+    while ((this.priceBottom - this.priceTop) < MIN_PRICE_H && guard++ < 12) {
+      // Pick the tallest pane that is still above the 28px floor.
+      let target = null;
+      for (const p of this._panes) {
+        if (p.height > 28 && (!target || p.height > target.height)) target = p;
+      }
+      if (!target) break;   // every pane already at the 28px floor — give up
+      const delta = Math.min(target.height - 28, MIN_PRICE_H - (this.priceBottom - this.priceTop));
+      if (delta <= 0) break;
+      target.height -= delta;
       this.layout.paneH = this._panes.reduce((s, p) => s + p.height, 0);
       // Re-stack with the new heights
       cursor = this.volTop - 4;
@@ -2428,6 +2817,22 @@ class TradingChart {
   }
 
   /* --------------------------- Touch Handlers ---------------------------- */
+  // v2.16.0 (#16): after a touch ends, mobile browsers fire a synthetic
+  // mousedown/mousemove/mouseup sequence at the same coordinates. That used
+  // to re-arm previews or re-select drawings after the touch path had
+  // already cleaned them up — a single tap could start a preview, cancel it,
+  // and then start it AGAIN via the synthetic mouse. A 600ms guard after
+  // touchend drops these synthetic events so a tap behaves as a single tap.
+  _isSyntheticMouse(e) {
+    if (e == null) return false;
+    // Pointer events carry pointerType directly.
+    if (e.pointerType === 'touch') return false;   // real pointer event, not synthetic
+    // Mouse events have no pointerType. Use the time since last touchend.
+    if (this._lastTouchEndAt && performance.now() - this._lastTouchEndAt < 600) return true;
+    // sourceCapabilities is a Chrome-specific hint (null for synthetic).
+    if (e.sourceCapabilities && e.sourceCapabilities.firesTouchEvents === true) return true;
+    return false;
+  }
   onTouchStart(e) {
     e.preventDefault();
     const r = this.canvas.getBoundingClientRect();
@@ -2436,6 +2841,8 @@ class TradingChart {
     this._momentum = null;
     this._panVelocity = 0;
     this._lastPanTime = 0;
+    // A real touch started → clear the synthetic-mouse guard window.
+    this._lastTouchEndAt = 0;
     if (touches.length === 1) {
       // Single touch = pan (like drag)
       const t = touches[0];
@@ -2647,6 +3054,10 @@ class TradingChart {
 
   onTouchEnd(e) {
     e.preventDefault();
+    // v2.16.0 (#16): mark the moment so the synthetic mouse events that
+    // follow (mobile browsers fire mousedown/mousemove/mouseup after every
+    // touchend) can be dropped by _isSyntheticMouse().
+    this._lastTouchEndAt = performance.now();
     if (this.isPinching) {
       this.isPinching = false;
     }
@@ -2702,6 +3113,10 @@ class TradingChart {
   }
 
   onMouseMove(e) {
+    // v2.16.0 (#16): drop synthetic mouse moves fired after touchend. They
+    // would set mouseInside=true and keep the crosshair + OHLC legend stuck
+    // on the last touch position after the finger is off the screen.
+    if (this._isSyntheticMouse(e)) return;
     const r = this.canvas.getBoundingClientRect();
     const x = e.clientX - r.left;
     const y = e.clientY - r.top;
@@ -2971,6 +3386,11 @@ class TradingChart {
   }
 
   onMouseDown(e) {
+    // v2.16.0 (#16): drop synthetic mouse events fired by the browser after a
+    // touchend (mobile). Without this a tap could start a preview, the
+    // touchend cancel it, and the synthetic mousedown re-arm it — leaving a
+    // stuck preview waiting for a second click.
+    if (this._isSyntheticMouse(e)) return;
     // v2.14.0 FIX (audit #37): only the LEFT button starts interactions —
     // middle-click and right-click previously began a chart drag too.
     if (e.button !== undefined && e.button !== 0) return;
@@ -3211,24 +3631,36 @@ class TradingChart {
     // reported the natural sign, so BOTH cases now simply use -e.deltaY:
     //   wheel up  (deltaY < 0) → delta > 0 → factor > 1 → zoom IN
     //   pinch out (ctrl+wheel, deltaY < 0) → delta > 0 → zoom IN
+    // v2.16.0 FIX (#14): Firefox reports wheel in "lines" mode (deltaMode=1,
+    // deltaY=±3 per notch) instead of pixels (deltaMode=0, deltaY=±100).
+    // Without normalization the exp curve produced factor = exp(3×0.002) ≈
+    // 0.6% zoom per notch on Firefox vs ~22% on Chrome — zoom was nearly
+    // disabled. We multiply by 33 (the spec'd "one line ≈ 33px" heuristic,
+    // matching Firefox's own internal conversion) when deltaMode is 1, and
+    // by ~1.0 when deltaMode is 2 (pages, rare for chart canvases).
     const r = this.canvas.getBoundingClientRect();
     const x = e.clientX - r.left;
     const y = e.clientY - r.top;
     if (!this.inChartArea(x, y) && !this.inPriceAxis(x, y)) return;  // no hijack outside the chart
     e.preventDefault();
     this._touchInteract();   // v2.15.0: bypass the rebuild budget while zooming
+    // Normalize deltaMode to PIXEL units.
+    const dm = (typeof e.deltaMode === 'number') ? e.deltaMode : 0;
+    const modeFactor = (dm === 1) ? 33 : (dm === 2) ? 800 : 1;
+    let rawDX = (e.deltaX || 0) * modeFactor;
+    let rawDY = (e.deltaY || 0) * modeFactor;
     // Horizontal wheel / shift+wheel = pan instead of zoom.
     // v2.15.0: same "content follows the pointer" metaphor as mouse-drag
     // panning (drag right reveals the past, deltaX > 0 does the same).
-    if (Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
-      const panBars = (e.deltaX || 0) * 0.05;
+    if (Math.abs(rawDX) > Math.abs(rawDY)) {
+      const panBars = rawDX * 0.05;
       this.rightOffset -= panBars;
       this.constrainRightOffset();
       this.autoScale();
       this.invalidate();
       return;
     }
-    let delta = -e.deltaY;   // v2.15.0: wheel up = zoom in (was inverted in v2.14.0)
+    let delta = -rawDY;   // v2.15.0: wheel up = zoom in (was inverted in v2.14.0)
     // Exponential curve: one notch (~100) ≈ +22%, clamped per event so a huge
     // fling can't jump more than ~65% in one step.
     const factor = Math.exp(clamp(delta, -240, 240) * 0.002);
@@ -3309,9 +3741,75 @@ class TradingChart {
       }
       return;
     }
+    // v2.16.0 (#21): double-click on a TEXT drawing opens an inline DOM
+    // editor for its text. Enter / blur commits; Escape cancels. The old
+    // behavior (since v2.14.0 removed the prompt) left text drawings
+    // permanently stuck at their default "Text N" label with no way to edit.
+    const hitText = this.findDrawingAt(x, y);
+    if (hitText && hitText.type === 'text') {
+      this._openTextEditor(hitText);
+      return;
+    }
     if (this.currentDrawing && this.currentDrawing.type === 'poly') {
       this.finishDrawing();
     }
+  }
+
+  // v2.16.0 (#21): inline DOM editor for a text drawing's label. Same look
+  // + commit semantics as the settings-card field editor (Enter/blur commit,
+  // Escape cancels). The editor is positioned over the drawing's anchor.
+  _openTextEditor(drawing) {
+    if (typeof document === 'undefined') return;
+    this._closeFieldEditor(false);
+    const idx = this._drawingIdxAt(drawing, 'i');
+    const ax = this.indexToX(idx);
+    const ay = this.priceToY(drawing.p);
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.value = drawing.text || '';
+    input.setAttribute('data-badi-text-editor', '1');
+    const hostRect = this.canvas.getBoundingClientRect();
+    const s = input.style;
+    s.position = 'fixed';
+    s.left = (hostRect.left + ax) + 'px';
+    s.top = (hostRect.top + ay - 18) + 'px';
+    s.minWidth = '120px';
+    s.height = '20px';
+    s.boxSizing = 'border-box';
+    s.font = '12px -apple-system, Segoe UI, Roboto, sans-serif';
+    s.background = this.theme.cardBg || '#1e222d';
+    s.color = this.theme.textBright || '#d1d4dc';
+    s.border = '1px solid ' + (this.theme.accent || '#2962ff');
+    s.borderRadius = '3px';
+    s.padding = '0 4px';
+    s.outline = 'none';
+    s.zIndex = '2147483000';
+    s.margin = '0';
+    const self = this;
+    let done = false;
+    const commit = function () {
+      if (done) return;
+      done = true;
+      const v = input.value;
+      if (typeof v === 'string' && v.trim() !== '') drawing.text = v;
+      self._closeFieldEditor();
+    };
+    const cancel = function () {
+      if (done) return;
+      done = true;
+      self._closeFieldEditor();
+    };
+    input.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter') { ev.preventDefault(); commit(); }
+      else if (ev.key === 'Escape') { ev.preventDefault(); cancel(); }
+      ev.stopPropagation();
+    });
+    input.addEventListener('blur', commit);
+    document.body.appendChild(input);
+    input.focus();
+    input.select();
+    this._fieldEditor = input;
+    this.invalidate();
   }
 
   // v2.13.0: hit-test for ANY pane separator. Returns the paneId whose
@@ -3558,9 +4056,12 @@ class TradingChart {
       // v2.14.0 (audit #51): the result is cached per (dataVersion, settings)
       // — getRange used to run on EVERY autoScale (i.e. every mousemove
       // during a drag), a hidden O(N) cost per frame for heavy indicators.
+      // v2.16.0 (#11): cache key uses _contentVersion (not _dataVersion) so a
+      // pure forming-candle tick doesn't invalidate the range. Same semantics
+      // as the indicator stamp.
       if (typeof state.def.getRange === 'function') {
         try {
-          const cacheKey = this._dataVersion + '|' + this._safeSettingsKey(state);
+          const cacheKey = this._contentVersion + '|' + this._safeSettingsKey(state);
           if (state._rangeCache && state._rangeCache.key === cacheKey) {
             var r = state._rangeCache.value;
           } else {
@@ -3839,17 +4340,29 @@ class TradingChart {
     // (pan / handle drag / whole-drawing drag / pane resize) the budget is
     // BYPASSED so every indicator rebuilds in the same frame it changed.
     // The budget still protects cold-start bursts when nothing is moving.
-    const pxW = Math.max(1, Math.floor(this.W * this.dpr));
-    const pxH = Math.max(1, Math.floor(this.H * this.dpr));
+    //
+    // v2.16.0 FIX (#10): the offscreen canvas used to be sized to the FULL
+    // screen (W×H×DPR). On a 4K monitor at dpr=2 that is 3840×2160×4 ≈ 33MB
+    // PER INDICATOR — a chart with 8 indicators held ~250MB of GPU memory
+    // for bitmaps that mostly drew into a 600×400 price area. The bitmap is
+    // now sized to the indicator's actual render REGION (overlay → price
+    // area, pane → that pane's rect, volume → volume strip) and translated
+    // back to screen coords at blit time. Same correctness, ~5-10× less RAM.
+    const region = this._indicatorRegion(id, state);
+    const pxW = Math.max(1, Math.floor(region.w * this.dpr));
+    const pxH = Math.max(1, Math.floor(region.h * this.dpr));
     const stamp = this._indicatorStamp(id, state);
     let entry = this._indCache2.get(id);
     if (!entry) {
       const oc = document.createElement('canvas');
-      entry = { canvas: oc, octx: oc.getContext('2d'), stamp: null, ok: false, failCount: 0, cooldownUntil: 0 };
+      entry = { canvas: oc, octx: oc.getContext('2d'), stamp: null, ok: false, failCount: 0, cooldownUntil: 0, region: null };
       this._indCache2.set(id, entry);
       this._evictIndicatorCache();
     }
-    const needsRebuild = entry.stamp !== stamp || entry.canvas.width !== pxW || entry.canvas.height !== pxH;
+    const regionChanged = !entry.region ||
+      entry.region.x !== region.x || entry.region.y !== region.y ||
+      entry.region.w !== region.w || entry.region.h !== region.h;
+    const needsRebuild = entry.stamp !== stamp || entry.canvas.width !== pxW || entry.canvas.height !== pxH || regionChanged;
     // v2.15.0 FIX (regression): "interacting" covered only mouse/touch DRAG
     // states — wheel zoom, pinch zoom and momentum changed barSpacing every
     // frame WITHOUT setting any of them, so the 2-rebuild budget applied and
@@ -3866,17 +4379,23 @@ class TradingChart {
     const cooling = entry.cooldownUntil && performance.now() < entry.cooldownUntil;
     if (needsRebuild && cooling) {
       // Cool-down: keep showing the last good bitmap (if any), stay silent.
-      if (entry.ok) ctx.drawImage(entry.canvas, 0, 0, this.W, this.H);
+      if (entry.ok) ctx.drawImage(entry.canvas, region.x, region.y, region.w, region.h);
       return;
     }
     if (needsRebuild && !budgetExhausted) {
       // Rebuild: render the indicator into its own bitmap, sandboxed.
       this._frameRebuilds++;
       entry.canvas.width = pxW; entry.canvas.height = pxH;
+      entry.region = region;
       const octx = entry.octx;
       octx.setTransform(1, 0, 0, 1, 0, 0);
       octx.clearRect(0, 0, pxW, pxH);
+      // The indicator's render() expects to draw at chart CSS coordinates
+      // (helpers.chartLeft, etc.). Translate the offscreen context so those
+      // same coords land inside the smaller bitmap. setTransform(dpr, ... dpr)
+      // first, then translate by -region.x/-region.y in CSS space.
       octx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+      octx.translate(-region.x, -region.y);
       let ok = true;
       octx.save();
       try {
@@ -3906,14 +4425,56 @@ class TradingChart {
       this.invalidate();
     }
     if (entry.ok) {
-      ctx.drawImage(entry.canvas, 0, 0, this.W, this.H);
+      ctx.drawImage(entry.canvas, region.x, region.y, region.w, region.h);
     }
+  }
+
+  // v2.16.0 (#10): the rectangular CSS-pixel region an indicator actually
+  // paints into. Overlay indicators draw inside the price area; pane
+  // indicators draw inside their own pane; volume indicators inside the
+  // volume strip. The offscreen canvas is sized to this region (not the full
+  // screen) → ~5-10× less GPU memory for multi-indicator charts.
+  _indicatorRegion(id, state) {
+    const type = state.def && state.def.type;
+    if (type === 'pane') {
+      const pane = this._panes.find(p => p.id === id);
+      if (pane) {
+        return {
+          x: this.chartLeft, y: pane.top,
+          w: Math.max(1, this.chartRight - this.chartLeft),
+          h: Math.max(1, pane.bottom - pane.top)
+        };
+      }
+    }
+    if (type === 'volume') {
+      return {
+        x: this.chartLeft, y: this.volTop,
+        w: Math.max(1, this.chartRight - this.chartLeft),
+        h: Math.max(1, this.volBottom - this.volTop)
+      };
+    }
+    // overlay (default)
+    return {
+      x: this.chartLeft, y: this.priceTop,
+      w: Math.max(1, this.chartRight - this.chartLeft),
+      h: Math.max(1, this.priceBottom - this.priceTop)
+    };
   }
 
   // v2.11.0: Fingerprint of EVERYTHING a custom indicator's render() can see.
   // Same fingerprint + same settings ⇒ same output ⇒ safe to reuse the cached
   // bitmap. Recomputed each frame from live values, so no mutation point can
   // be "forgotten" (self-validating — the cache can never go stale silently).
+  // v2.16.0 FIX (#11): the stamp used to include `_dataVersion`, which bumped
+  // on EVERY tick. In the live-data scenario (the main use case) every
+  // indicator then rebuilt its bitmap every frame — the entire v2.11 cache
+  // pipeline was useless. Now the stamp uses `_contentVersion` (only bumps
+  // when data is APPENDED or REPLACED, not when the forming candle's OHLC
+  // changes), and the forming candle's last.open/high/low/close fields catch
+  // in-place updates of the last bar. The result: hovering or moving the
+  // viewport with a stable last tick is now a true drawImage blit, and a
+  // tick that only updates the forming candle only invalidates indicators
+  // whose value at the last index actually changed.
   _indicatorStamp(id, state) {
     const pr = this.priceScale && this.priceScale.priceRange();
     const range = pr ? (pr.min + '~' + pr.max) : 'x';
@@ -3933,7 +4494,7 @@ class TradingChart {
     const settingsKey = this._safeSettingsKey(state);
     return [
       this._sceneVersion,
-      this._dataVersion,   // v2.14.0: rebuild when DATA changes (replaces the per-tick scene bump)
+      this._contentVersion,   // v2.16.0: bumps only when DATA is appended/replaced (was _dataVersion → bumped every tick)
       N,
       last ? last.time : 0, last ? last.open : 0, last ? last.high : 0, last ? last.low : 0, last ? last.close : 0,
       Math.round(this.barSpacing * 100) / 100,
@@ -4197,47 +4758,66 @@ class TradingChart {
         const topColor = opts.topColor || 'rgba(41,98,255,0.35)';
         const bottomColor = opts.bottomColor || 'rgba(41,98,255,0.02)';
         const lw = opts.lineWidth || 1.5;
-        // Find vertical extent of visible values
+        // v2.16.0 FIX (#7): the fill closed back to `indexToX(firstIdx)` even
+        // when the first VISIBLE values were null (warm-up bars). The gradient
+        // then extended under a no-data area. Track firstValidIdx / firstValidX
+        // and close back to THAT instead.
         let minY = Infinity;
+        let firstValidIdx = -1, firstValidX = null, lastValidX = null;
         for (let i = firstIdx; i <= lastIdx; i++) {
           const v = values[i];
           if (v === null || v === undefined) continue;
           const y = self.priceToY(v);
           if (y < minY) minY = y;
+          const x = self.indexToX(i);
+          if (firstValidIdx < 0) { firstValidIdx = i; firstValidX = x; }
+          lastValidX = x;
         }
-        if (!isFinite(minY)) return;
+        if (firstValidIdx < 0 || !isFinite(minY)) return;
         const grad = ctx.createLinearGradient(0, minY, 0, self.priceBottom);
         grad.addColorStop(0, topColor);
         grad.addColorStop(1, bottomColor);
-        // Fill area under the line
+        // Fill area under the line — uses the downsampled path (see drawLine).
         ctx.beginPath();
-        let started = false, lastX = null;
-        for (let i = firstIdx; i <= lastIdx; i++) {
-          const v = values[i];
-          if (v === null || v === undefined) { started = false; continue; }
-          const x = self.indexToX(i);
-          const y = self.priceToY(v);
-          if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
-          lastX = x;
+        const segs = downsampleLineSegments(self, values, firstIdx, lastIdx);
+        let started = false;
+        for (const seg of segs) {
+          if (!started) { ctx.moveTo(seg.x, seg.y); started = true; } else ctx.lineTo(seg.x, seg.y);
         }
         if (!started) return;
-        ctx.lineTo(lastX, self.priceBottom);
-        ctx.lineTo(self.indexToX(firstIdx), self.priceBottom);
+        ctx.lineTo(lastValidX, self.priceBottom);
+        ctx.lineTo(firstValidX, self.priceBottom);
         ctx.closePath();
         ctx.fillStyle = grad;
         ctx.fill();
-        // Stroke the line on top
+        // Stroke the line on top (same downsampled path)
         ctx.beginPath();
         started = false;
-        for (let i = firstIdx; i <= lastIdx; i++) {
-          const v = values[i];
-          if (v === null || v === undefined) { started = false; continue; }
-          const x = self.indexToX(i);
-          const y = self.priceToY(v);
-          if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
+        for (const seg of segs) {
+          if (!started) { ctx.moveTo(seg.x, seg.y); started = true; } else ctx.lineTo(seg.x, seg.y);
         }
         ctx.strokeStyle = lineColor;
         ctx.lineWidth = lw;
+        ctx.stroke();
+      },
+      // v2.16.0 (#5): downsampled line stroker. At extreme zoom-out (>600
+      // visible bars) drawing one lineTo per candle produces thousands of
+      // overlapping sub-pixel segments that anti-alias into a shimmer. This
+      // helper collapses collinear interior segments via a light
+      // Ramer-Douglas-Peucker pass with epsilon = 0.3px in screen space. End
+      // points and local extrema are always kept, so the visual silhouette is
+      // identical to the full path. Use this instead of building the path by
+      // hand when you have a numeric values array.
+      //   helpers.drawLine(ctx, values, { color:'#2962ff', lineWidth:1.5 });
+      drawLine: function (ctx, values, opts) {
+        opts = opts || {};
+        ctx.strokeStyle = opts.color || '#2962ff';
+        ctx.lineWidth = opts.lineWidth || 1.5;
+        const segs = downsampleLineSegments(self, values, firstIdx, lastIdx);
+        if (segs.length === 0) return;
+        ctx.beginPath();
+        ctx.moveTo(segs[0].x, segs[0].y);
+        for (let i = 1; i < segs.length; i++) ctx.lineTo(segs[i].x, segs[i].y);
         ctx.stroke();
       }
     };
@@ -4246,6 +4826,55 @@ class TradingChart {
   }
 
   /* --------------------------- Drawing Tools ----------------------------- */
+  // v2.16.0 (#19): drawings used to be anchored by candle INDEX. When the
+  // 50k cap trimmed old candles (a common occurrence in live long-running
+  // sessions), every index shifted and your trend line "drifted" to a
+  // different candle. We now ALSO stamp the unix time at every anchor point
+  // (t1/t2 for line-style drawings, tIdx for vline/text, tPoints[] for
+  // brush/poly). At render + hit-test time, _drawingIdxAt(d, key) re-derives
+  // the index from the time so the drawing follows the SAME candle forever.
+  // The index fields stay for back-compat (and for the rare case where the
+  // drawing was created via addDrawing() with no time → fall back to index).
+  _timeAtIdx(idx) {
+    const arr = this.sim.candles;
+    if (idx < 0 || idx >= arr.length) return 0;
+    return arr[idx].time;
+  }
+  _stampDrawingTimes(d) {
+    if (!d) return d;
+    if (d.i1 != null && d.t1 == null) d.t1 = this._timeAtIdx(Math.round(d.i1));
+    if (d.i2 != null && d.t2 == null) d.t2 = this._timeAtIdx(Math.round(d.i2));
+    if (d.index != null && d.tIdx == null) d.tIdx = this._timeAtIdx(Math.round(d.index));
+    if (d.i != null && d.tIdx == null) d.tIdx = this._timeAtIdx(Math.round(d.i));
+    if (Array.isArray(d.points)) {
+      if (!Array.isArray(d.tPoints)) d.tPoints = [];
+      for (let k = 0; k < d.points.length; k++) {
+        if (d.tPoints[k] == null) d.tPoints[k] = this._timeAtIdx(Math.round(d.points[k].i));
+      }
+    }
+    return d;
+  }
+  // Re-derive the candle index for an anchor from its stored time. Falls back
+  // to the stored index when the time is missing or stale (back-compat with
+  // drawings created by an older version or via addDrawing()).
+  _drawingIdxAt(d, key) {
+    const tKey = (key === 'i1') ? 't1' : (key === 'i2') ? 't2' : 'tIdx';
+    const t = d[tKey];
+    if (t != null && t > 0) {
+      const idx = this._indexForTime(t);
+      if (idx >= 0) return idx;
+    }
+    return d[key];
+  }
+  // Same, but for a brush/poly vertex (returns the index for vertex k).
+  _drawingVertexIdx(d, k) {
+    const t = d.tPoints && d.tPoints[k];
+    if (t != null && t > 0) {
+      const idx = this._indexForTime(t);
+      if (idx >= 0) return idx;
+    }
+    return d.points && d.points[k] ? d.points[k].i : 0;
+  }
   startDrawing(x, y) {
     const idx = this.xToIndex(x);
     const price = this.yToPrice(y);
@@ -4261,19 +4890,26 @@ class TradingChart {
       return;
     }
     if (tool === 'vline') {
-      this.drawings.push({type:'vline', index: idx, color: this.theme.drawing, id: Date.now()});
+      // v2.16.0 (#19): store tIdx so the line stays on its candle after a trim.
+      const d = {type:'vline', index: idx, color: this.theme.drawing, id: Date.now()};
+      this._stampDrawingTimes(d);
+      this.drawings.push(d);
       this.setTool('cursor');   // v2.15.0: fires onToolChange
       this.showToast('Vertical line added');
       this.invalidate();
       return;
     }
     if (tool === 'text') {
-      // For text, we use a prompt-like approach via toast; in real app use input.
-      // Here we'll add a text drawing with a default label the user can change.
+      // v2.16.0 (#21): default text + the inline editor is opened by
+      // double-clicking the placed text (see onDblClick). The toast tells
+      // the user the gesture. _stampDrawingTimes adds tIdx so the text
+      // follows its candle after a 50k trim.
       const txt = 'Text ' + (this.drawings.length + 1);
-      this.drawings.push({type:'text', i: idx, p: price, text: txt, color: this.theme.drawing, id: Date.now()});
+      const d = {type:'text', i: idx, p: price, text: txt, color: this.theme.drawing, id: Date.now()};
+      this._stampDrawingTimes(d);
+      this.drawings.push(d);
       this.setTool('cursor');   // v2.15.0: fires onToolChange
-      this.showToast('Text added');   // v2.14.0 FIX (audit drawing-72): no text editing exists — the old promise was misleading
+      this.showToast('Text added — double-click to edit');
       this.invalidate();
       return;
     }
@@ -4409,6 +5045,8 @@ class TradingChart {
       }
       d.closed = true;
     }
+    // v2.16.0 (#19): stamp anchor times so the drawing survives a 50k trim.
+    this._stampDrawingTimes(d);
     this.drawings.push(d);
     this.currentDrawing = null;
     this._drawAnchor = null;
@@ -4538,6 +5176,14 @@ class TradingChart {
       } else this.hoverDrawing = null;
     } finally {
       THEME = savedTheme;
+      // v2.16.0 FIX (#22b): window.THEME was published ONCE at module load
+      // pointing to a default THEME object. During every render the global
+      // THEME is swapped with this.theme (per-instance), then restored — but
+      // window.THEME kept pointing at the OLD object the whole time. So an
+      // external user reading window.THEME never saw the instance's live
+      // colors (and writes to window.THEME did nothing). Re-publish the live
+      // THEME here at the END of every render so external code can read it.
+      if (typeof window !== 'undefined') window.THEME = savedTheme;
     }
   }
 
@@ -4593,6 +5239,7 @@ class TradingChart {
   /* --------------------------- Grid (price marks) ------------------------ */
   drawGrid() {
     const ctx = this.ctx;
+    const dpr = this.dpr;
     ctx.strokeStyle = this.theme.grid;
     ctx.lineWidth = 1;
     // Use price tick marks for horizontal grid lines
@@ -4600,9 +5247,10 @@ class TradingChart {
     for (const m of marks) {
       const y = this.priceTop + m.coord;
       if (y < this.priceTop - 1 || y > this.priceBottom + 1) continue;
+      const ys = snapToV(y, dpr);
       ctx.beginPath();
-      ctx.moveTo(this.chartLeft, Math.floor(y) + 0.5);
-      ctx.lineTo(this.chartRight, Math.floor(y) + 0.5);
+      ctx.moveTo(this.chartLeft, ys);
+      ctx.lineTo(this.chartRight, ys);
       ctx.stroke();
     }
     // Time tick marks for vertical grid lines (including future area)
@@ -4610,9 +5258,10 @@ class TradingChart {
     for (const m of timeMarks) {
       const x = this.indexToX(m.index);
       if (x < this.chartLeft || x > this.chartRight) continue;
+      const xs = snapToH(x, dpr);
       ctx.beginPath();
-      ctx.moveTo(Math.floor(x) + 0.5, this.chartTop);
-      ctx.lineTo(Math.floor(x) + 0.5, this.chartBottom);
+      ctx.moveTo(xs, this.chartTop);
+      ctx.lineTo(xs, this.chartBottom);
       ctx.stroke();
     }
     // v2.14.0 FIX (audit #28): the separator lines + grip handles were drawn
@@ -4626,8 +5275,9 @@ class TradingChart {
   drawPaneSeparators() {
     if (this._panes.length === 0) return;
     const ctx = this.ctx;
+    const dpr = this.dpr;
     for (const pane of this._panes) {
-      const sepY = Math.floor(pane.top) - 0.5;
+      const sepY = snapToV(pane.top, dpr);
       const active = (this._paneSepHoverId === pane.id) ||
                      (this._paneResize && this._paneResize.paneId === pane.id);
       ctx.strokeStyle = active ? this.theme.axisBorder : this.theme.toolbarBorder;
@@ -4974,12 +5624,14 @@ class TradingChart {
       // with the price area and the other panes).
       ctx.strokeStyle = this.theme.grid;
       ctx.lineWidth = 1;
+      const _dpr = this.dpr;
       for (const m of timeMarks) {
         const x = this.indexToX(m.index);
         if (x < left || x > right) continue;
+        const xs = snapToH(x, _dpr);
         ctx.beginPath();
-        ctx.moveTo(Math.floor(x) + 0.5, top);
-        ctx.lineTo(Math.floor(x) + 0.5, bot);
+        ctx.moveTo(xs, top);
+        ctx.lineTo(xs, bot);
         ctx.stroke();
       }
 
@@ -4989,9 +5641,10 @@ class TradingChart {
         for (const m of pmarks) {
           const y = top + m.coord;
           if (y < top - 1 || y > bot + 1) continue;
+          const ys = snapToV(y, _dpr);
           ctx.beginPath();
-          ctx.moveTo(left, Math.floor(y) + 0.5);
-          ctx.lineTo(right, Math.floor(y) + 0.5);
+          ctx.moveTo(left, ys);
+          ctx.lineTo(right, ys);
           ctx.stroke();
         }
       }
@@ -5025,6 +5678,7 @@ class TradingChart {
   /* --------------------------- Drawings ---------------------------------- */
   drawDrawings() {
     const ctx = this.ctx;
+    const _dpr = this.dpr;
     const drawOne = (d, isActive = false) => {
       const color = isActive ? this.theme.drawingActive : (d.color || this.theme.drawing);
       const isSelected = (d === this.selectedDrawing);
@@ -5050,8 +5704,10 @@ class TradingChart {
 
       switch (d.type) {
         case 'trend': {
-          const x1 = this.indexToX(d.i1);
-          const x2 = this.indexToX(d.i2);
+          const i1 = this._drawingIdxAt(d, 'i1');
+          const i2 = this._drawingIdxAt(d, 'i2');
+          const x1 = this.indexToX(i1);
+          const x2 = this.indexToX(i2);
           const y1 = this.priceToY(d.p1);
           const y2 = this.priceToY(d.p2);
           ctx.beginPath();
@@ -5064,8 +5720,10 @@ class TradingChart {
         }
         case 'ray': {
           // Ray: starts at (i1,p1) and extends through (i2,p2) to the right edge
-          const x1 = this.indexToX(d.i1);
-          const x2 = this.indexToX(d.i2);
+          const i1 = this._drawingIdxAt(d, 'i1');
+          const i2 = this._drawingIdxAt(d, 'i2');
+          const x1 = this.indexToX(i1);
+          const x2 = this.indexToX(i2);
           const y1 = this.priceToY(d.p1);
           const y2 = this.priceToY(d.p2);
           const dx = x2 - x1, dy = y2 - y1;
@@ -5084,8 +5742,10 @@ class TradingChart {
         }
         case 'channel': {
           // Parallel channel: two parallel lines from (i1,p1)-(i2,p2) and offset by (p2-p1)
-          const x1 = this.indexToX(d.i1);
-          const x2 = this.indexToX(d.i2);
+          const i1 = this._drawingIdxAt(d, 'i1');
+          const i2 = this._drawingIdxAt(d, 'i2');
+          const x1 = this.indexToX(i1);
+          const x2 = this.indexToX(i2);
           const y1 = this.priceToY(d.p1);
           const y2 = this.priceToY(d.p2);
           // Main line
@@ -5112,8 +5772,10 @@ class TradingChart {
           break;
         }
         case 'arrow': {
-          const x1 = this.indexToX(d.i1);
-          const x2 = this.indexToX(d.i2);
+          const i1 = this._drawingIdxAt(d, 'i1');
+          const i2 = this._drawingIdxAt(d, 'i2');
+          const x1 = this.indexToX(i1);
+          const x2 = this.indexToX(i2);
           const y1 = this.priceToY(d.p1);
           const y2 = this.priceToY(d.p2);
           // Main shaft
@@ -5164,10 +5826,11 @@ class TradingChart {
         }
         case 'hline': {
           const y = this.priceToY(d.price);
+          const ys = snapToV(y, _dpr);
           ctx.setLineDash([4, 4]);
           ctx.beginPath();
-          ctx.moveTo(this.chartLeft, Math.floor(y) + 0.5);
-          ctx.lineTo(this.chartRight, Math.floor(y) + 0.5);
+          ctx.moveTo(this.chartLeft, ys);
+          ctx.lineTo(this.chartRight, ys);
           ctx.stroke();
           ctx.setLineDash([]);
           // v2.2.0+: Price label INSIDE the chart at the right edge (not on price axis)
@@ -5183,19 +5846,23 @@ class TradingChart {
           break;
         }
         case 'vline': {
-          const x = this.indexToX(d.index);
+          const idx = this._drawingIdxAt(d, 'index');
+          const x = this.indexToX(idx);
+          const xs = snapToH(x, _dpr);
           ctx.setLineDash([4, 4]);
           ctx.beginPath();
           // v2.2.0+: clip vline to chartTop..chartBottom only (not into pane/time axis)
-          ctx.moveTo(Math.floor(x) + 0.5, this.chartTop);
-          ctx.lineTo(Math.floor(x) + 0.5, this.chartBottom);
+          ctx.moveTo(xs, this.chartTop);
+          ctx.lineTo(xs, this.chartBottom);
           ctx.stroke();
           ctx.setLineDash([]);
           break;
         }
         case 'rect': {
-          const x1 = this.indexToX(d.i1);
-          const x2 = this.indexToX(d.i2);
+          const i1 = this._drawingIdxAt(d, 'i1');
+          const i2 = this._drawingIdxAt(d, 'i2');
+          const x1 = this.indexToX(i1);
+          const x2 = this.indexToX(i2);
           const y1 = this.priceToY(d.p1);
           const y2 = this.priceToY(d.p2);
           const rx = Math.min(x1, x2), ry = Math.min(y1, y2);
@@ -5210,9 +5877,9 @@ class TradingChart {
           ctx.lineWidth = 1.5; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
           ctx.beginPath();
           for (let i = 0; i < d.points.length; i++) {
-            const p = d.points[i];
-            const x = this.indexToX(p.i);
-            const y = this.priceToY(p.p);
+            const idx = this._drawingVertexIdx(d, i);
+            const x = this.indexToX(idx);
+            const y = this.priceToY(d.points[i].p);
             if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
           }
           if (d.closed) {
@@ -5222,15 +5889,17 @@ class TradingChart {
           }
           ctx.stroke();
           // Vertex dots
-          for (const p of d.points) {
-            const x = this.indexToX(p.i);
-            const y = this.priceToY(p.p);
+          for (let i = 0; i < d.points.length; i++) {
+            const idx = this._drawingVertexIdx(d, i);
+            const x = this.indexToX(idx);
+            const y = this.priceToY(d.points[i].p);
             ctx.beginPath(); ctx.arc(x, y, 3, 0, Math.PI * 2); ctx.fill();
           }
           break;
         }
         case 'text': {
-          const x = this.indexToX(d.i);
+          const idx = this._drawingIdxAt(d, 'i');
+          const x = this.indexToX(idx);
           const y = this.priceToY(d.p);
           ctx.font = '12px -apple-system, Segoe UI, Roboto, sans-serif';
           ctx.textAlign = 'left'; ctx.textBaseline = 'bottom';
@@ -5245,8 +5914,10 @@ class TradingChart {
           break;
         }
         case 'fib': {
-          const x1 = this.indexToX(d.i1);
-          const x2 = this.indexToX(d.i2);
+          const i1 = this._drawingIdxAt(d, 'i1');
+          const i2 = this._drawingIdxAt(d, 'i2');
+          const x1 = this.indexToX(i1);
+          const x2 = this.indexToX(i2);
           const y1 = this.priceToY(d.p1);
           const y2 = this.priceToY(d.p2);
           const xL = Math.min(x1, x2), xR = Math.max(x1, x2);
@@ -5258,9 +5929,10 @@ class TradingChart {
             const y = y1 + (y2 - y1) * levels[i];
             ctx.strokeStyle = colors[i]; ctx.lineWidth = 1;
             ctx.setLineDash([2, 2]);
+            const ys = snapToV(y, _dpr);
             ctx.beginPath();
-            ctx.moveTo(xL, Math.floor(y) + 0.5);
-            ctx.lineTo(xR, Math.floor(y) + 0.5);
+            ctx.moveTo(xL, ys);
+            ctx.lineTo(xR, ys);
             ctx.stroke();
             ctx.setLineDash([]);
             const p = d.p1 + (d.p2 - d.p1) * levels[i];
@@ -5281,9 +5953,9 @@ class TradingChart {
           ctx.lineWidth = 2; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
           ctx.beginPath();
           for (let i = 0; i < d.points.length; i++) {
-            const p = d.points[i];
-            const x = this.indexToX(p.i);
-            const y = this.priceToY(p.p);
+            const idx = this._drawingVertexIdx(d, i);
+            const x = this.indexToX(idx);
+            const y = this.priceToY(d.points[i].p);
             if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
           }
           ctx.stroke();
@@ -5639,13 +6311,17 @@ class TradingChart {
       case 'trend':
       case 'arrow':
       case 'ray': {
-        const x1 = this.indexToX(d.i1), x2 = this.indexToX(d.i2);
+        // v2.16.0 (#19): derive indices from stored times so a drawing stays
+        // hittable after a 50k trim shifts the array.
+        const i1 = this._drawingIdxAt(d, 'i1'), i2 = this._drawingIdxAt(d, 'i2');
+        const x1 = this.indexToX(i1), x2 = this.indexToX(i2);
         const y1 = this.priceToY(d.p1), y2 = this.priceToY(d.p2);
         return this._distToSeg(x, y, x1, y1, x2, y2) < tol;
       }
       case 'channel': {
         // Test both the main line and the parallel line
-        const x1 = this.indexToX(d.i1), x2 = this.indexToX(d.i2);
+        const i1 = this._drawingIdxAt(d, 'i1'), i2 = this._drawingIdxAt(d, 'i2');
+        const x1 = this.indexToX(i1), x2 = this.indexToX(i2);
         const y1 = this.priceToY(d.p1), y2 = this.priceToY(d.p2);
         const offsetPrice = d.p2 - d.p1;
         const y1b = this.priceToY(d.p1 + offsetPrice);
@@ -5653,20 +6329,30 @@ class TradingChart {
         return this._distToSeg(x, y, x1, y1, x2, y2) < tol
             || this._distToSeg(x, y, x1, y1b, x2, y2b) < tol;
       }
-      case 'band':
-      case 'hline': {
-        const y1 = this.priceToY(d.type === 'hline' ? d.price : d.p1);
-        const y2 = d.type === 'hline' ? y1 : this.priceToY(d.p2);
+      case 'band': {
+        // v2.16.0 FIX (#20): only the top/bottom EDGES (and the implied corner
+        // zones) capture a click — the INTERIOR is pannable, like a Rectangle.
+        // The old code accepted any point inside the band, so a user could
+        // never pan the chart while the cursor was inside a band region.
+        const y1 = this.priceToY(d.p1);
+        const y2 = this.priceToY(d.p2);
         const yTop = Math.min(y1, y2), yBot = Math.max(y1, y2);
-        return ((Math.abs(y - yTop) < tol || Math.abs(y - yBot) < tol) ||
-                (y >= yTop && y <= yBot)) && x >= this.chartLeft && x <= this.chartRight;
+        const onTop = Math.abs(y - yTop) < tol;
+        const onBot = Math.abs(y - yBot) < tol;
+        return (onTop || onBot) && x >= this.chartLeft && x <= this.chartRight;
+      }
+      case 'hline': {
+        const y1 = this.priceToY(d.price);
+        return Math.abs(y - y1) < tol && x >= this.chartLeft && x <= this.chartRight;
       }
       case 'vline': {
-        const xx = this.indexToX(d.index);
+        const idx = this._drawingIdxAt(d, 'index');
+        const xx = this.indexToX(idx);
         return Math.abs(x - xx) < tol && y >= this.chartTop && y <= this.chartBottom;
       }
       case 'rect': {
-        const x1 = this.indexToX(d.i1), x2 = this.indexToX(d.i2);
+        const i1 = this._drawingIdxAt(d, 'i1'), i2 = this._drawingIdxAt(d, 'i2');
+        const x1 = this.indexToX(i1), x2 = this.indexToX(i2);
         const y1 = this.priceToY(d.p1), y2 = this.priceToY(d.p2);
         const rx = Math.min(x1, x2), ry = Math.min(y1, y2);
         const rw = Math.abs(x2 - x1), rh = Math.abs(y2 - y1);
@@ -5677,15 +6363,17 @@ class TradingChart {
       case 'poly': {
         if (!d.points || d.points.length < 2) return false;
         for (let i = 1; i < d.points.length; i++) {
-          const p1 = d.points[i-1], p2 = d.points[i];
-          const x1 = this.indexToX(p1.i), y1 = this.priceToY(p1.p);
-          const x2 = this.indexToX(p2.i), y2 = this.priceToY(p2.p);
+          const idx1 = this._drawingVertexIdx(d, i - 1);
+          const idx2 = this._drawingVertexIdx(d, i);
+          const x1 = this.indexToX(idx1), y1 = this.priceToY(d.points[i - 1].p);
+          const x2 = this.indexToX(idx2), y2 = this.priceToY(d.points[i].p);
           if (this._distToSeg(x, y, x1, y1, x2, y2) < tol) return true;
         }
         return false;
       }
       case 'text': {
-        const x1 = this.indexToX(d.i), y1 = this.priceToY(d.p);
+        const idx = this._drawingIdxAt(d, 'i');
+        const x1 = this.indexToX(idx), y1 = this.priceToY(d.p);
         // v2.14.0 FIX: was `ctx.font` — a bare identifier that threw
         // ReferenceError whenever any click landed in this branch, blocking
         // chart drag/pan whenever a text drawing existed on the canvas.
@@ -5734,9 +6422,10 @@ class TradingChart {
     ctx.strokeStyle = color;
     ctx.lineWidth = 1;
     ctx.setLineDash([2, 3]);
+    const ys = snapToV(y, this.dpr);
     ctx.beginPath();
-    ctx.moveTo(this.chartLeft, Math.floor(y) + 0.5);
-    ctx.lineTo(this.chartRight, Math.floor(y) + 0.5);
+    ctx.moveTo(this.chartLeft, ys);
+    ctx.lineTo(this.chartRight, ys);
     ctx.stroke();
     ctx.setLineDash([]);
     // v2.3.1: Price label ON the price axis (chartRight + 1) — this is where it
@@ -5789,7 +6478,9 @@ class TradingChart {
     const nowSec = Math.floor(Date.now() / 1000);   // v2.14.0: real Unix time
     let remainingSec = candleCloseSec - nowSec;
     if (remainingSec < 0) remainingSec = 0;
-    const pad2 = (n) => (n < 10 ? '0' : '') + n;
+    // v2.16.0 (#22d): the local `pad2` here shadowed the module-level helper
+    // — same implementation, but the shadow was a code-smell flag in the
+    // audit. Reusing the module helper; behavior is identical.
     const fmt = this._countdown.format || 'auto';
     let text;
     if (fmt === 'auto') {
@@ -5836,6 +6527,7 @@ class TradingChart {
   /* --------------------------- Price Axis -------------------------------- */
   drawPriceAxis() {
     const ctx = this.ctx;
+    const dpr = this.dpr;
     // v2.4.0+: Use dedicated axis colors (axisBg, axisBorder, axisText)
     // Fill the entire right column (price axis + corner with time axis) with axisBg
     const axisTop = this.chartTop;
@@ -5844,8 +6536,10 @@ class TradingChart {
     ctx.fillRect(this.chartRight + 1, axisTop, this.W - this.chartRight - 1, axisBottom - axisTop);
     ctx.strokeStyle = this.theme.axisBorder;
     ctx.beginPath();
-    ctx.moveTo(this.chartRight + 0.5, this.chartTop);
-    ctx.lineTo(this.chartRight + 0.5, this.chartBottom);
+    // v2.16.0: bitmap-snapped 1px border (was chartRight + 0.5 — only crisp at integer dpr).
+    const axBorder = snapToH(this.chartRight, dpr);
+    ctx.moveTo(axBorder, this.chartTop);
+    ctx.lineTo(axBorder, this.chartBottom);
     ctx.stroke();
 
     ctx.font = '11px -apple-system, Segoe UI, Roboto, sans-serif';
@@ -5891,14 +6585,15 @@ class TradingChart {
 
   drawTimeAxis() {
     const ctx = this.ctx;
+    const dpr = this.dpr;
     const axisTop = this.layout.paneBottom || this.chartBottom;
     // v2.4.0+: Use dedicated axis colors (axisBg, axisBorder, axisText)
     ctx.fillStyle = this.theme.axisBg;
     ctx.fillRect(0, axisTop, this.chartRight + 1, this.layout.timeAxisH);
     ctx.strokeStyle = this.theme.axisBorder;
     ctx.beginPath();
-    ctx.moveTo(0, axisTop + 0.5);
-    ctx.lineTo(this.chartRight, axisTop + 0.5);
+    ctx.moveTo(0, snapToV(axisTop, dpr));
+    ctx.lineTo(this.chartRight, snapToV(axisTop, dpr));
     ctx.stroke();
 
     ctx.font = '11px -apple-system, Segoe UI, Roboto, sans-serif';
@@ -5906,14 +6601,19 @@ class TradingChart {
     ctx.textBaseline = 'middle';
     ctx.textAlign = 'center';
     const marks = this.getTimeMarks();
-    // LWC-style collision detection: skip labels that would overlap previous one.
+    // v2.16.0 FIX (#2): label width is MEASURED with the same font set above,
+    // not estimated as `label.length * 6 + 8`. The estimate broke on bold
+    // fonts, wide glyphs, and (important for the future) Arabic month names
+    // — every label assumed 6px per char and either overlapped or wasted
+    // space. Collision detection now uses the real measured width.
+    const tzOpts = {locale: this._locale, timezone: this._timezone, hour12: this._hour12};
     let prevRightEdge = -Infinity;
     for (const m of marks) {
       const x = this.indexToX(m.index);
       if (x < this.chartLeft || x > this.chartRight) continue;
       // Use the time stored in the mark (works for past, present, and future)
-      const label = formatTickMark(m.time, m.weight, this.timeframe.label);
-      const labelW = label.length * 6 + 8;
+      const label = formatTickMark(m.time, m.weight, this.timeframe.label, tzOpts);
+      const labelW = ctx.measureText(label).width + 8;
       const leftEdge = x - labelW / 2;
       const rightEdge = x + labelW / 2;
       if (leftEdge < prevRightEdge + 4) continue;
@@ -5925,14 +6625,19 @@ class TradingChart {
 
   /* --------------------------- Crosshair --------------------------------- */
   drawCrosshair() {
-    // v2.3.1: On mobile/touch devices, don't show the crosshair (mouse axes) at all.
-    if (this._isMobile) return;
+    // v2.16.0 FIX (#3): the crosshair was blanket-disabled on touch devices
+    // (`if (_isMobile) return`), but touch handlers DO maintain crosshairIndex
+    // for the OHLC legend. A mobile user could see the legend update but never
+    // the aiming lines or the time/price readouts — a disabled feature, not a
+    // missing one. Now drawn on touch too, with a thinner dash so it doesn't
+    // dominate the small screen.
     if (!this.mouseInside || this.crosshairIndex === null) return;
     // v2.10.0: crosshair stays visible while a drawing tool is active too —
     // the user needs it to aim; hiding it made the chart look frozen.
     if (!this.inChartArea(this.mouseX, this.mouseY) &&
         !this.inPriceAxis(this.mouseX, this.mouseY)) return;
     const ctx = this.ctx;
+    const dpr = this.dpr;
     const idx = Math.round(this.crosshairIndex);
     // Allow crosshair in future area (idx >= candles.length) and past area (idx < 0)
     const x = this.indexToX(idx);
@@ -5940,17 +6645,19 @@ class TradingChart {
 
     ctx.strokeStyle = this.theme.crosshair;
     ctx.lineWidth = 1;
-    ctx.setLineDash([3, 3]);
+    ctx.setLineDash(this._isMobile ? [2, 4] : [3, 3]);
     if (this.mouseY < (this.layout.paneBottom || this.chartBottom)) {
+      const xs = snapToH(x, dpr);
       ctx.beginPath();
-      ctx.moveTo(Math.floor(x) + 0.5, this.chartTop);
-      ctx.lineTo(Math.floor(x) + 0.5, this.layout.paneBottom || this.chartBottom);
+      ctx.moveTo(xs, this.chartTop);
+      ctx.lineTo(xs, this.layout.paneBottom || this.chartBottom);
       ctx.stroke();
     }
     if (this.mouseX < this.chartRight) {
+      const ys = snapToV(y, dpr);
       ctx.beginPath();
-      ctx.moveTo(this.chartLeft, Math.floor(y) + 0.5);
-      ctx.lineTo(this.chartRight, Math.floor(y) + 0.5);
+      ctx.moveTo(this.chartLeft, ys);
+      ctx.lineTo(this.chartRight, ys);
       ctx.stroke();
     }
     ctx.setLineDash([]);
@@ -5962,25 +6669,48 @@ class TradingChart {
     //   >= 1 day  → YYYY-MM-DD
     //   < 1 min   → HH:MM:SS
     //   else      → MM-DD HH:MM
+    // v2.16.0 FIX (#8): honor opts.timezone / opts.locale for display. The
+    // data stays in Unix seconds; only the DISPLAYED string changes. Default
+    // (no tz/locale) keeps the previous UTC + English short-month behavior.
     const t = this._timeAtIndex(idx);
     const date = new Date(t * 1000);
-    const pad2 = (n) => n < 10 ? '0' + n : '' + n;
     const tfSec = (this.timeframe.ms || 60000) / 1000;
     let timeStr;
-    if (tfSec >= 86400) {
-      timeStr = date.getUTCFullYear() + '-' + pad2(date.getUTCMonth() + 1) + '-' + pad2(date.getUTCDate());
-    } else if (tfSec < 60) {
-      timeStr = pad2(date.getUTCHours()) + ':' + pad2(date.getUTCMinutes()) + ':' + pad2(date.getUTCSeconds());
+    if (this._locale || this._timezone) {
+      // Use Intl for locale + timezone display. The format chooses fields
+      // automatically based on the timeframe span (matches the UTC branches
+      // below: day+ for daily+, time+seconds for sub-minute).
+      try {
+        const opts = {};
+        if (tfSec >= 86400) { opts.year = 'numeric'; opts.month = 'short'; opts.day = '2-digit'; }
+        else if (tfSec < 60) { opts.hour = '2-digit'; opts.minute = '2-digit'; opts.second = '2-digit'; }
+        else { opts.month = 'short'; opts.day = '2-digit'; opts.hour = '2-digit'; opts.minute = '2-digit'; }
+        if (this._timezone) opts.timeZone = this._timezone;
+        if (this._hour12 != null) opts.hour12 = this._hour12;
+        timeStr = new Intl.DateTimeFormat(this._locale || undefined, opts).format(date);
+      } catch (_) { timeStr = String(t); }
     } else {
-      timeStr = pad2(date.getUTCMonth() + 1) + '-' + pad2(date.getUTCDate()) + ' ' + pad2(date.getUTCHours()) + ':' + pad2(date.getUTCMinutes());
+      const pad2 = (n) => n < 10 ? '0' + n : '' + n;
+      if (tfSec >= 86400) {
+        timeStr = date.getUTCFullYear() + '-' + pad2(date.getUTCMonth() + 1) + '-' + pad2(date.getUTCDate());
+      } else if (tfSec < 60) {
+        timeStr = pad2(date.getUTCHours()) + ':' + pad2(date.getUTCMinutes()) + ':' + pad2(date.getUTCSeconds());
+      } else {
+        timeStr = pad2(date.getUTCMonth() + 1) + '-' + pad2(date.getUTCDate()) + ' ' + pad2(date.getUTCHours()) + ':' + pad2(date.getUTCMinutes());
+      }
     }
     ctx.font = '11px -apple-system, Segoe UI, Roboto, sans-serif';
     const tw = ctx.measureText(timeStr).width + 14;
+    // v2.16.0 FIX (#4): CLAMP the time label so it stays inside the chart's
+    // horizontal extent. The old `x - tw/2` clipped outside the canvas on the
+    // left and overlapped the price axis on the right.
+    const axisBottom = (this.layout.paneBottom || this.chartBottom);
+    const labelX = clamp(x, this.chartLeft + tw / 2 + 2, this.chartRight - tw / 2 - 2);
     ctx.fillStyle = this.theme.crosshairLabel;
-    ctx.fillRect(x - tw / 2, (this.layout.paneBottom || this.chartBottom) + 2, tw, this.layout.timeAxisH - 4);
+    ctx.fillRect(labelX - tw / 2, axisBottom + 2, tw, this.layout.timeAxisH - 4);
     ctx.fillStyle = this.theme.textBright;
     ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-    ctx.fillText(timeStr, x, (this.layout.paneBottom || this.chartBottom) + this.layout.timeAxisH / 2);
+    ctx.fillText(timeStr, labelX, axisBottom + this.layout.timeAxisH / 2);
 
     // v2.3.1: Price label ON the price axis (chartRight + 1) — the axis is
     // connected to the chart and the crosshair price label sits on it.
@@ -6064,9 +6794,17 @@ class TradingChart {
       x += ctx.measureText(p.value).width + gap;
     }
     const change = c.close - c.open;
-    const changePct = (change / c.open) * 100;
-    const changeTxt = (change >= 0 ? '+' : '') + this.priceScale.formatLogical(Math.abs(change)) +
-                      ' (' + (change >= 0 ? '+' : '') + changePct.toFixed(2) + '%)';
+    // v2.16.0 (#18): guard against open=0 (still possible if a previous
+    // version stored data without the _norm repair, or if a custom feed
+    // bypasses DataLayer). 0/0 = NaN → toFixed produced "NaN%"; nonzero/0
+    // produced Infinity → "Infinity%". Both are now "—" until open is real.
+    const changePct = (c.open !== 0 && isFinite(c.open))
+      ? (change / c.open) * 100
+      : 0;
+    const changeTxt = (c.open !== 0 && isFinite(c.open))
+      ? ((change >= 0 ? '+' : '') + this.priceScale.formatLogical(Math.abs(change)) +
+         ' (' + (change >= 0 ? '+' : '') + changePct.toFixed(2) + '%)')
+      : this.priceScale.formatLogical(Math.abs(change)) + ' (—)';
     ctx.fillStyle = isBull ? this.theme.bull : this.theme.bear;
     ctx.fillText(changeTxt, x, y);
 
@@ -6458,17 +7196,43 @@ class TradingChart {
   _openSettingsCard(id, state) {
     // HEADLESS v2.1.0+: settings fields are auto-generated from the indicator's
     // settings object (any key present becomes an editable field).
+    // v2.16.0 FIX (#22c): the previous implementation only knew about a
+    // hard-coded list (period/mult/fast/slow/signal/bins/color). Any other
+    // key the user put on `state.settings` was silently invisible in the
+    // card, even though the comment above the loop claimed "any key present
+    // becomes an editable field". Now ALL keys are discovered; the known
+    // ones get friendly labels + types, everything else is auto-labeled.
     const fields = [];
-    const s = state.settings;
-    if (s.period !== undefined) fields.push({key: 'period', label: 'Period', type: 'number', value: s.period});
-    if (s.mult !== undefined) fields.push({key: 'mult', label: 'Std Dev Mult', type: 'number', value: s.mult});
-    if (s.fast !== undefined) fields.push({key: 'fast', label: 'Fast', type: 'number', value: s.fast});
-    if (s.slow !== undefined) fields.push({key: 'slow', label: 'Slow', type: 'number', value: s.slow});
-    if (s.signal !== undefined) fields.push({key: 'signal', label: 'Signal', type: 'number', value: s.signal});
-    if (s.bins !== undefined) fields.push({key: 'bins', label: 'Bins', type: 'number', value: s.bins});
-    if (s.color !== undefined) fields.push({key: 'color', label: 'Color', type: 'color', value: s.color});
-    // Allow user to override fields via onSettings callback returning custom fields
-    // (handled by user — here we just provide defaults)
+    const s = state.settings || {};
+    const known = {
+      period:  {label: 'Period',      type: 'number'},
+      mult:    {label: 'Std Dev Mult', type: 'number'},
+      fast:    {label: 'Fast',        type: 'number'},
+      slow:    {label: 'Slow',        type: 'number'},
+      signal:  {label: 'Signal',      type: 'number'},
+      bins:    {label: 'Bins',        type: 'number'},
+      color:   {label: 'Color',       type: 'color'}
+    };
+    // First, the known keys (in their stable order — so the indicator's
+    // "primary" fields stay at the top in the same order users are used to).
+    for (const k of Object.keys(known)) {
+      if (s[k] !== undefined) {
+        fields.push({key: k, label: known[k].label, type: known[k].type, value: s[k]});
+      }
+    }
+    // Then, every other key in insertion order (custom user settings).
+    for (const k of Object.keys(s)) {
+      if (known[k]) continue;
+      const v = s[k];
+      let t = 'text';
+      if (typeof v === 'number') t = 'number';
+      else if (typeof v === 'boolean') t = 'checkbox';
+      else if (typeof v === 'string' && /^#[0-9a-fA-F]{3,8}$/.test(v)) t = 'color';
+      // Prettify the label: camelCase → "Camel Case", snake_case → "Snake Case".
+      const label = k.replace(/([a-z])([A-Z])/g, '$1 $2').replace(/_/g, ' ')
+                     .replace(/\b\w/g, function (c) { return c.toUpperCase(); });
+      fields.push({key: k, label: label, type: t, value: v});
+    }
     const w = 220;
     const h = 36 + fields.length * 30 + 40;
     this.settingsCard = {
@@ -6866,6 +7630,11 @@ class TradingChart {
       this._computeQueued = false;
     }
     if (this._fieldEditor) this._closeFieldEditor(false);
+    // v2.16.0 (#15): tear down background video — pause, remove the timeupdate
+    // listener, src-clear. Without this the <video> kept playing inside a
+    // closure on a "dead" chart, leaking memory + network for the page's life.
+    this._teardownBgVideo();
+    if (this._bgImage) this._bgImage = null;
     if (_lastActiveChartInstance === this) _lastActiveChartInstance = null;
     this._panes = [];
     if (this._indCache2) this._indCache2.clear();
