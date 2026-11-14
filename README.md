@@ -4,10 +4,67 @@
 >
 > Pixel-perfect rendering, 14 drawing tools, fully custom indicators via API — you bring the data, the UI, and the indicators. BADI-CHARTS-V2 renders the chart.
 
-[![Version](https://img.shields.io/badge/version-2.13.0-2962ff.svg)](#)
+[![Version](https://img.shields.io/badge/version-2.14.0-2962ff.svg)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-26a69a.svg)](LICENSE)
 [![No Dependencies](https://img.shields.io/badge/dependencies-zero-ff9800.svg)](#)
 [![Headless](https://img.shields.io/badge/UI-headless-9c27b0.svg)](#)
+
+---
+
+## ⚠️ What changed in v2.14.0
+
+**Major correctness & robustness release — 40+ fixes from a full external audit.** The headline: **the second pane indicator now actually renders** (this was the reported bug: with 2+ pane indicators, each pane's indicator mapped its values through the FIRST pane's scale and was clipped away — "one draws, one never appears").
+
+### Critical fixes (breaking/wrong results)
+1. **Multi-pane scale (`paneToY`) — the reported bug.** Each pane indicator now maps values through **its own** pane scale (`helpers.paneScale`, re-pointed per pane by `drawPane()`), not `_panes[0]`'s. Verified pixel-level: MACD in pane 2 now draws its line + histogram + signal inside its own window.
+2. **Countdown timer — real Unix time.** The old code subtracted `performance.now()/1000` (seconds since PAGE LOAD) from a Unix candle time — the countdown was garbage. Now `Date.now()/1000`. Format `auto` also upgraded: `hh:mm` when ≥1h remains, `mm:ss` when ≥1m, `ss` below (the old `mm` pinned at "99" for H4/D1).
+3. **`hitTestDrawing` text branch** used a bare `ctx` → ReferenceError on every click near a text drawing, blocking pan/drag whenever any text drawing existed.
+4. **`isBaseDecimal`** now checks power-of-**10** (LWC-accurate) instead of power-of-2 — decimal bases like 100 no longer produce 0.125-style grid ticks.
+5. **`resize()` calls `autoScale()`** — grid marks no longer computed against the old height after any resize. Plus: ResizeObserver (catches container resizes), DPR re-read (moving between screens), and hidden-canvas (0×0) resizes are skipped instead of corrupting layout.
+
+### Indicator math
+6. **`Indicators.rsi`**: pure uptrend now = **100** (was 99.01), pure downtrend = **0**; flat = 50. Correct Wilder boundaries.
+7. **`Indicators.macd`**: the SIGNAL EMA is computed over the compacted valid segment only — pre-warmup nulls were previously converted to ZEROS and dragged the signal/histogram wrong for hundreds of bars.
+8. **`Indicators.sma/ema/bollinger`**: NaN/null inputs no longer poison rolling sums; invalid periods (≤0) return all-null instead of NaN cascades; Bollinger is O(N) rolling variance (was O(N·period)).
+9. **Hiding an indicator** now releases its pane window / scale contribution (`updateLayout + computeIndicators + autoScale` were missing). `_safeRenderIndicator` also hard-guards `visible === false`.
+10. **`getIndicators()`** no longer crashes on an indicator without `color` (`this.theme` → `self.theme`); missing `type` defaults to `overlay` consistently.
+11. **`calculate()` returning null** = "not enough data yet" — no more error badge + toast + eternal retry; only thrown errors are flagged. A persistently failing `render()` backs off after 3 failures (5s cooldown) instead of burning 60fps forever.
+
+### Performance & cache
+12. **`computeIndicators()` no longer bumps the scene version** — that invalidated EVERY indicator's offscreen cache on EVERY `update()` tick (hidden rebuild storm). Cache invalidation now rides on `_dataVersion` inside the stamp.
+13. **Rebuild budget bypassed during active drag** — pan/zoom used to leave the 3rd+ indicators showing stale (offset) bitmaps while the budget throttled rebuilds. During interaction, everything rebuilds in-frame; the budget still protects cold-start bursts.
+14. **Cache limit scales with indicator count** (was a hard 8 — thrashed violently with 9+ indicators, allocating + rebuilding every frame).
+15. **`computeTimeWeights()` + `TimeTickMarks` deleted** — pure dead code doing O(N) work with 2 `Date` allocations per candle on every tick; their output (`_timePoints`) was never read.
+16. **`getRange()` hook results cached** per (dataVersion, settings) — previously ran on every mousemove during drag.
+17. **Pane layout budget**: volume strip subtracted first; proportional shrink (no forced minimum that produced 0/negative price height → NaN); hard cap of 6 panes; last-resort pass guarantees the price area.
+18. **`update()` accepts late corrections** of the last 300 candles by time match (the WebSocket "candle closed" message that arrives after the next bar opened). Appending pins the view when you're browsing history (`rightOffset > 12`), follows the live edge otherwise.
+
+### Security & environment
+19. **Node/SSR safe**: globals guarded (`typeof window`) — `require('chart.js')` works; previously the whole file threw ReferenceError.
+20. **Keyboard shortcuts sanitized**: ignored while typing in inputs/textareas/contentEditable, ignored with Ctrl/Meta/Alt (Ctrl+R, Ctrl+-), and only the last-hovered chart reacts on multi-chart pages.
+21. **`destroy()` really destroys** — removes every window + canvas listener (stored refs now), disconnects ResizeObserver, stops loop + countdown. `start()` twice no longer runs two loops.
+22. **Delete key / right-click delete the SELECTED drawing** (the old code deleted `hoverDrawing`, only set in eraser mode — dead in practice). Touch deletes via the drawing panel.
+
+### Input & UX
+23. **Wheel**: zoom factor follows |deltaY| (trackpad fling ≡ gentle, no more fixed 10% steps), deltaX pans, Ctrl+wheel (pinch) zooms, and `preventDefault` only fires inside the chart (page scroll no longer hijacked at the edges).
+24. **Only the left mouse button** starts drags; window-level `mousemove` keeps drags alive when the pointer leaves the canvas mid-gesture.
+25. **Momentum dt clamped to 50ms** — returning to a hidden tab no longer flings the chart across the dataset.
+26. **Touch can reach everything**: indicator cards, settings card, drawing properties panel and pane-resize dividers all route through touch now; `mouseInside` clears on touchend (no more legend stuck on the last candle).
+27. **Mobile detection via `pointer: coarse`** — touch laptops keep the crosshair and full framerate; the 33ms mobile throttle is removed (render-on-demand already handles idle).
+28. **Status bar honest**: fabricated Bid/Ask/Spread removed; "24h" stats are computed from actual TIME (24h of bars for the current timeframe), labeled accordingly.
+29. **Crosshair**: shows the PANE's value when over a pane (was a meaningless price); follows the cursor into the future area; `onCrosshair(cb)` now actually fires (supports multiple listeners + `offCrosshair`) — and no longer throws on fractional indexes.
+30. **Pane grips render after the pane background** (the pill was half-covered before).
+
+### Other fixes
+31. `setData(candles, {keepView:true})`; `fit()` really fits all data (was just resetView).
+32. Expanded indicator card closes on outside click; `Escape`/right-click/finish go through `setTool()` (onToolChange now fires).
+33. `setSymbol`/`setTimeframe` clear markers + drawings + selection/preview state; invalid `timeframe.ms` falls back to 60s (was NaN labels).
+34. Pane scale formatter derives base/decimals from the pane's own range (small-valued panes no longer show "0.00").
+35. `includeInAutoScale: false` option for indicators/drawings that would crush the candle scale; flat-market autoScale is now RELATIVE (precise assets no longer jump to -1..1).
+36. All-zero volume no longer renders full-height columns; hidden volume frees its 64px strip; no-volume layout no longer wastes 8px.
+37. Markers with a future time are hidden instead of sticking to the last candle; `withAlpha()` replaces all `color + '22'` concatenations (works with named/rgba colors); duplicate drawing offsets ALL coordinate families; drawing handle grab radius 12px; misleading "double-click to edit" toast removed; `layout.paneBottom` alias fixed (8 sites used a property that never existed); `touch-action: none` on canvas; background video repaints while playing; image `crossOrigin` no longer forced.
+
+No breaking API changes. `require()` in Node now works.
 
 ---
 
