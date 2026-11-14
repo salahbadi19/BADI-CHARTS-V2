@@ -1803,17 +1803,45 @@ class TradingChart {
       id = idOrDef;
       def = this._customIndicators.get(id);
       if (!def) {
-        if (BADI_DEBUG) console.warn('[BadiCharts] Unknown indicator id:', id,
-          '(in v2.1.0+, pass a definition object instead)');
+        // v2.16.0: this warning is ALWAYS shown now (was BADI_DEBUG-only).
+        // A Studio toggling indicators by id string with a typo'd/unregistered
+        // id got a SILENT no-op — the indicator "doesn't work" with zero
+        // feedback, which looks exactly like the "one pane indicator kills
+        // the other" report. Make the cause visible.
+        console.warn('[BadiCharts] addIndicator("' + id + '"): no definition registered ' +
+          'with this id on THIS chart instance. Register it first via ' +
+          'chart.registerIndicator(def) or pass the definition object directly. ' +
+          'Registered ids: [' + Array.from(this._customIndicators.keys()).join(', ') + ']');
         return;
       }
     } else if (idOrDef && typeof idOrDef === 'object' && idOrDef.id) {
       def = idOrDef;
       id = def.id;
+      // v2.16.0: warn when an ALREADY-ACTIVE id is re-added — the new state
+      // silently replaces the old one, so "enabling indicator B" can look
+      // like "indicator A stopped working" when both share the same id
+      // (a copy-paste id collision in the host app).
+      if (this.activeIndicators.has(id)) {
+        console.warn('[BadiCharts] addIndicator("' + id + '"): this id is ALREADY active — ' +
+          'the previous state/settings were replaced. If two different indicators ' +
+          'should coexist, they need DIFFERENT ids.');
+      }
       this._customIndicators.set(id, def);
     } else {
-      if (BADI_DEBUG) console.warn('[BadiCharts] addIndicator: expected definition object or id');
+      console.warn('[BadiCharts] addIndicator: expected a definition object {id, label, type, calculate, render} or a registered id string');
       return;
+    }
+    // v2.16.0: validate def.type. A missing/misspelled type ('Pane', 'panes',
+    // undefined…) renders NOWHERE: updateLayout only reserves windows for
+    // exactly 'pane', drawIndicators only takes exactly 'overlay', drawVolume
+    // only exactly 'volume'. The indicator then looks "broken" with no
+    // feedback. Normalize to a safe default + warn.
+    const VALID_TYPES = ['overlay', 'pane', 'volume'];
+    if (VALID_TYPES.indexOf(def.type) === -1) {
+      console.warn('[BadiCharts] addIndicator("' + id + '"): def.type "' + def.type +
+        '" is not one of overlay|pane|volume — falling back to "overlay". ' +
+        'Bottom-pane indicators MUST use type: "pane".');
+      def.type = 'overlay';
     }
     this.activeIndicators.add(id);
     const state = this._defaultIndicatorState(id);
@@ -1826,6 +1854,7 @@ class TradingChart {
     this.updateLayout();
     this.computeIndicators();
     this.autoScale();
+    this.invalidate();   // v2.16.0: explicit repaint (addIndicator relied on autoScale's side-effect invalidate before)
   }
   // Register a custom indicator definition WITHOUT activating it.
   // Useful for defining indicators once and toggling them by id later.
@@ -2584,8 +2613,12 @@ class TradingChart {
     const MAX_PANES = 6;
     const overflow = paneIds.slice(MAX_PANES);
     if (overflow.length > 0) {
-      if (BADI_DEBUG) console.warn('[BadiCharts] More than ' + MAX_PANES +
-        ' pane indicators active — extras get no window until others are removed:', overflow.join(', '));
+      // v2.16.0: this warning is ALWAYS shown (was BADI_DEBUG-only) — a pane
+      // indicator beyond the cap gets NO window and renders nowhere, which
+      // looks exactly like "my bottom indicator doesn't work" with no clue.
+      console.warn('[BadiCharts] More than ' + MAX_PANES +
+        ' pane indicators active — these get NO window until others are removed or hidden: [' +
+        overflow.join(', ') + ']. Visible panes: [' + paneIds.slice(0, MAX_PANES).join(', ') + ']');
       paneIds.length = MAX_PANES;
     }
     const N = paneIds.length;
