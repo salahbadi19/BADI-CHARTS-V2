@@ -272,7 +272,7 @@
 'use strict';
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.16.0';
+const VERSION = '2.17.0';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 // v2.14.0 (audit #12): tracks the chart the user last hovered/touched, so
 // window-level keyboard shortcuts only apply to ONE chart on multi-chart pages.
@@ -441,14 +441,26 @@ function snapToH(xCss, dpr) {
 // extreme zoom-out (700+ visible bars) into ~50-200 visual segments, killing
 // the random shimmer AND the wasted CPU. At normal zoom (<6 visible bars per
 // pixel) every point survives, so behavior is identical to v2.15.0.
-function downsampleLineSegments(chart, values, firstIdx, lastIdx) {
+// v2.17.0 FIX: optional `yMap` — the value→Y mapper. Callers that render
+// OUTSIDE the price area (pane indicators via helpers.paneToY, volume
+// indicators via volToY) pass their own mapper; when omitted the map falls
+// back to chart.priceToY (the historical behavior for overlay helpers).
+// BEFORE this fix helpers.drawLine() ALWAYS projected values through the
+// PRICE scale, so a pane indicator (RSI 0–100 on a 95,000-priced symbol)
+// rasterized its line at price-area Y coordinates — far outside its own
+// pane rect — and the pane clip erased it: an EMPTY pane that looked like
+// "the bottom indicator doesn't work" (and toggling a second pane indicator
+// changed the pane geometry, deciding WHICH of the two windows showed its
+// line — the reported "one works, the other doesn't" exclusivity).
+function downsampleLineSegments(chart, values, firstIdx, lastIdx, yMap) {
   if (!values) return [];
+  const mapY = yMap || function (v) { return chart.priceToY(v); };
   // Step 1: collect non-null screen points (skip null runs).
   const raw = [];
   for (let i = firstIdx; i <= lastIdx; i++) {
     const v = values[i];
     if (v === null || v === undefined || typeof v !== 'number' || !isFinite(v)) continue;
-    raw.push({i: i, x: chart.indexToX(i), y: chart.priceToY(v)});
+    raw.push({i: i, x: chart.indexToX(i), y: mapY(v)});
   }
   const n = raw.length;
   if (n <= 2) return raw;
@@ -4412,7 +4424,10 @@ class TradingChart {
     const cooling = entry.cooldownUntil && performance.now() < entry.cooldownUntil;
     if (needsRebuild && cooling) {
       // Cool-down: keep showing the last good bitmap (if any), stay silent.
-      if (entry.ok) ctx.drawImage(entry.canvas, region.x, region.y, region.w, region.h);
+      // v2.17.0 FIX: only blit when the stored region still matches — a stale
+      // bitmap built for an OLD pane rect, blitted into the NEW rect, renders
+      // scaled/ghosted content while cooling.
+      if (entry.ok && !regionChanged) ctx.drawImage(entry.canvas, region.x, region.y, region.w, region.h);
       return;
     }
     if (needsRebuild && !budgetExhausted) {
@@ -4457,7 +4472,13 @@ class TradingChart {
       // Defer: keep the old bitmap on screen this frame, retry next frame.
       this.invalidate();
     }
-    if (entry.ok) {
+    // v2.17.0 FIX: when the rebuild was DEFERRED (budget) but the region
+    // MOVED (a pane was added/removed/resized), the stored bitmap was built
+    // for a DIFFERENT rect — blitting it into the new rect scales and ghosts
+    // the old content. Skip the stale blit; the deferred rebuild lands on
+    // the very next frame (invalidate() above already scheduled it).
+    const staleRegionBlit = needsRebuild && budgetExhausted && regionChanged;
+    if (entry.ok && !staleRegionBlit) {
       ctx.drawImage(entry.canvas, region.x, region.y, region.w, region.h);
     }
   }
@@ -4515,8 +4536,15 @@ class TradingChart {
     // so a pane indicator's cache rebuilds when ITS pane geometry/range
     // changes — not when the legacy this.paneScale (which now points to
     // _panes[0].scale) changes for an unrelated pane.
-    const pane = this._panes.find(p => p.id === id);
-    const ps = pane ? pane.scale : this.paneScale;
+    // v2.17.0 FIX: ONLY pane-type indicators include their pane's range in
+    // the stamp. Overlays/volume render in the PRICE/VOLUME area with
+    // priceToY/volToY — they never see a pane scale — yet the old code
+    // stamped them with `this.paneScale` (_panes[0].scale) → every pane[0]
+    // rescale (its own indicator updating!) rebuilt every overlay/volume
+    // bitmap for nothing. Now overlays stamp with 'x' (constant) here.
+    const type = state.def && state.def.type;
+    const pane = type === 'pane' ? this._panes.find(p => p.id === id) : null;
+    const ps = pane ? pane.scale : null;
     const ppr = ps && ps.priceRange() ? (ps.priceRange().min + '~' + ps.priceRange().max) : 'x';
     const paneTop = pane ? pane.top : (this.paneTop || 0);
     const paneBottom = pane ? pane.bottom : (this.paneBottom || 0);
@@ -4742,7 +4770,16 @@ class TradingChart {
 
   // Build the helpers object passed to each indicator's render() function.
   // Contains coordinate-conversion functions and current chart geometry.
-  _indicatorHelpers(firstIdx, lastIdx) {
+  // v2.17.0 FIX: `kind` — which render context the helpers serve:
+  //   'overlay' (default) → drawLine/drawGradientArea map via priceToY
+  //   'pane'              → map via paneToY (the CURRENT pane's own scale)
+  //   'volume'            → map via volToY
+  // drawIndicators/drawPane/drawVolume each pass their kind. The mapping
+  // helpers (yMap/yBottom) read the LIVE helpers.paneScale / _paneRegion,
+  // which drawPane() re-points before EACH pane indicator's render — so one
+  // shared helpers object still serves every pane correctly.
+  _indicatorHelpers(firstIdx, lastIdx, kind) {
+    kind = kind || 'overlay';
     const self = this;
     // v2.6.0: paneRegion is mutable — drawPane() overrides .top/.bottom so
     // paneToY() maps into the in-chart overlay region (bottom of price area).
@@ -4750,6 +4787,7 @@ class TradingChart {
     const helpers = {
       firstIdx: firstIdx,
       lastIdx:  lastIdx,
+      _kind:    kind,
       indexToX: function (i) { return self.indexToX(i); },
       priceToY: function (p) { return self.priceToY(p); },
       volToY:   function (v) { return self.volToY(v); },
@@ -4760,9 +4798,28 @@ class TradingChart {
       // RSI's coordinate space, clipped away by its own pane → invisible or
       // wrong. Now it reads helpers.paneScale, which drawPane() re-points to
       // the CURRENT pane's scale before each indicator render.
+      // v2.17.0 FIX: removed the `|| self.paneScale` fallback — when the pane
+      // lookup failed it silently mapped a pane-2 indicator through pane-1's
+      // scale (the v2.14.0 bug, resurrected through the back door). With no
+      // pane scale the only safe output is the pane's own top edge.
       paneToY:  function (v) {
-        const ps = helpers.paneScale || self.paneScale;
-        return paneRegion.top + (ps ? ps.logicalToCoordinate(v, 0) : 0);
+        const ps = helpers.paneScale;
+        if (!ps || typeof ps.logicalToCoordinate !== 'function') return paneRegion.top;
+        return paneRegion.top + ps.logicalToCoordinate(v, 0);
+      },
+      // v2.17.0: context-aware value→Y mapper used by drawLine/drawGradientArea.
+      // Pane indicators now rasterize inside THEIR pane (own scale), volume
+      // indicators inside the volume strip, overlays in the price area.
+      yMap: function (v) {
+        if (kind === 'pane') return helpers.paneToY(v);
+        if (kind === 'volume') return self.volToY(v);
+        return self.priceToY(v);
+      },
+      // The bottom edge the current context fills down to (gradient area).
+      yBottom: function () {
+        if (kind === 'pane') return paneRegion.bottom;
+        if (kind === 'volume') return self.volBottom;
+        return self.priceBottom;
       },
       chartLeft:   this.chartLeft,
       chartRight:  this.chartRight,
@@ -4785,12 +4842,26 @@ class TradingChart {
       //     bottomColor: 'rgba(41,98,255,0.02)',
       //     lineWidth: 1.5
       //   });
+      // v2.7.0: Gradient area helper — fills the area under a line with a
+      // vertical gradient and strokes the line on top.
+      //   helpers.drawGradientArea(ctx, values, {
+      //     lineColor: '#2962ff',
+      //     topColor:  'rgba(41,98,255,0.35)',
+      //     bottomColor: 'rgba(41,98,255,0.02)',
+      //     lineWidth: 1.5
+      //   });
+      // v2.17.0 FIX: values now map through the CURRENT context's scale
+      // (pane scale for pane indicators, volume scale for volume indicators,
+      // price scale for overlays) and the fill closes to that context's
+      // bottom edge — previously it ALWAYS used the price scale and
+      // priceBottom, so pane/volume users got an empty or misplaced fill.
       drawGradientArea: function (ctx, values, opts) {
         opts = opts || {};
         const lineColor = opts.lineColor || '#2962ff';
         const topColor = opts.topColor || 'rgba(41,98,255,0.35)';
         const bottomColor = opts.bottomColor || 'rgba(41,98,255,0.02)';
         const lw = opts.lineWidth || 1.5;
+        const ctxBottom = helpers.yBottom();
         // v2.16.0 FIX (#7): the fill closed back to `indexToX(firstIdx)` even
         // when the first VISIBLE values were null (warm-up bars). The gradient
         // then extended under a no-data area. Track firstValidIdx / firstValidX
@@ -4800,26 +4871,26 @@ class TradingChart {
         for (let i = firstIdx; i <= lastIdx; i++) {
           const v = values[i];
           if (v === null || v === undefined) continue;
-          const y = self.priceToY(v);
+          const y = helpers.yMap(v);
           if (y < minY) minY = y;
           const x = self.indexToX(i);
           if (firstValidIdx < 0) { firstValidIdx = i; firstValidX = x; }
           lastValidX = x;
         }
         if (firstValidIdx < 0 || !isFinite(minY)) return;
-        const grad = ctx.createLinearGradient(0, minY, 0, self.priceBottom);
+        const grad = ctx.createLinearGradient(0, minY, 0, ctxBottom);
         grad.addColorStop(0, topColor);
         grad.addColorStop(1, bottomColor);
         // Fill area under the line — uses the downsampled path (see drawLine).
         ctx.beginPath();
-        const segs = downsampleLineSegments(self, values, firstIdx, lastIdx);
+        const segs = downsampleLineSegments(self, values, firstIdx, lastIdx, helpers.yMap);
         let started = false;
         for (const seg of segs) {
           if (!started) { ctx.moveTo(seg.x, seg.y); started = true; } else ctx.lineTo(seg.x, seg.y);
         }
         if (!started) return;
-        ctx.lineTo(lastValidX, self.priceBottom);
-        ctx.lineTo(firstValidX, self.priceBottom);
+        ctx.lineTo(lastValidX, ctxBottom);
+        ctx.lineTo(firstValidX, ctxBottom);
         ctx.closePath();
         ctx.fillStyle = grad;
         ctx.fill();
@@ -4842,11 +4913,17 @@ class TradingChart {
       // identical to the full path. Use this instead of building the path by
       // hand when you have a numeric values array.
       //   helpers.drawLine(ctx, values, { color:'#2962ff', lineWidth:1.5 });
+      // v2.17.0 FIX: maps values through the CURRENT context's scale — the
+      // pane's own scale for pane indicators (via paneToY), the volume scale
+      // for volume indicators, the price scale for overlays. Previously it
+      // ALWAYS projected through the price scale, so pane indicators drawn
+      // with this helper rasterized OUTSIDE their pane and the clip erased
+      // them (empty pane windows — the "bottom indicators don't work" report).
       drawLine: function (ctx, values, opts) {
         opts = opts || {};
         ctx.strokeStyle = opts.color || '#2962ff';
         ctx.lineWidth = opts.lineWidth || 1.5;
-        const segs = downsampleLineSegments(self, values, firstIdx, lastIdx);
+        const segs = downsampleLineSegments(self, values, firstIdx, lastIdx, helpers.yMap);
         if (segs.length === 0) return;
         ctx.beginPath();
         ctx.moveTo(segs[0].x, segs[0].y);
@@ -5555,7 +5632,8 @@ class TradingChart {
     }
 
     // Render each active volume indicator (e.g., volume SMA) via its render()
-    const helpers = this._indicatorHelpers(firstIdx, lastIdx);
+    // v2.17.0: kind 'volume' — helpers.drawLine/drawGradientArea now map via volToY.
+    const helpers = this._indicatorHelpers(firstIdx, lastIdx, 'volume');
     for (const id of volIndicators) {
       const state = this.indicatorStates.get(id);
       if (!state || !state.def || typeof state.def.render !== 'function') continue;
@@ -5602,7 +5680,8 @@ class TradingChart {
     ctx.rect(this.chartLeft, this.priceTop, this.chartRight - this.chartLeft, this.priceBottom - this.priceTop);
     ctx.clip();
 
-    const helpers = this._indicatorHelpers(firstIdx, lastIdx);
+    // v2.17.0: kind 'overlay' — helpers.drawLine/drawGradientArea map via priceToY.
+    const helpers = this._indicatorHelpers(firstIdx, lastIdx, 'overlay');
 
     for (const id of this.activeIndicators) {
       const state = this.indicatorStates.get(id);
@@ -5639,7 +5718,9 @@ class TradingChart {
     const paneIdx = this.crosshairIndex !== null ?
       clamp(Math.round(this.crosshairIndex), 0, this.sim.candles.length - 1) :
       this.sim.candles.length - 1;
-    const helpers = this._indicatorHelpers(firstIdx, lastIdx);
+    // v2.17.0: kind 'pane' — helpers.drawLine/drawGradientArea/paneToY map
+    // through the CURRENT pane's own scale (re-pointed per pane below).
+    const helpers = this._indicatorHelpers(firstIdx, lastIdx, 'pane');
 
     for (const pane of this._panes) {
       const state = this.indicatorStates.get(pane.id);

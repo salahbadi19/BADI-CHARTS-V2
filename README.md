@@ -4,10 +4,28 @@
 >
 > Pixel-perfect rendering, 14 drawing tools, fully custom indicators via API — you bring the data, the UI, and the indicators. BADI-CHARTS-V2 renders the chart.
 
-[![Version](https://img.shields.io/badge/version-2.16.0-2962ff.svg)](#)
+[![Version](https://img.shields.io/badge/version-2.17.0-2962ff.svg)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-26a69a.svg)](LICENSE)
 [![No Dependencies](https://img.shields.io/badge/dependencies-zero-ff9800.svg)](#)
 [![Headless](https://img.shields.io/badge/UI-headless-9c27b0.svg)](#)
+
+---
+
+## ⚠️ What changed in v2.17.0
+
+**Critical pane-indicator rendering fix** — resolves the reported "bottom indicators are mutually exclusive: enabling one stops the other, disabling it brings the other back".
+
+### Root cause
+`helpers.drawLine(ctx, values, opts)` (introduced in v2.16.0) and `helpers.drawGradientArea(...)` ALWAYS projected indicator values through the **price scale** — regardless of where the indicator renders. A pane indicator (RSI 0–100 on a 95,000-priced symbol) rasterized its line at price-area Y coordinates, far outside its own pane rect, and the pane clip erased it: an **empty pane window** (label + axis rendered, line didn't). Toggling a second pane indicator shifted the pane geometry, which decided **which** of the two windows happened to show its line — the reported one-works/one-doesn't exclusivity. Verified by rasterized-coordinate tests: on v2.16.0 an RSI line landed at Y [175.8–367.0] for a pane band [244–304] (5 points even leaked into the neighboring pane), a MACD line landed entirely BELOW its pane [418.9–474.0] vs [308–368], and a volume line landed at Y ≈ −6976.
+
+### Fixes
+1. **Context-aware value→Y mapping** — `_indicatorHelpers()` now takes a `kind` (`'overlay' | 'pane' | 'volume'`), passed by `drawIndicators` / `drawPane` / `drawVolume` respectively. `helpers.drawLine` and `helpers.drawGradientArea` map values through the CURRENT context's scale (`priceToY` / the pane's OWN scale via `paneToY` / `volToY`) and `drawGradientArea` closes its fill to that context's bottom edge (pane bottom / volume bottom / price bottom). Overlays are pixel-identical to v2.16.0; pane and volume indicators finally rasterize inside their own region.
+2. **`downsampleLineSegments` accepts a `yMap`** — the RDP downsampler maps points through the caller's mapper instead of hardcoding `priceToY`.
+3. **`helpers.paneToY` fallback removed** — the silent `|| self.paneScale` fallback mapped a pane-2 indicator through pane-1's scale when the pane lookup failed (the v2.14.0 bug through the back door). With no pane scale the safe output is the pane's own top edge.
+4. **Stamp no longer churns overlays** — only pane-type indicators include their pane's range in the offscreen-cache stamp. Previously every pane[0] rescale rebuilt every overlay/volume bitmap for nothing (`this.paneScale` leaked into their stamps).
+5. **Stale-region blit guard** — when a rebuild is deferred (frame budget) but the indicator's region moved (pane added/removed/resized), the old bitmap is no longer blitted into the new rect scaled/ghosted; the deferred rebuild lands on the next frame instead.
+
+No breaking API changes. All three render contexts are covered by automated rasterized-coordinate regression tests (pane-in-pane, overlay-in-price, volume-in-strip, no cross-pane leakage, gradient closes to pane bottom).
 
 ---
 
@@ -20,7 +38,7 @@
 2. **Time-axis label width** — measured with `ctx.measureText` instead of `label.length * 6 + 8` (broke on bold fonts, wide glyphs, future Arabic labels). Collision detection actually works now.
 3. **Crosshair on touch** — the blanket `if (_isMobile) return` was a fully disabled feature; mobile now shows a thinner-dashed crosshair + OHLC readout.
 4. **Crosshair time label clamp** — clamped to stay inside the canvas (left/right edges no longer clip outside).
-5. **Indicator line downsampling** — at extreme zoom-out (>2 visible bars per pixel), a light Ramer-Douglas-Peucker pass collapses collinear interior segments. New `helpers.drawLine(ctx, values, opts)` exposes it; `drawGradientArea` uses it internally.
+5. **Indicator line downsampling** — at extreme zoom-out (>2 visible bars per pixel), a light Ramer-Douglas-Peucker pass collapses collinear interior segments. New `helpers.drawLine(ctx, values, opts)` exposes it; `drawGradientArea` uses it internally. (v2.17.0 fix: both helpers now map values through the CURRENT context's scale — see the v2.17.0 changelog; in v2.16.0 they always used the price scale, which broke pane/volume indicators that used them.)
 6. **Gradient area close path** — closes back to the FIRST index that actually had a value, not to `firstIdx` (which could be `null` for warm-up bars).
 7. **Min price area safety loop** — only gives up when EVERY pane is at the 28px floor (was: when the largest was, so a single tall pane could starve the price area).
 
