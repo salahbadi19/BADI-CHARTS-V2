@@ -4,10 +4,139 @@
 >
 > Pixel-perfect rendering, 14 drawing tools, fully custom indicators via API — you bring the data, the UI, and the indicators. BADI-CHARTS-V2 renders the chart.
 
-[![Version](https://img.shields.io/badge/version-2.17.1-2962ff.svg)](#)
+[![Version](https://img.shields.io/badge/version-2.18.0-2962ff.svg)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-26a69a.svg)](LICENSE)
 [![No Dependencies](https://img.shields.io/badge/dependencies-zero-ff9800.svg)](#)
 [![Headless](https://img.shields.io/badge/UI-headless-9c27b0.svg)](#)
+
+---
+
+## ⚠️ What changed in v2.18.0
+
+**`helpers.drawOnMain(fn)` — pane indicators can now draw on the MAIN candle chart**, using `priceToY` / `indexToX` of the price area, NOT clipped to the pane.
+
+### What was wrong
+A pane indicator (RSI, MACD, Stochastic, ...) only ever received **pane-scale** helpers (`helpers.paneToY(v)` maps into the pane's own 0–100 / oscillator window), and its `ctx` was **clipped to the pane rect**. There was no way for a pane indicator to project a price-level line, a candle marker, or a touch-index vertical line onto the candle chart itself: anything drawn at a `priceToY` Y-coordinate was erased by the pane clip. This was a library limitation, not a bug in user code — `helpers.priceToY` existed but was unusable from inside a pane render because of the clip.
+
+### What changed
+1. **New helper: `h.drawOnMain(fn)`** — register a callback that runs once per frame, AFTER `drawPane()`, against the **live main-chart ctx clipped to the price area** (NOT the pane). The callback receives `(mctx, mh)` where `mh` exposes `priceToY`, `indexToX`, `chartLeft`, `chartRight`, `priceTop`, `priceBottom`, `firstIdx`, `lastIdx`, `barSpacing`, `dpr`, `candles`, `THEME`.
+2. **Per-frame replay, cache-safe.** Callbacks are stored on the indicator's state (`state._mainDraws`) and replayed every frame — including **cache-HIT frames** where the indicator's `render()` was NOT called. They are only replaced when the offscreen cache rebuilds (i.e. when `render()` actually runs). Removing the indicator drops its callbacks.
+3. **Sandboxed.** A throw inside a `drawOnMain` callback is swallowed (logged when `BADI_DEBUG = true`), so one broken callback never kills the chart or hides sibling callbacks.
+4. **Z-order.** The callback runs AFTER `drawIndicators()` (the overlay layer) and `drawPane()` (pane indicators), so it draws on TOP of overlays (Bollinger Bands, SMA, EMA) and BELOW markers, user drawings, the crosshair and the price-axis labels.
+
+### Usage — pane indicator draws a price level on the candle chart
+
+```js
+chart.addIndicator({
+  id: 'rsi', label: 'RSI 14', type: 'pane', color: '#d32f53',
+  settings: { period: 14 },
+  calculate: function (c, s) { /* ...RSI calc... */ return out; },
+  getRange:  function () { return { min: 0, max: 100 }; },
+  render: function (ctx, v, h, s, state) {
+    // 1. Draw the RSI line INSIDE the pane (as before).
+    ctx.strokeStyle = s.color; ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    let started = false;
+    for (let i = h.firstIdx; i <= h.lastIdx; i++) {
+      if (v[i] === null) { started = false; continue; }
+      const x = h.indexToX(i), y = h.paneToY(v[i]);
+      if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+
+    // 2. Project a price-level line onto the CANDLE chart from inside the pane.
+    //    Find the last candle whose RSI crossed 70 and draw a horizontal line
+    //    at that candle's CLOSE price, spanning from the touch index to the
+    //    last visible candle.
+    let touchIdx = -1;
+    for (let i = h.lastIdx; i >= h.firstIdx; i--) {
+      if (v[i] !== null && v[i] >= 70) { touchIdx = i; break; }
+    }
+    if (touchIdx >= 0) {
+      const level = h.candles[touchIdx].close;
+      h.drawOnMain(function (mctx, mh) {
+        const y  = mh.priceToY(level);
+        const x1 = mh.indexToX(touchIdx);
+        const x2 = mh.indexToX(mh.lastIdx);
+        mctx.strokeStyle = '#ff5252';
+        mctx.lineWidth = 1;
+        mctx.setLineDash([4, 3]);
+        mctx.beginPath();
+        mctx.moveTo(x1, y);
+        mctx.lineTo(x2, y);
+        mctx.stroke();
+        mctx.setLineDash([]);
+      });
+    }
+  }
+});
+```
+
+### RSI (pane) + Bollinger Bands (overlay) in ONE chart
+
+Both indicator types can be active at the same time and render correctly — they were always independent (overlays render in `drawIndicators()` with `kind: 'overlay'`; panes in `drawPane()` with `kind: 'pane'`), but `drawOnMain()` now lets a pane indicator also draw on the candle layer that the overlay lives on. Example:
+
+```js
+// Overlay: Bollinger Bands on the candle chart
+chart.addIndicator({
+  id: 'bb', label: 'BB 20 2σ', type: 'overlay',
+  settings: { period: 20, mult: 2 },
+  calculate: function (c, s) {
+    const p = s.period, m = s.mult, out = { upper: [], mid: [], lower: [] };
+    for (let i = 0; i < c.length; i++) {
+      if (i < p - 1) { out.upper[i] = out.mid[i] = out.lower[i] = null; continue; }
+      let sum = 0;
+      for (let k = i - p + 1; k <= i; k++) sum += c[k].close;
+      const mean = sum / p;
+      let sq = 0;
+      for (let k = i - p + 1; k <= i; k++) sq += (c[k].close - mean) ** 2;
+      const sd = Math.sqrt(sq / p);
+      out.upper[i] = mean + m * sd;
+      out.mid[i]   = mean;
+      out.lower[i] = mean - m * sd;
+    }
+    return out;
+  },
+  render: function (ctx, v, h, s) {
+    ctx.lineWidth = 1; ctx.strokeStyle = '#9c27b0';
+    ['upper', 'lower'].forEach(function (k) {
+      ctx.beginPath();
+      let st = false;
+      for (let i = h.firstIdx; i <= h.lastIdx; i++) {
+        if (v[k][i] === null) { st = false; continue; }
+        const x = h.indexToX(i), y = h.priceToY(v[k][i]);
+        if (!st) { ctx.moveTo(x, y); st = true; } else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+    });
+    ctx.strokeStyle = '#ce93d8'; ctx.setLineDash([2, 2]);
+    ctx.beginPath();
+    let st = false;
+    for (let i = h.firstIdx; i <= h.lastIdx; i++) {
+      if (v.mid[i] === null) { st = false; continue; }
+      const x = h.indexToX(i), y = h.priceToY(v.mid[i]);
+      if (!st) { ctx.moveTo(x, y); st = true; } else ctx.lineTo(x, y);
+    }
+    ctx.stroke(); ctx.setLineDash([]);
+  }
+});
+
+// Pane: RSI 14 — also projects a price-level line via h.drawOnMain()
+chart.addIndicator({
+  id: 'rsi', label: 'RSI 14', type: 'pane', color: '#d32f53',
+  settings: { period: 14 },
+  calculate: function (c, s) { /* ... */ },
+  getRange:  function () { return { min: 0, max: 100 }; },
+  render:    function (ctx, v, h, s, state) {
+    /* ...draw RSI line in pane... */
+    /* ...h.drawOnMain(function (mctx, mh) { ...priceToY(level)... })... */
+  }
+});
+```
+
+Both indicators render at the same time: Bollinger Bands inside the price area, RSI in its own pane below, and any `drawOnMain()` callbacks from RSI replay on top of the Bollinger Bands (and the candles) inside the price area.
+
+No breaking API changes. `helpers.drawOnMain()` is purely additive — existing indicators (overlay, pane, volume) keep working unchanged.
 
 ---
 
@@ -823,6 +952,13 @@ chart.addIndicator({
     //   helpers.volTop, helpers.volBottom, helpers.paneTop, helpers.paneBottom
     //   helpers.barSpacing, helpers.dpr, helpers.candles, helpers.THEME
     //   helpers.optimalCandlestickWidth(barSpacing, dpr)
+    //   helpers.drawOnMain(fn)   (v2.18.0+) — register a callback that draws
+    //     on the MAIN candle chart, NOT clipped to this pane. The callback
+    //     receives (mctx, mh) where mh has priceToY, indexToX and the price-
+    //     area geometry. Useful for pane indicators that need to project a
+    //     price level, candle marker, or touch-index vertical line onto the
+    //     candle chart itself. See the v2.18.0 changelog above for a full
+    //     example.
     ctx.strokeStyle = settings.color;
     ctx.lineWidth = 1.5;
     ctx.beginPath();

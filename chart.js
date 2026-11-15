@@ -299,7 +299,7 @@
 'use strict';
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.17.1';
+const VERSION = '2.18.0';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 // v2.14.0 (audit #12): tracks the chart the user last hovered/touched, so
 // window-level keyboard shortcuts only apply to ONE chart on multi-chart pages.
@@ -1410,6 +1410,19 @@ class TradingChart {
     this._paneHUsers = {};                   // paneId → height (null/missing = auto)
     this._paneResize = null;                  // null | { paneId, startY, startH } while dragging
     this._paneSepHoverId = null;              // paneId whose separator is hovered (cursor + grip)
+    // v2.18.0: drawOnMain — pane indicators can register callbacks that draw
+    // on the MAIN chart layer (price area), using priceToY / indexToX of the
+    // candle chart, NOT clipped to the pane. The library limitation was that
+    // pane indicators only got helpers.paneToY (a pane-relative scale) and
+    // their ctx was clipped to the pane rect — so a horizontal price level
+    // drawn from inside an RSI render() was erased by the pane clip. Now an
+    // indicator calls h.drawOnMain(function (mctx, mh) { ... }) and the
+    // callback is replayed after drawPane(), against the LIVE main ctx with
+    // the price-area clip (NOT the pane clip). Callbacks are cached per
+    // indicator state so cache-HIT frames (no render() call) still replay
+    // them — only a cache REBUILD replaces the set.
+    this._pendingMainDraws = [];              // per-frame queue of {fn} to replay
+    this._currentRenderState = null;          // state of the indicator whose render() is now running
     // v2.13.0: COUNTDOWN — a 2-digit number that floats just to the right of
     // the forming candle, at the close-price Y level, with no border/card.
     // Counts down based on the timeframe: minutes for H1+, seconds for sub-
@@ -4435,6 +4448,11 @@ class TradingChart {
     // v2.11.0: self-animated indicators opt out of the cache — their render()
     // typically depends on time and must run every frame (loop stays awake).
     if (state.def.animated === true) {
+      // v2.18.0: thread _currentRenderState + reset state._mainDraws so
+      // drawOnMain() callbacks registered during this render replace the
+      // previous frame's set (animated indicators re-register every frame).
+      this._currentRenderState = state;
+      state._mainDraws = [];
       ctx.save();
       try {
         state.def.render(ctx, this.indCache[id], helpers, state.settings, state);
@@ -4444,6 +4462,7 @@ class TradingChart {
       } finally {
         ctx.restore();  // discard any leaked transform / clip / alpha / shadow
         this._fixCanvasWreck();   // user code may have resized the bitmap
+        this._currentRenderState = null;   // v2.18.0: always clear, even on throw
       }
       return;
     }
@@ -4528,6 +4547,15 @@ class TradingChart {
       octx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
       octx.translate(-region.x, -region.y);
       let ok = true;
+      // v2.18.0: thread _currentRenderState + reset state._mainDraws so
+      // drawOnMain() callbacks registered during this render REPLACE the
+      // previous cache's set. The cached callbacks are replayed every frame
+      // by _flushMainDraws() — including cache-HIT frames where render()
+      // is NOT called — so a price-level line drawn from inside a pane
+      // indicator stays on screen until the indicator is removed or its
+      // inputs change (which triggers a cache rebuild and a fresh set).
+      this._currentRenderState = state;
+      state._mainDraws = [];
       octx.save();
       try {
         state.def.render(octx, this.indCache[id], helpers, state.settings, state);
@@ -4537,6 +4565,7 @@ class TradingChart {
         this._flagIndicatorError(id, state, e, 'render()');
       } finally {
         octx.restore();
+        this._currentRenderState = null;   // v2.18.0: always clear, even on throw
       }
       entry.ok = ok;
       // Failed renders are NOT cached — they retry (with backoff, see above).
@@ -5012,6 +5041,59 @@ class TradingChart {
         ctx.moveTo(segs[0].x, segs[0].y);
         for (let i = 1; i < segs.length; i++) ctx.lineTo(segs[i].x, segs[i].y);
         ctx.stroke();
+      },
+      // v2.18.0: drawOnMain(fn) — register a callback that draws on the MAIN
+      // chart layer (the candlestick price area) using priceToY / indexToX of
+      // the candle chart, NOT clipped to this pane. This is the official
+      // escape hatch for pane indicators that need to project something onto
+      // the candle chart itself (a horizontal price level at the close of the
+      // candle that touched RSI 70, a vertical line at the touch index, a
+      // marker on the candle, etc.).
+      //
+      //   render: function (ctx, values, h, s, state) {
+      //     // ...draw the RSI line inside this pane...
+      //     h.drawOnMain(function (mctx, mh) {
+      //       // mctx = the LIVE main-chart canvas context, clipped to the
+      //       //        price area (NOT to this pane).
+      //       // mh   = main-chart helpers:
+      //       //        mh.priceToY(p), mh.indexToX(i),
+      //       //        mh.chartLeft, mh.chartRight, mh.priceTop, mh.priceBottom,
+      //       //        mh.firstIdx, mh.lastIdx, mh.barSpacing, mh.dpr,
+      //       //        mh.candles, mh.THEME
+      //       const y = mh.priceToY(level);
+      //       mctx.beginPath();
+      //       mctx.moveTo(mh.indexToX(i), y);
+      //       mctx.lineTo(mh.indexToX(touchIdx), y);
+      //       mctx.stroke();
+      //     });
+      //   }
+      //
+      // Notes:
+      // - The callback runs AFTER drawPane() and AFTER drawIndicators() (the
+      //   overlay layer), so it draws on top of overlays (Bollinger Bands, SMA,
+      //   etc.) and below markers/drawings/crosshair.
+      // - It is replayed every frame, even on cache-HIT frames where the
+      //   indicator's render() wasn't called. Callbacks are stored per
+      //   indicator state and only replaced when the offscreen cache rebuilds
+      //   (i.e. when render() actually runs). Removing the indicator clears
+      //   its callbacks.
+      // - Safe to call from overlay/volume indicators too, but redundant there
+      //   (their ctx is already the price-area / volume-strip ctx).
+      // - The callback is sandboxed: a throw is swallowed (and logged when
+      //   BADI_DEBUG = true), so one broken drawOnMain never kills the chart.
+      drawOnMain: function (fn) {
+        if (typeof fn !== 'function') return;
+        // Cache on the indicator state — replayed every frame by
+        // _flushMainDraws via the state sweep (NO live push to the
+        // per-frame queue — that would double-execute the callback, once
+        // from the live push and once from the sweep). The state sweep
+        // runs AFTER drawPane() in the render pipeline, so it picks up
+        // freshly-registered callbacks from THIS frame's render() pass.
+        const st = self._currentRenderState;
+        if (st) {
+          if (!Array.isArray(st._mainDraws)) st._mainDraws = [];
+          st._mainDraws.push(fn);
+        }
       }
     };
     helpers._paneRegion = paneRegion;
@@ -5348,6 +5430,7 @@ class TradingChart {
       this.drawIndicators();
       this.drawVolumeProfile();
       this.drawPane();
+      this._flushMainDraws();          // v2.18.0: replay pane indicators' drawOnMain() callbacks
       this.drawPaneSeparators();   // v2.14.0: after pane bg so grips aren't covered
       // v2.8.0: markers are drawn AFTER indicators/pane so translucent fills,
       // gradients and the pane backdrop never cover buy/sell arrows.
@@ -5875,6 +5958,99 @@ class TradingChart {
         this._drawIndicatorLine(left + 6, top + 4, pane.id, state.def, state, val);
       }
     }
+  }
+
+  /* --------------------------- drawOnMain replay (v2.18.0) --------------- */
+  // _flushMainDraws() — replays every active indicator's cached drawOnMain()
+  // callbacks against the LIVE main-chart ctx, clipped to the price area.
+  // Called once per frame, AFTER drawPane() (so pane indicators have already
+  // had a chance to register fresh callbacks during their cache-rebuild) and
+  // BEFORE drawPaneSeparators()/drawMarkers()/drawDrawings()/drawCrosshair()
+  // (so the price-level line draws under the crosshair and user drawings).
+  //
+  // Cache contract:
+  //   - state._mainDraws is reset to [] immediately before each render() call
+  //     inside _safeRenderIndicator (both the animated and cache-rebuild paths).
+  //   - render() then calls h.drawOnMain(fn) one or more times, which pushes
+  //     fn into state._mainDraws.
+  //   - On cache-HIT frames render() is NOT called, so state._mainDraws keeps
+  //     the LAST render's callbacks and they are replayed again — the drawing
+  //     stays on screen.
+  //   - When the indicator's stamp changes (data/settings/theme/scale), the
+  //     cache rebuilds, render() runs, and state._mainDraws is replaced.
+  //   - removeIndicator() drops the state entirely (the indicatorStates map
+  //     entry is deleted), so its callbacks are no longer found here.
+  _flushMainDraws() {
+    // Sweep active indicators and seed the per-frame queue from each state's
+    // cached _mainDraws. Live registrations during THIS frame's render() pass
+    // were already pushed to _pendingMainDraws by helpers.drawOnMain(); the
+    // sweep below ALSO adds cache-HIT callbacks from indicators whose render()
+    // didn't run this frame (so their previous callbacks still replay).
+    if (this.activeIndicators.size > 0) {
+      for (const id of this.activeIndicators) {
+        const state = this.indicatorStates.get(id);
+        if (!state || state.visible === false) continue;
+        const draws = state._mainDraws;
+        if (!draws || draws.length === 0) continue;
+        for (let i = 0; i < draws.length; i++) {
+          this._pendingMainDraws.push({ fn: draws[i] });
+        }
+      }
+    }
+    if (this._pendingMainDraws.length === 0) return;
+
+    const ctx = this.ctx;
+    const firstIdx = Math.max(0, Math.floor(this.xToIndex(this.chartLeft)));
+    const lastIdx  = Math.min(this.sim.candles.length - 1,
+                              Math.ceil(this.xToIndex(this.chartRight)));
+    const self = this;
+    // Main-chart helpers — a SUBSET of the regular indicator helpers, exposing
+    // ONLY the price-area coordinate converters and geometry. Pane-only fields
+    // (paneToY, paneTop, paneBottom, volToY, volTop, volBottom) are omitted on
+    // purpose: drawOnMain is for drawing on the CANDLE layer, and exposing the
+    // pane/volume scales there would be misleading.
+    const mainHelpers = {
+      firstIdx:    firstIdx,
+      lastIdx:     lastIdx,
+      indexToX:    function (i) { return self.indexToX(i); },
+      priceToY:    function (p) { return self.priceToY(p); },
+      chartLeft:   this.chartLeft,
+      chartRight:  this.chartRight,
+      priceTop:    this.priceTop,
+      priceBottom: this.priceBottom,
+      barSpacing:  this.barSpacing,
+      dpr:         this.dpr,
+      candles:     this.sim.candles,
+      THEME:       THEME
+    };
+
+    ctx.save();
+    // Clip to the price area — main-layer drawings stay inside the candle
+    // region (they will NOT leak into the time axis, the pane windows, or the
+    // volume strip). This is the key fix: a pane indicator's own ctx was
+    // clipped to its pane rect, erasing anything drawn at a price-area Y;
+    // here the clip matches what the user wants (the price area itself).
+    ctx.beginPath();
+    ctx.rect(this.chartLeft, this.priceTop,
+             this.chartRight - this.chartLeft,
+             this.priceBottom - this.priceTop);
+    ctx.clip();
+    // Replay every pending callback. Each is sandboxed: a throw is logged
+    // (when BADI_DEBUG) and swallowed so one broken callback can't kill the
+    // chart or hide sibling callbacks.
+    const queue = this._pendingMainDraws;
+    for (let i = 0; i < queue.length; i++) {
+      const entry = queue[i];
+      try {
+        entry.fn.call(null, ctx, mainHelpers);
+      } catch (e) {
+        if (BADI_DEBUG) console.error('[BadiCharts] drawOnMain callback error:', e);
+      }
+    }
+    ctx.restore();
+    // Clear the per-frame queue (callback cache lives on state._mainDraws and
+    // will be re-seeded next frame).
+    this._pendingMainDraws.length = 0;
   }
 
   /* --------------------------- Drawings ---------------------------------- */
