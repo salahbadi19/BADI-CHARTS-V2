@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.17.1 — Pixel-Perfect Pure JavaScript Trading Chart Library
+ * BADI-CHARTS-V2 v2.18.0 — Pixel-Perfect Pure JavaScript Trading Chart Library
  *
  * A lightweight, dependency-free candlestick charting library built entirely
  * with the HTML5 Canvas API. Inspired by TradingView Lightweight Charts.
@@ -13,6 +13,20 @@
  *   - Responsive (desktop + mobile with touch/pinch support)
  *   - Crosshair, current price line, OHLC legend
  *   - Clipping for all chart areas (no overflow)
+ *
+ * v2.18.0 — helpers.drawOnMain(fn): pane indicators can draw on the MAIN
+ *   candle chart (the price area), using priceToY / indexToX of the candle
+ *   chart, NOT clipped to the pane. A pane indicator's render() received
+ *   ONLY pane-scale helpers (helpers.paneToY maps into the pane's own 0-100
+ *   window) and its ctx was clipped to the pane rect — so a horizontal price
+ *   level drawn from inside an RSI render() was erased by the pane clip.
+ *   Now an indicator calls h.drawOnMain(function (mctx, mh) { ... }) and the
+ *   callback is replayed every frame against the LIVE main-chart ctx clipped
+ *   to the price area. Useful for projecting a price level, candle marker, or
+ *   touch-index vertical line onto the candle chart from inside a pane.
+ *   Callbacks are cached per indicator state (state._mainDraws) and replayed
+ *   on cache-HIT frames too. Sandboxed: a throw is swallowed.
+ *   RSI (pane) + Bollinger Bands (overlay) run together in ONE chart.
  *
  * v2.17.1 — UNLIMITED bottom indicators (the "draw as many as you want" release):
  *   - NO CAP: the hard limit of 6 pane windows is GONE. Every visible pane-type
