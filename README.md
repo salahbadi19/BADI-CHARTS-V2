@@ -4,10 +4,34 @@
 >
 > Pixel-perfect rendering, 14 drawing tools, fully custom indicators via API — you bring the data, the UI, and the indicators. BADI-CHARTS-V2 renders the chart.
 
-[![Version](https://img.shields.io/badge/version-2.18.0-2962ff.svg)](#)
+[![Version](https://img.shields.io/badge/version-2.18.1-2962ff.svg)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-26a69a.svg)](LICENSE)
 [![No Dependencies](https://img.shields.io/badge/dependencies-zero-ff9800.svg)](#)
 [![Headless](https://img.shields.io/badge/UI-headless-9c27b0.svg)](#)
+
+---
+
+## ⚠️ What changed in v2.18.1
+
+**Performance: guarded bitmap resize in `_safeRenderIndicator`** — eliminates a hidden per-frame reallocation during pan/zoom.
+
+### What was wrong
+In the indicator cache-rebuild branch, the line:
+```js
+entry.canvas.width = pxW; entry.canvas.height = pxH;
+```
+ran on EVERY rebuild. Assigning `canvas.width` (even to the SAME value) **clears the bitmap AND forces the browser to allocate a fresh backing store**. During pan/zoom the indicator's stamp changes every frame (because `barSpacing` moves), so the cache rebuilds 60×/sec — but the region SIZE (pxW × pxH) rarely changes at all. The old code was reallocating an identical-size bitmap 60 times per second for nothing.
+
+### What changed
+```js
+if (entry.canvas.width  !== pxW) entry.canvas.width  = pxW;
+if (entry.canvas.height !== pxH) entry.canvas.height = pxH;
+```
+The bitmap is now resized ONLY when its dimensions actually change. The `clearRect` immediately below already wipes stale pixels, so the visual result is identical. Pan/zoom is noticeably lighter, especially on charts with many indicators (each indicator's cache was independently paying this cost).
+
+Also: the file header banner comment is now in sync with `VERSION` (both say `2.18.x`). The CDN cache for v2.18.0 was briefly serving a stale banner line — the source was already correct; this release makes it unambiguous.
+
+No breaking API changes. Purely a perf optimization.
 
 ---
 

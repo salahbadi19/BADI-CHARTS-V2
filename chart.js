@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.18.0 — Pixel-Perfect Pure JavaScript Trading Chart Library
+ * BADI-CHARTS-V2 v2.18.1 — Pixel-Perfect Pure JavaScript Trading Chart Library
  *
  * A lightweight, dependency-free candlestick charting library built entirely
  * with the HTML5 Canvas API. Inspired by TradingView Lightweight Charts.
@@ -13,6 +13,16 @@
  *   - Responsive (desktop + mobile with touch/pinch support)
  *   - Crosshair, current price line, OHLC legend
  *   - Clipping for all chart areas (no overflow)
+ *
+ * v2.18.1 — perf: guarded bitmap resize in _safeRenderIndicator's rebuild
+ *   branch. `entry.canvas.width = pxW` (even when pxW is UNCHANGED) clears the
+ *   bitmap AND forces the browser to allocate a fresh backing store on every
+ *   rebuild. During pan/zoom the indicator's STAMP changes every frame
+ *   (barSpacing moves) but the region SIZE rarely does — so the old code
+ *   reallocated the bitmap 60×/sec for nothing. The guarded form
+ *   `if (entry.canvas.width !== pxW) entry.canvas.width = pxW;` skips the
+ *   reallocation; the existing clearRect() below already wipes stale pixels,
+ *   so the visual result is identical but pan/zoom is lighter. No API change.
  *
  * v2.18.0 — helpers.drawOnMain(fn): pane indicators can draw on the MAIN
  *   candle chart (the price area), using priceToY / indexToX of the candle
@@ -313,7 +323,7 @@
 'use strict';
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.18.0';
+const VERSION = '2.18.1';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 // v2.14.0 (audit #12): tracks the chart the user last hovered/touched, so
 // window-level keyboard shortcuts only apply to ONE chart on multi-chart pages.
@@ -4549,7 +4559,15 @@ class TradingChart {
       // Rebuild: render the indicator into its own bitmap, sandboxed.
       this._frameRebuilds++;
       this._frameRebuildArea += bitmapArea;   // v2.17.1: area-based budget
-      entry.canvas.width = pxW; entry.canvas.height = pxH;
+      // v2.18.1: only RESIZE the bitmap when the dimensions actually changed.
+      // Assigning canvas.width (even to the SAME value) clears the bitmap AND
+      // forces the browser to reallocate a fresh backing store — a real cost
+      // on every rebuild, especially during pan/zoom where the indicator's
+      // STAMP changes every frame (barSpacing moves) but the region size
+      // rarely does. Guarded assignment skips the reallocation; the clearRect
+      // below already wipes stale pixels, so the visual result is identical.
+      if (entry.canvas.width  !== pxW) entry.canvas.width  = pxW;
+      if (entry.canvas.height !== pxH) entry.canvas.height = pxH;
       entry.region = region;
       const octx = entry.octx;
       octx.setTransform(1, 0, 0, 1, 0, 0);
