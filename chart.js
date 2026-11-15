@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.16.0 — Pixel-Perfect Pure JavaScript Trading Chart Library
+ * BADI-CHARTS-V2 v2.17.1 — Pixel-Perfect Pure JavaScript Trading Chart Library
  *
  * A lightweight, dependency-free candlestick charting library built entirely
  * with the HTML5 Canvas API. Inspired by TradingView Lightweight Charts.
@@ -13,6 +13,33 @@
  *   - Responsive (desktop + mobile with touch/pinch support)
  *   - Crosshair, current price line, OHLC legend
  *   - Clipping for all chart areas (no overflow)
+ *
+ * v2.17.1 — UNLIMITED bottom indicators (the "draw as many as you want" release):
+ *   - NO CAP: the hard limit of 6 pane windows is GONE. Every visible pane-type
+ *     indicator (RSI, MACD, Stoch, ...) gets its OWN window — add 7, 12 or 20
+ *     bottom indicators and ALL of them render. The old cap silently dropped
+ *     panes 7+ (active in the API but drawn NOWHERE, which looked like
+ *     "one bottom indicator kills another").
+ *   - ADAPTIVE pane heights: the 60px comfort floor holds while N × 60 fits
+ *     the pane budget; beyond that it yields down to a 16px absolute floor so
+ *     every pane keeps a real window and the price area keeps its guaranteed
+ *     minimum. A last-resort squeeze (8px floor) makes NaN coordinates
+ *     impossible on any canvas, however small.
+ *   - AREA-based rebuild budget: the fixed 2-rebuilds-per-frame budget dates
+ *     from the v2.12 era when indicator bitmaps were full-screen sized. Since
+ *     v2.16 bitmaps are region-sized (a pane bitmap is ~10× smaller than the
+ *     screen), so the count budget made panes appear only 2-per-frame. The
+ *     budget now measures bitmap AREA (~2 full-screen areas per frame): a
+ *     dozen pane indicators rebuild in ONE frame, heavy overlay bursts are
+ *     still throttled.
+ *   - Pane labels are skipped on panes shorter than 22px (the label card
+ *     would bleed into the pane below).
+ *
+ * v2.17.0 — helpers context fix:
+ *   - helpers.drawLine / drawGradientArea / paneToY now map values through
+ *     the CURRENT context's scale — re-pointed per pane during drawPane() —
+ *     fixing pane/volume indicators that used the helpers and drew through
+ *     the wrong (first) pane's scale.
  *
  * v2.16.0 — Rendering quality + memory + robustness release (23 audit items).
  *   Highlights:
@@ -272,7 +299,7 @@
 'use strict';
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.17.0';
+const VERSION = '2.17.1';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 // v2.14.0 (audit #12): tracks the chart the user last hovered/touched, so
 // window-level keyboard shortcuts only apply to ONE chart on multi-chart pages.
@@ -1351,7 +1378,18 @@ class TradingChart {
     // rebuilding 5+ heavy indicator layers and cause a visible hitch.
     this._frameId = 0;                       // monotonic frame counter
     this._frameRebuilds = 0;                 // rebuilds done in the current frame
-    this._MAX_FRAME_REBUILDS = 2;            // hard cap per frame
+    // v2.17.1: AREA-based rebuild budget. The old fixed count (2/frame) dates
+    // from v2.12 when every offscreen bitmap was FULL-SCREEN sized. Since
+    // v2.16 (#10) bitmaps are sized to the indicator's own REGION — a pane
+    // bitmap is ~10× smaller than the screen — so with 7+ bottom indicators
+    // the count budget made panes appear only 2-per-frame (progressive
+    // popping) and blank panes lingered in on-demand render contexts. The
+    // budget now measures BITMAP AREA: up to ~2 full-screen areas of new
+    // pixels per frame (same anti-hitch intent), which rebuilds a dozen pane
+    // indicators in ONE frame while still throttling heavy overlay bursts.
+    this._frameRebuildArea = 0;              // bitmap pixels rebuilt this frame
+    this._REBUILD_AREA_FACTOR = 2;           // full-screen areas allowed per frame
+    this._MAX_FRAME_REBUILDS = 64;           // hard safety ceiling per frame
     // v2.15.0: the rebuild budget is bypassed not only during mouse drags but
     // for a short window after ANY fast interaction (wheel zoom, pinch,
     // momentum) — otherwise indicators 3+ kept showing stale bitmaps while
@@ -2618,21 +2656,15 @@ class TradingChart {
         paneIds.push(id);
       }
     }
-    // v2.14.0 FIX (audit #13c): hard cap of 6 panes. Beyond that, extra pane
-    // indicators stay active in the API but get no window (there is simply no
-    // room — previously 10 panes produced 10×MIN heights and a negative price
-    // area → NaN coordinates everywhere).
-    const MAX_PANES = 6;
-    const overflow = paneIds.slice(MAX_PANES);
-    if (overflow.length > 0) {
-      // v2.16.0: this warning is ALWAYS shown (was BADI_DEBUG-only) — a pane
-      // indicator beyond the cap gets NO window and renders nowhere, which
-      // looks exactly like "my bottom indicator doesn't work" with no clue.
-      console.warn('[BadiCharts] More than ' + MAX_PANES +
-        ' pane indicators active — these get NO window until others are removed or hidden: [' +
-        overflow.join(', ') + ']. Visible panes: [' + paneIds.slice(0, MAX_PANES).join(', ') + ']');
-      paneIds.length = MAX_PANES;
-    }
+    // v2.17.1: NO CAP. Every visible pane-type indicator gets its OWN window —
+    // the user can add as many bottom indicators as they want and ALL of them
+    // render. The old hard cap of 6 silently dropped panes 7+ (they stayed
+    // "active" in the API but drew NOWHERE, which looked like a bug). Instead
+    // of capping, the per-pane heights adapt: the more panes, the smaller each
+    // one gets (down to a readable minimum), and the price area always keeps
+    // its guaranteed minimum. With a huge number of panes on a small canvas
+    // every pane shrinks toward the 16px absolute floor — small, but VISIBLE
+    // and error-free (no NaN coordinates are possible: every height stays > 0).
     const N = paneIds.length;
     const hasPane = N > 0;
     const volH = hasVolume ? this.layout.volumeH : 0;   // hoisted (needed by the budget)
@@ -2664,12 +2696,26 @@ class TradingChart {
     // v2.14.0 FIX (audit #13a): the volume strip is now SUBTRACTED from the
     // budget first — previously volH was ignored, so with a volume indicator
     // active the panes could overflow into it and squeeze the price area.
-    const MIN_PANE_H = 60;
+    const MIN_PANE_H = 60;      // comfort floor for a handful of panes
+    const ABS_MIN_PANE_H = 16;  // v2.17.1: absolute floor — a pane this small still draws
     const MIN_PRICE_H = 120;
     const usableH = Math.max(0, bottomStart - (paneTop + 4) - volH);
     const maxTotalPaneH = Math.max(0, usableH - MIN_PRICE_H);
+    // v2.17.1: ADAPTIVE floor. With N panes the 60px comfort floor only holds
+    // while N × 60 fits in the pane budget; beyond that the floor yields down
+    // to ABS_MIN_PANE_H so EVERY pane keeps a real window (the old behaviour
+    // — fixed 60px — overflowed the budget and forced the cap). The floor is
+    // GAP-AWARE: the stack also consumes 4px between panes + 4px above + one
+    // price gap, and those pixels are reserved BEFORE dividing the budget, so
+    // N × paneFloor + gaps ≤ maxTotalPaneH whenever paneFloor > ABS_MIN_PANE_H
+    // and the price area keeps its MIN_PRICE_H guarantee for ANY pane count.
+    const gapAllowance = (N - 1) * 4 + 4 + this.layout.gap;
+    const paneFloor = hasPane
+      ? Math.max(ABS_MIN_PANE_H, Math.min(MIN_PANE_H,
+          Math.floor(Math.max(0, maxTotalPaneH - gapAllowance) / N)))
+      : MIN_PANE_H;
     const autoEach = hasPane
-      ? Math.max(MIN_PANE_H, Math.min(200, Math.round((usableH * 0.24) / N)))
+      ? Math.max(paneFloor, Math.min(200, Math.round((usableH * 0.24) / N)))
       : 0;
     let paneTotalH = 0;
     for (const p of this._panes) {
@@ -2680,6 +2726,8 @@ class TradingChart {
       } else {
         h = autoEach;
       }
+      // v2.17.1: never below the adaptive floor (guards a degenerate budget).
+      if (h < paneFloor) h = paneFloor;
       p.height = h;
       paneTotalH += h;
     }
@@ -2689,13 +2737,15 @@ class TradingChart {
     // shrink — with e.g. 6 panes × 60px forced minimum on a 400px chart the
     // "protected" sum was still 360px, leaving a 0-or-negative price area and
     // NaN in coordinateToLogical. The proportional shrink is now honest (down
-    // to a 28px hard floor per pane) and a final safety pass guarantees the
-    // price area is at least MIN_PRICE_H whenever the canvas allows it.
+    // to the ADAPTIVE floor per pane — v2.17.1: was a fixed 28px, which still
+    // overflowed with 7+ panes: 7 × 28 = 196px on a budget of 160px) and the
+    // final safety pass guarantees the price area its minimum whenever the
+    // canvas allows it.
     if (paneTotalH > maxTotalPaneH && paneTotalH > 0) {
       const scale = maxTotalPaneH / paneTotalH;
       paneTotalH = 0;
       for (const p of this._panes) {
-        p.height = Math.max(28, Math.round(p.height * scale));
+        p.height = Math.max(paneFloor, Math.round(p.height * scale));
         paneTotalH += p.height;
       }
     }
@@ -2738,17 +2788,23 @@ class TradingChart {
     // single tall pane could keep starving the price area on a small canvas
     // (e.g. one user-set 200px pane on a 320px canvas → price area stuck at
     // ~70-80px instead of the declared 120px minimum). The loop now continues
-    // shrinking ANY pane above the floor until EVERY pane is at 28px (only
-    // then does it give up — meaning the canvas itself is too small).
+    // shrinking ANY pane above the adaptive floor until EVERY pane is at
+    // paneFloor (only then does it give up — meaning the canvas itself is too
+    // small).
+    // v2.17.1 LAST-RESORT squeeze: when even N × paneFloor does not fit (only
+    // possible on a very small canvas with very many panes — the paneFloor
+    // then equals ABS_MIN_PANE_H), shrink ALL panes proportionally to an 8px
+    // absolute floor so the price area stays positive. Heights can NEVER
+    // reach 0 or below in any code path → no NaN coordinates are possible.
     let guard = 0;
     while ((this.priceBottom - this.priceTop) < MIN_PRICE_H && guard++ < 12) {
-      // Pick the tallest pane that is still above the 28px floor.
+      // Pick the tallest pane that is still above the adaptive floor.
       let target = null;
       for (const p of this._panes) {
-        if (p.height > 28 && (!target || p.height > target.height)) target = p;
+        if (p.height > paneFloor && (!target || p.height > target.height)) target = p;
       }
-      if (!target) break;   // every pane already at the 28px floor — give up
-      const delta = Math.min(target.height - 28, MIN_PRICE_H - (this.priceBottom - this.priceTop));
+      if (!target) break;   // every pane already at the adaptive floor
+      const delta = Math.min(target.height - paneFloor, MIN_PRICE_H - (this.priceBottom - this.priceTop));
       if (delta <= 0) break;
       target.height -= delta;
       this.layout.paneH = this._panes.reduce((s, p) => s + p.height, 0);
@@ -2762,6 +2818,26 @@ class TradingChart {
       }
       this.paneTop = this._panes[0].top;
       this.paneBottom = this._panes[this._panes.length - 1].bottom;
+      this.priceBottom = this.paneTop - this.layout.gap;
+    }
+    if ((this.priceBottom - this.priceTop) < MIN_PRICE_H && this._panes.length > 0) {
+      const M = this._panes.length;
+      // v2.17.1: gap-aware squeeze — reserve the inter-pane gaps first, then
+      // divide what is left; each pane is clamped to an 8px absolute floor so
+      // heights can NEVER reach 0 (no NaN coordinates are possible).
+      const fitEach = Math.floor(Math.max(0, maxTotalPaneH - ((M - 1) * 4 + 4 + this.layout.gap)) / M);
+      const squeezeEach = Math.max(8, Math.min(fitEach, paneFloor));
+      for (const p of this._panes) p.height = squeezeEach;
+      this.layout.paneH = squeezeEach * M;
+      cursor = this.volTop - 4;
+      for (let i = M - 1; i >= 0; i--) {
+        const p = this._panes[i];
+        p.bottom = cursor;
+        p.top = p.bottom - p.height;
+        cursor = p.top - 4;
+      }
+      this.paneTop = this._panes[0].top;
+      this.paneBottom = this._panes[M - 1].bottom;
       this.priceBottom = this.paneTop - this.layout.gap;
     }
     this.priceTop = this.chartTop;
@@ -4415,7 +4491,13 @@ class TradingChart {
     // Fast interactions now open a 400ms budget-bypass window (_interactUntil).
     const interacting = this.isDragging || !!this._dragHandle || !!this._dragWhole ||
       !!this._paneResize || performance.now() < this._interactUntil;
-    const budgetExhausted = !interacting && this._frameRebuilds >= this._MAX_FRAME_REBUILDS;
+    // v2.17.1: AREA-based budget (see constructor). Full-screen-area reference
+    // is computed once per indicator; the deferred path is unchanged.
+    const screenArea = Math.max(1, this.W * this.H * this.dpr * this.dpr);
+    const bitmapArea = pxW * pxH;
+    const budgetExhausted = !interacting && (
+      (this._frameRebuildArea + bitmapArea) > screenArea * this._REBUILD_AREA_FACTOR ||
+      this._frameRebuilds >= this._MAX_FRAME_REBUILDS);
     // v2.14.0 FIX (audit #14d): a persistently FAILING render retried every
     // frame FOREVER (stamp=null → needsRebuild → invalidate → 60fps loop).
     // Now: after 3 consecutive failures the indicator cools down for 5s and
@@ -4433,6 +4515,7 @@ class TradingChart {
     if (needsRebuild && !budgetExhausted) {
       // Rebuild: render the indicator into its own bitmap, sandboxed.
       this._frameRebuilds++;
+      this._frameRebuildArea += bitmapArea;   // v2.17.1: area-based budget
       entry.canvas.width = pxW; entry.canvas.height = pxH;
       entry.region = region;
       const octx = entry.octx;
@@ -5251,6 +5334,7 @@ class TradingChart {
     // rebuild an indicator's offscreen bitmap now or defer to a later frame.
     this._frameId++;
     this._frameRebuilds = 0;
+    this._frameRebuildArea = 0;   // v2.17.1: area budget resets every frame
     try {
       // No auto-tick. User must call update() with real data.
       const ctx = this.ctx;
@@ -5781,11 +5865,15 @@ class TradingChart {
       }
       ctx.restore();
 
-      // Indicator label inside the pane (top-left)
-      ctx.font = '11px -apple-system, Segoe UI, Roboto, sans-serif';
-      ctx.textBaseline = 'top';
-      const val = this._getIndicatorValueAt(pane.id, paneIdx);
-      this._drawIndicatorLine(left + 6, top + 4, pane.id, state.def, state, val);
+      // Indicator label inside the pane (top-left). v2.17.1: skipped on
+      // panes shorter than 22px — the 18px-tall label card would overflow a
+      // micro-pane (16px) and bleed into the pane below.
+      if (bot - top >= 22) {
+        ctx.font = '11px -apple-system, Segoe UI, Roboto, sans-serif';
+        ctx.textBaseline = 'top';
+        const val = this._getIndicatorValueAt(pane.id, paneIdx);
+        this._drawIndicatorLine(left + 6, top + 4, pane.id, state.def, state, val);
+      }
     }
   }
 

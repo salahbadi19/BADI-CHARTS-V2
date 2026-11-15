@@ -4,10 +4,30 @@
 >
 > Pixel-perfect rendering, 14 drawing tools, fully custom indicators via API — you bring the data, the UI, and the indicators. BADI-CHARTS-V2 renders the chart.
 
-[![Version](https://img.shields.io/badge/version-2.17.0-2962ff.svg)](#)
+[![Version](https://img.shields.io/badge/version-2.17.1-2962ff.svg)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-26a69a.svg)](LICENSE)
 [![No Dependencies](https://img.shields.io/badge/dependencies-zero-ff9800.svg)](#)
 [![Headless](https://img.shields.io/badge/UI-headless-9c27b0.svg)](#)
+
+---
+
+## ⚠️ What changed in v2.17.1
+
+**Unlimited bottom indicators** — answers the question "how many bottom indicators can I add?" with **as many as you want, and every single one draws**.
+
+### What was wrong
+Pane windows were hard-capped at **6** (`MAX_PANES = 6` in `updateLayout()`). A 7th active pane-type indicator stayed registered in the API (`getActiveIndicators()` listed it, `setIndicatorSettings()` worked) but got **no window** — it rendered nowhere, with only a console warning as a clue. To users this looked exactly like "I added a bottom indicator and it doesn't show". The cap existed because the pane heights were built on a **fixed 60px minimum per pane**: 7 × 60px already overflowed the pane budget on a 500px-tall canvas, so the code protected itself by dropping panes.
+
+### What changed
+1. **No cap.** Every visible pane-type indicator gets its own window — 7, 12 or 20 bottom indicators all render, stacked between the price area and the volume strip. `MAX_PANES` and its overflow warning are gone.
+2. **Adaptive pane heights.** The 60px comfort floor holds while `N × 60` fits the pane budget. Beyond that the floor yields **down to 16px per pane** (`ABS_MIN_PANE_H`) — small but fully drawn, with its own grid, scale labels and separator. The price area keeps its guaranteed 120px minimum for any pane count.
+3. **Last-resort squeeze (8px floor).** On a tiny canvas with very many panes, a final proportional squeeze keeps the price area positive and every height ≥ 8px — **NaN coordinates are impossible in any code path** (verified by stress tests).
+4. **Area-based rebuild budget.** The fixed 2-rebuilds-per-frame budget dates from v2.12 when indicator bitmaps were full-screen sized. Since v2.16 bitmaps are region-sized (a pane bitmap is ~10× smaller than the screen), so the old count budget made panes appear only 2-per-frame after a bulk add. The budget now measures bitmap **area** (~2 full-screen areas per frame): a dozen pane indicators rebuild in ONE frame; heavy overlay bursts are still throttled. The 400ms interaction bypass is unchanged.
+5. **Micro-pane labels.** The indicator label card is skipped on panes shorter than 22px (it would bleed into the pane below).
+
+Resize limits are unchanged (user drag clamps to 60–200px; the proportional shrink protects the price area when the user makes many panes tall). All behavior is covered by `test_chart_v2_17_1_unlimited_panes.js`: 12 panes on a 900×500 canvas (all render, no overlap, all rasterized inside their own band), progressive 1→12 add, 10 panes on a 360×320 canvas, 8 user-resized 200px panes, and volume + overlay + 8 panes combined.
+
+**How many indicators are supported?** Overlays and pane indicators: **unlimited** (the offscreen-cache limit scales with the active count since v2.14.0). Bottom panes are now unlimited too — the only real limit is that each pane still needs a few pixels of height, which the adaptive floors manage automatically.
 
 ---
 
@@ -564,7 +584,7 @@ const chart = new BadiCharts(canvas, { /* options */ });
 <body>
   <canvas id="chart"></canvas>
   <!-- Load from CDN (headless, no built-in UI or indicators) -->
-  <script src="https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@v2.15.0/chart.js"></script>
+  <script src="https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@v2.17.1/chart.js"></script>
   <script>
     const canvas = document.getElementById('chart');
     const chart = new BadiCharts(canvas, {
