@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
 <meta name="theme-color" content="#0e1015">
-<title>BADI-CHARTS-V2 — Headless + Custom Indicators</title>
+<title>BADI-CHARTS-V2 v2.19.0 — WebGL Edition</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   html, body { width: 100%; height: 100%; overflow: hidden; background: #0e1015; color: #e0e3eb; font-family: -apple-system, Segoe UI, Roboto, sans-serif; }
@@ -27,6 +27,15 @@
   #toolbar button:hover { background: #363a45; color: #fff; }
   #toolbar button.active { background: #2962ff; color: #fff; border-color: #2962ff; }
   #toolbar .sep { width: 1px; background: #2a2e39; margin: 4px 2px; }
+
+  #hud {
+    position: fixed; top: 8px; right: 8px; z-index: 10;
+    padding: 6px 10px; border-radius: 6px;
+    background: rgba(26, 30, 42, 0.92); border: 1px solid #2a2e39;
+    font-size: 12px; line-height: 1.5; text-align: right;
+  }
+  #hud .gl-on  { color: #26a69a; font-weight: 600; }
+  #hud .gl-off { color: #ef5350; font-weight: 600; }
 </style>
 </head>
 <body>
@@ -44,11 +53,11 @@
   <button data-tool="brush"   title="Brush">~</button>
   <button data-tool="text"    title="Text">T</button>
   <button data-tool="eraser"  title="Eraser">✕</button>
-  <div class="sep"></div>
-  <button data-tool="circle"   title="Circle (custom tool)">○ Circle</button>
+  <button data-tool="circle"  title="Circle (custom tool)">○ Circle</button>
   <div class="sep"></div>
   <button data-ind="sma20"   class="active">SMA20</button>
   <button data-ind="sma50"   class="active">SMA50</button>
+  <button data-ind="bb"      class="active">BB</button>
   <button data-ind="rsi"     class="active">RSI</button>
   <button data-ind="volume"  class="active">Vol</button>
   <div class="sep"></div>
@@ -56,38 +65,43 @@
   <button data-action="clear"    title="Clear drawings">Clr</button>
 </div>
 
-<!-- BADI-CHARTS-V2 v2.19.0: core renderer + optional WebGL add-on -->
-<script src="https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@v2.19.0/chart.js"></script>
-<script src="https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@v2.19.0/chart-webgl.js"></script>
+<div id="hud">
+  <div>Renderer: <span id="glStatus" class="gl-off">…</span></div>
+  <div>FPS: <span id="fps">—</span> · Candles: <span id="nCandles">—</span></div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════════════
+     BADI-CHARTS-V2 v2.19.0 — WEBGL EDITION (complete standalone library).
+     ONE file. No chart.js needed. Drop-in: same API as the 2D edition.
+     CDN: https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@v2.19.0/chart-webgl.js
+     ══════════════════════════════════════════════════════════════════ -->
+<script src="chart-webgl.js"></script>
 <script>
-  // ─── 1. Create a headless chart instance (no built-in indicators) ──
+  // ─── 1. Create the chart (identical API to the 2D edition) ──────────
   const chart = new BadiCharts(document.getElementById('chart'), {
     symbol:    { label: 'BTCUSDT', priceScale: 100, decimals: 2 },
     timeframe: { label: '1H', ms: 3600000 }
-    // No `indicators` option here — we add them below via addIndicator(def).
   });
-  // ─── 1b. Enable the WebGL renderer (GPU candles/grid/volume) ───────
-  // Falls back silently to Canvas 2D if WebGL is unavailable.
-  chart.initWebGL();
   chart.start();
 
-  // ─── 2a. Register a CUSTOM drawing tool (v2.1.1+) ─────────────────
-  // Custom tools have: onStart, onUpdate (optional), onDraw, onHitTest.
+  // Renderer status (WebGL canvas behind the overlay, 2D fallback if none)
+  const glStatus = document.getElementById('glStatus');
+  if (chart._glBackend && chart._glBackend.ready) {
+    glStatus.textContent = 'WebGL ✓ (GPU)';
+    glStatus.className = 'gl-on';
+  } else {
+    glStatus.textContent = 'Canvas 2D fallback';
+    glStatus.className = 'gl-off';
+  }
+
+  // ─── 2. Register a CUSTOM drawing tool (unchanged API) ──────────────
   chart.addDrawingTool({
     id: 'circle',
     label: 'Circle',
     icon: '○',
     defaultStyle: { color: '#ff9800', lineWidth: 1.5 },
     onStart: function (ctx) {
-      // ctx = { x, y, idx, price } — click position in pixels and chart coords
-      return {
-        type: 'circle',
-        cx: ctx.x, cy: ctx.y,
-        i: ctx.idx, p: ctx.price,
-        radius: 0,
-        color: '#ff9800',
-        lineWidth: 1.5
-      };
+      return { type: 'circle', cx: ctx.x, cy: ctx.y, i: ctx.idx, p: ctx.price, radius: 0, color: '#ff9800', lineWidth: 1.5 };
     },
     onUpdate: function (drawing, ctx) {
       drawing.radius = Math.hypot(ctx.x - drawing.cx, ctx.y - drawing.cy);
@@ -100,78 +114,94 @@
       ctx.stroke();
     },
     onHitTest: function (d, x, y, helpers) {
-      const dist = Math.hypot(x - d.cx, y - d.cy);
-      return Math.abs(dist - d.radius) < 8;
+      return Math.abs(Math.hypot(x - d.cx, y - d.cy) - d.radius) < 8;
     }
   });
 
-  // ─── 2. Register custom indicators (all user-defined) ──────────────
-  // Each definition has: id, label, type ('overlay'|'pane'|'volume'),
-  // color, settings, calculate(candles, settings), render(ctx, values, helpers, settings, state).
-  // Optional: formatValue(value, settings), getRange(values, settings) for pane indicators.
-
-  // SMA 20 — overlay line
-  chart.addIndicator({
-    id: 'sma20',
-    label: 'SMA 20',
-    type: 'overlay',
-    color: '#2962ff',
-    settings: { period: 20 },
-    calculate: function (candles, s) {
-      const out = new Array(candles.length).fill(null);
-      let sum = 0; const p = s.period || 20;
-      for (let i = 0; i < candles.length; i++) {
-        sum += candles[i].close;
-        if (i >= p) sum -= candles[i - p].close;
-        if (i >= p - 1) out[i] = sum / p;
+  // ─── 3. Custom indicators — IDENTICAL contract to the 2D edition ────
+  // Overlay: SMA lines render through GLCtx → batched GL triangles.
+  function smaDef(id, label, color, period) {
+    return {
+      id: id, label: label, type: 'overlay', color: color,
+      settings: { period: period, color: color },
+      calculate: function (c, s) {
+        const out = new Array(c.length).fill(null);
+        let sum = 0; const p = s.period || period;
+        for (let i = 0; i < c.length; i++) {
+          sum += c[i].close;
+          if (i >= p) sum -= c[i - p].close;
+          if (i >= p - 1) out[i] = sum / p;
+        }
+        return out;
+      },
+      render: function (ctx, v, h, s) {
+        ctx.strokeStyle = s.color; ctx.lineWidth = 1.5; ctx.beginPath();
+        let started = false;
+        for (let i = h.firstIdx; i <= h.lastIdx; i++) {
+          if (v[i] === null) { started = false; continue; }
+          const x = h.indexToX(i), y = h.priceToY(v[i]);
+          if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
+        }
+        ctx.stroke();
       }
-      return out;
-    },
-    render: function (ctx, v, h, s) {
-      ctx.strokeStyle = s.color; ctx.lineWidth = 1.5; ctx.beginPath();
-      let started = false;
-      for (let i = h.firstIdx; i <= h.lastIdx; i++) {
-        if (v[i] === null) { started = false; continue; }
-        const x = h.indexToX(i), y = h.priceToY(v[i]);
-        if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
-      }
-      ctx.stroke();
-    }
-  });
+    };
+  }
+  chart.addIndicator(smaDef('sma20', 'SMA 20', '#2962ff', 20));
+  chart.addIndicator(smaDef('sma50', 'SMA 50', '#ff9800', 50));
 
-  // SMA 50 — overlay line
+  // Bollinger Bands — fill + stroke (gradient fill is GPU-sampled per vertex)
   chart.addIndicator({
-    id: 'sma50', label: 'SMA 50', type: 'overlay', color: '#ff9800',
-    settings: { period: 50 },
+    id: 'bb', label: 'Bollinger', type: 'overlay', color: '#9c27b0',
+    settings: { period: 20, mult: 2, color: '#9c27b0' },
     calculate: function (c, s) {
       const out = new Array(c.length).fill(null);
-      let sum = 0; const p = s.period || 50;
-      for (let i = 0; i < c.length; i++) {
-        sum += c[i].close;
-        if (i >= p) sum -= c[i - p].close;
-        if (i >= p - 1) out[i] = sum / p;
+      const p = s.period, k = s.mult;
+      for (let i = p - 1; i < c.length; i++) {
+        let sum = 0;
+        for (let j = i - p + 1; j <= i; j++) sum += c[j].close;
+        const mean = sum / p;
+        let v = 0;
+        for (let j = i - p + 1; j <= i; j++) v += (c[j].close - mean) * (c[j].close - mean);
+        const sd = Math.sqrt(v / p);
+        out[i] = { mid: mean, upper: mean + k * sd, lower: mean - k * sd };
       }
       return out;
     },
     render: function (ctx, v, h, s) {
-      ctx.strokeStyle = s.color; ctx.lineWidth = 1.5; ctx.beginPath();
+      // band fill
+      ctx.beginPath();
       let started = false;
+      const top = [];
       for (let i = h.firstIdx; i <= h.lastIdx; i++) {
-        if (v[i] === null) { started = false; continue; }
-        const x = h.indexToX(i), y = h.priceToY(v[i]);
+        const val = v[i]; if (!val) continue;
+        const x = h.indexToX(i), y = h.priceToY(val.upper);
+        top.push([x, h.priceToY(val.lower)]);
+        if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
+      }
+      for (let i = top.length - 1; i >= 0; i--) ctx.lineTo(top[i][0], top[i][1]);
+      ctx.closePath();
+      ctx.fillStyle = 'rgba(156,39,176,0.10)';
+      ctx.fill();
+      // mid line
+      ctx.strokeStyle = s.color; ctx.lineWidth = 1; ctx.beginPath();
+      started = false;
+      for (let i = h.firstIdx; i <= h.lastIdx; i++) {
+        const val = v[i]; if (!val) continue;
+        const x = h.indexToX(i), y = h.priceToY(val.mid);
         if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
       }
       ctx.stroke();
     }
   });
 
-  // Volume — type='volume' with no calculate/render: the chart draws bars automatically
+  // Volume bars (auto-drawn) + SMA on volume — type='volume'
   chart.addIndicator({ id: 'volume', label: 'Volume', type: 'volume', color: '#26a69a' });
 
-  // RSI 14 — pane indicator (renders in a separate pane below the chart)
+  // RSI pane — WITH h.drawOnMain(): projects the overbought/oversold touch
+  // levels onto the MAIN candle chart (v2.18.0 feature, WebGL-native now).
   chart.addIndicator({
     id: 'rsi', label: 'RSI 14', type: 'pane', color: '#d32f53',
-    settings: { period: 14 },
+    settings: { period: 14, color: '#d32f53' },
     calculate: function (c, s) {
       const p = s.period || 14;
       const out = new Array(c.length).fill(null);
@@ -179,20 +209,17 @@
       for (let i = 0; i < c.length; i++) {
         if (i === 0) { out[i] = 50; continue; }
         const ch = c[i].close - c[i - 1].close;
-        const gain = ch > 0 ? ch : 0;
-        const loss = ch < 0 ? -ch : 0;
+        const gain = ch > 0 ? ch : 0, loss = ch < 0 ? -ch : 0;
         if (i <= p) {
           avgGain += gain; avgLoss += loss;
           if (i === p) {
             avgGain /= p; avgLoss /= p;
-            const rs = avgLoss === 0 ? 100 : avgGain / avgLoss;
-            out[i] = 100 - 100 / (1 + rs);
+            out[i] = avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss);
           }
         } else {
           avgGain = (avgGain * (p - 1) + gain) / p;
           avgLoss = (avgLoss * (p - 1) + loss) / p;
-          const rs = avgLoss === 0 ? 100 : avgGain / avgLoss;
-          out[i] = 100 - 100 / (1 + rs);
+          out[i] = avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss);
         }
       }
       return out;
@@ -214,14 +241,125 @@
         if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
       }
       ctx.stroke();
+      // drawOnMain — runs on the MAIN chart layer through GLCtx → GPU
+      h.drawOnMain(function (mctx, mh) {
+        const last = mh.candles[mh.lastIdx];
+        if (!last) return;
+        const y = mh.priceToY(last.close);
+        mctx.strokeStyle = 'rgba(255,183,77,0.55)';
+        mctx.setLineDash([2, 2]);
+        mctx.lineWidth = 1;
+        mctx.beginPath();
+        mctx.moveTo(mh.chartLeft, y);
+        mctx.lineTo(mh.chartRight, y);
+        mctx.stroke();
+        mctx.setLineDash([]);
+      });
     }
   });
 
-  // ─── 3. Feed your data ─────────────────────────────────────────────
-  // chart.setData([{time, open, high, low, close, volume}, ...]);
-  // chart.update(latestCandle);
+  // ─── 4. Feed data (5,000 candles — pan/zoom stays smooth) ───────────
+  (function () {
+    const N = 5000, tf = 3600000;
+    let t = Math.floor(Date.now() / 1000) - N * 3600;
+    let price = 42000;
+    const out = [];
+    for (let i = 0; i < N; i++) {
+      const o = price;
+      price = Math.max(1000, price + (Math.sin(i / 41) + Math.cos(i / 113) + (Math.random() - 0.5)) * 140);
+      out.push({ time: t + i * tf / 1000, open: o, high: Math.max(o, price) + 60, low: Math.min(o, price) - 60, close: price, volume: 800 + Math.random() * 3200 });
+    }
+    chart.setData(out);
+    document.getElementById('nCandles').textContent = N.toLocaleString();
+  })();
 
-  // ─── 4. Wire your custom toolbar ───────────────────────────────────
+  // ─── 5. Toolbar wiring — indicator defs live in a lookup for re-adding ─
+  const bbDef2 = function () {
+    return {
+      id: 'bb', label: 'Bollinger', type: 'overlay', color: '#9c27b0',
+      settings: { period: 20, mult: 2, color: '#9c27b0' },
+      calculate: function (c, s) {
+        const out = new Array(c.length).fill(null);
+        const p = s.period, k = s.mult;
+        for (let i = p - 1; i < c.length; i++) {
+          let sum = 0;
+          for (let j = i - p + 1; j <= i; j++) sum += c[j].close;
+          const mean = sum / p;
+          let v = 0;
+          for (let j = i - p + 1; j <= i; j++) v += (c[j].close - mean) * (c[j].close - mean);
+          const sd = Math.sqrt(v / p);
+          out[i] = { mid: mean, upper: mean + k * sd, lower: mean - k * sd };
+        }
+        return out;
+      },
+      render: function (ctx, v, h, s) {
+        ctx.beginPath();
+        let started = false;
+        const bot = [];
+        for (let i = h.firstIdx; i <= h.lastIdx; i++) {
+          const val = v[i]; if (!val) continue;
+          const x = h.indexToX(i), y = h.priceToY(val.upper);
+          bot.push([x, h.priceToY(val.lower)]);
+          if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
+        }
+        for (let i = bot.length - 1; i >= 0; i--) ctx.lineTo(bot[i][0], bot[i][1]);
+        ctx.closePath();
+        ctx.fillStyle = 'rgba(156,39,176,0.10)';
+        ctx.fill();
+        ctx.strokeStyle = s.color; ctx.lineWidth = 1; ctx.beginPath();
+        started = false;
+        for (let i = h.firstIdx; i <= h.lastIdx; i++) {
+          const val = v[i]; if (!val) continue;
+          const x = h.indexToX(i), y = h.priceToY(val.mid);
+          if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+      }
+    };
+  };
+  const rsiDef2 = function () {
+    return {
+      id: 'rsi', label: 'RSI 14', type: 'pane', color: '#d32f53',
+      settings: { period: 14, color: '#d32f53' },
+      calculate: function (c, s) {
+        const p = s.period || 14;
+        const out = new Array(c.length).fill(null);
+        let avgGain = 0, avgLoss = 0;
+        for (let i = 0; i < c.length; i++) {
+          if (i === 0) { out[i] = 50; continue; }
+          const ch = c[i].close - c[i - 1].close;
+          const gain = ch > 0 ? ch : 0, loss = ch < 0 ? -ch : 0;
+          if (i <= p) {
+            avgGain += gain; avgLoss += loss;
+            if (i === p) { avgGain /= p; avgLoss /= p; out[i] = avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss); }
+          } else {
+            avgGain = (avgGain * (p - 1) + gain) / p;
+            avgLoss = (avgLoss * (p - 1) + loss) / p;
+            out[i] = avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss);
+          }
+        }
+        return out;
+      },
+      getRange: function () { return { min: 0, max: 100 }; },
+      render: function (ctx, v, h, s) {
+        ctx.strokeStyle = s.color; ctx.lineWidth = 1.5; ctx.beginPath();
+        let started = false;
+        for (let i = h.firstIdx; i <= h.lastIdx; i++) {
+          if (v[i] === null) { started = false; continue; }
+          const x = h.indexToX(i), y = h.paneToY(v[i]);
+          if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+      }
+    };
+  };
+  const IND_DEFS = {
+    sma20: function () { return smaDef('sma20', 'SMA 20', '#2962ff', 20); },
+    sma50: function () { return smaDef('sma50', 'SMA 50', '#ff9800', 50); },
+    bb: bbDef2,
+    rsi: rsiDef2,
+    volume: function () { return { id: 'volume', label: 'Volume', type: 'volume', color: '#26a69a' }; }
+  };
   const buttons = document.querySelectorAll('#toolbar button');
   buttons.forEach(function (btn) {
     btn.addEventListener('click', function () {
@@ -231,62 +369,37 @@
       if (tool) {
         chart.setTool(tool);
       } else if (ind) {
-        // Toggle the indicator on/off
         if (chart.getActiveIndicators().indexOf(ind) >= 0) {
           chart.removeIndicator(ind);
           btn.classList.remove('active');
         } else {
           btn.classList.add('active');
-          // For this demo, re-adding by id is not supported (we'd need to re-call
-          // addIndicator with the full definition). In a real app, store the
-          // definitions in a lookup object.
+          chart.addIndicator(IND_DEFS[ind]());
         }
-      } else if (action === 'reset') {
-        chart.resetView();
-      } else if (action === 'clear') {
-        chart.clearDrawings();
-      }
+      } else if (action === 'reset') chart.resetView();
+      else if (action === 'clear') chart.clearDrawings();
     });
   });
-
-  // Keep toolbar in sync with tool changes
   chart.onToolChange(function (toolId) {
     buttons.forEach(function (btn) {
-      const t = btn.getAttribute('data-tool');
-      btn.classList.toggle('active', t === toolId);
+      btn.classList.toggle('active', btn.getAttribute('data-tool') === toolId);
     });
   });
 
-  // ─── 5. Available API (v2.1.0+) ───────────────────────────────────
-  // TOOLS:
-  //   chart.getTools();              → [{id, label, icon, custom}, ...]
-  //   chart.setTool('trend');        → activate a tool
-  //   chart.getActiveTool();        → 'trend'
-  //   chart.clearTool();             → back to 'cursor'
-  //   chart.onToolChange(cb);        → subscribe to tool changes
-  //   chart.addDrawingTool(def);     → register a custom drawing tool
-  //
-  // INDICATORS (all custom — no built-ins in v2.1.0+):
-  //   chart.addIndicator(def);       → register + activate
-  //     def = { id, label, type, color, settings, calculate, render, formatValue?, getRange? }
-  //   chart.registerIndicator(def);  → register without activating
-  //   chart.removeIndicator(id);     → deactivate + remove
-  //   chart.getIndicators();         → [{id, label, type, color, active}, ...]
-  //   chart.getActiveIndicators();   → ['sma20', 'rsi', ...]
-  //   chart.getIndicatorDef(id);     → the definition object
-  //   chart.setIndicatorVisible(id, bool);
-  //   chart.setIndicatorSettings(id, {period: 50});
-  //
-  // DRAWINGS:
-  //   chart.getDrawings();           → all drawings on the chart
-  //   chart.getDrawing(id);          → one drawing by id
-  //   chart.removeDrawing(id);       → remove one drawing
-  //   chart.addDrawing({type:'hline', price:65000, color:'#2962ff'});
-  //   chart.clearDrawings();
-  //
-  // VIEW:
-  //   chart.resetView();             chart.start();
-  //   chart.setData(candles);        chart.update(candle);
+  // ─── 6. FPS meter ───────────────────────────────────────────────────
+  (function () {
+    const el = document.getElementById('fps');
+    let frames = 0, last = performance.now();
+    function tick(now) {
+      frames++;
+      if (now - last >= 1000) {
+        el.textContent = frames;
+        frames = 0; last = now;
+      }
+      requestAnimationFrame(tick);
+    }
+    requestAnimationFrame(tick);
+  })();
 </script>
 </body>
 </html>
