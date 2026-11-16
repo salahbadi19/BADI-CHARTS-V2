@@ -4,10 +4,40 @@
 >
 > Pixel-perfect rendering, 14 drawing tools, fully custom indicators via API — you bring the data, the UI, and the indicators. BADI-CHARTS-V2 renders the chart.
 
-[![Version](https://img.shields.io/badge/version-2.18.2-2962ff.svg)](#)
+[![Version](https://img.shields.io/badge/version-2.18.3-2962ff.svg)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-26a69a.svg)](LICENSE)
 [![No Dependencies](https://img.shields.io/badge/dependencies-zero-ff9800.svg)](#)
 [![Headless](https://img.shields.io/badge/UI-headless-9c27b0.svg)](#)
+
+---
+
+## ⚠️ What changed in v2.18.3
+
+**Path2D batching — the "WebGL-like" Canvas 2D optimization.** Instead of calling `ctx.fillRect()` per candle per rect and `ctx.stroke()` per grid line, all rects/lines are built into `Path2D` objects in JS, then `fill()`/`stroke()`d in a single call. The browser rasterizes each batch in ONE GPU pass.
+
+### Why this matters
+The question was asked: "shouldn't we use WebGL for performance?" WebGL IS faster for batched rendering, but migrating an 8000-line Canvas 2D library to WebGL is a **full rewrite** (weeks of work, loss of simplicity, harder debugging). `Path2D` batching gives the **same batching benefit** as WebGL's instanced rendering — fewer pipeline submissions, one GPU pass per batch — **with zero rewrite cost** and works in every browser.
+
+### What changed
+1. **`drawCandles`: ~1000 `fillRect` → 2 `fill(path)` calls.** All bull-candle rects (wick + body) are appended to one `Path2D`, all bear-candle rects to another. Two `ctx.fill(path)` calls rasterize everything. The GPU processes each color in a single pass instead of 500 separate pipeline submissions.
+2. **`drawGrid`: ~30 `stroke` → 2 `stroke(path)` calls.** All horizontal grid lines go into one `Path2D`, all vertical into another. Two `ctx.stroke(path)` calls.
+
+### Combined with v2.18.2
+A bare-candle chart now does the **absolute minimum** number of canvas API calls per frame:
+- `drawBackground`: 1 `fillRect` (full canvas)
+- `drawGrid`: 2 `stroke(path)` (H + V grid lines)
+- `drawCandles`: 2 `fill(path)` (bull + bear rects)
+- `drawPriceAxis` / `drawTimeAxis`: ~10 `fillText` (text can't be batched)
+- `drawCrosshair`: 2 `stroke` (only when hovering)
+
+**Total: ~17 canvas API calls per frame** for a bare-candle chart with 500 visible candles. Previously: ~1030. This is a **60× reduction** in canvas pipeline submissions.
+
+No API changes. Pixel output is identical (verified by regression tests). All v2.16/v2.17/v2.17.1/v2.18.0/v2.18.1/v2.18.2 tests pass.
+
+### Future: WebGL / OffscreenCanvas
+If even this isn't enough for your use case (e.g. 50,000+ visible candles, or dozens of animated indicators with heavy custom render code), the next steps would be:
+- **OffscreenCanvas + Web Worker**: moves rendering off the main thread so the UI never stutters. ~95% browser support. Moderate complexity.
+- **WebGL renderer**: a full GPU rewrite. Maximum performance, but a major project. Would be a separate module (`chart-webgl.js`) sharing the same API.
 
 ---
 

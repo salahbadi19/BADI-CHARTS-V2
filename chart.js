@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.18.2 — Pixel-Perfect Pure JavaScript Trading Chart Library
+ * BADI-CHARTS-V2 v2.18.3 — Pixel-Perfect Pure JavaScript Trading Chart Library
  *
  * A lightweight, dependency-free candlestick charting library built entirely
  * with the HTML5 Canvas API. Inspired by TradingView Lightweight Charts.
@@ -13,6 +13,19 @@
  *   - Responsive (desktop + mobile with touch/pinch support)
  *   - Crosshair, current price line, OHLC legend
  *   - Clipping for all chart areas (no overflow)
+ *
+ * v2.18.3 — PERF: Path2D batching (the "WebGL-like" Canvas 2D optimization).
+ *   Instead of calling ctx.fillRect() per candle per rect (~1000 fillRect
+ *   calls for 500 candles) and ctx.stroke() per grid line (~30 strokes),
+ *   we build ALL rects/lines into Path2D objects in JS, then fill/stroke
+ *   each ONCE. The browser rasterizes each batch in a single GPU pass.
+ *   This is the Canvas-2D equivalent of WebGL's instanced rendering — same
+ *   batching benefit, zero rewrite cost.
+ *     drawCandles: ~1000 fillRect → 2 fill(path) calls (bull + bear)
+ *     drawGrid:    ~30 stroke     → 2 stroke(path) calls (H + V)
+ *   Combined with v2.18.2's priceToY precompute (y = A - B*p) and early-
+ *   return guards, a bare-candle chart now does the absolute minimum number
+ *   of canvas API calls per frame. No API change; pixel output identical.
  *
  * v2.18.2 — PERF: three hot-path optimizations for the "just candles" case.
  *   The library was reported heavy during pan/zoom even with NO indicators.
@@ -341,8 +354,31 @@
 (function () {
 'use strict';
 
+/* ============================ Path2D (polyfill for Node.js tests) ========= */
+// v2.18.3: drawCandles & drawGrid use Path2D for batched rendering (the
+// Canvas-2D equivalent of WebGL instanced rendering — one GPU pass per
+// batch instead of one per rect/line). Native Path2D exists in every
+// browser since ~2015. In Node.js test sandboxes it doesn't, so we provide
+// a minimal polyfill that just collects ops — the test ctx mock absorbs all
+// draw calls anyway. The polyfill is NEVER used in a real browser.
+var Path2D = (typeof window !== 'undefined' && window.Path2D)
+  ? window.Path2D
+  : (function () {
+      function P() { this.ops = []; }
+      P.prototype.rect = function (x, y, w, h) { this.ops.push(['rect', x, y, w, h]); };
+      P.prototype.moveTo = function (x, y) { this.ops.push(['moveTo', x, y]); };
+      P.prototype.lineTo = function (x, y) { this.ops.push(['lineTo', x, y]); };
+      P.prototype.closePath = function () { this.ops.push(['closePath']); };
+      P.prototype.arc = function (x, y, r, s, e) { this.ops.push(['arc', x, y, r, s, e]); };
+      P.prototype.arcTo = function (x1, y1, x2, y2, r) { this.ops.push(['arcTo', x1, y1, x2, y2, r]); };
+      P.prototype.bezierCurveTo = function (cp1x, cp1y, cp2x, cp2y, x, y) { this.ops.push(['bezier', cp1x, cp1y, cp2x, cp2y, x, y]); };
+      P.prototype.quadraticCurveTo = function (cpx, cpy, x, y) { this.ops.push(['quad', cpx, cpy, x, y]); };
+      P.prototype.ellipse = function (x, y, rx, ry, rot, s, e) { this.ops.push(['ellipse', x, y, rx, ry, rot, s, e]); };
+      return P;
+    })();
+
 /* ============================ VERSION ====================================== */
-const VERSION = '2.18.2';
+const VERSION = '2.18.3';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 // v2.14.0 (audit #12): tracks the chart the user last hovered/touched, so
 // window-level keyboard shortcuts only apply to ONE chart on multi-chart pages.
@@ -5570,28 +5606,33 @@ class TradingChart {
     const dpr = this.dpr;
     ctx.strokeStyle = this.theme.grid;
     ctx.lineWidth = 1;
-    // Use price tick marks for horizontal grid lines
+    // v2.18.3 PERF: Path2D batching for grid lines. Previously each grid
+    // line was a separate beginPath/moveTo/lineTo/stroke sequence (~20
+    // strokes for H lines + ~10 for V lines = ~30 stroke calls). Now we
+    // build all H lines into one Path2D and all V lines into another, then
+    // stroke each ONCE. 30 stroke calls → 2.
+    const hPath = new Path2D();
     const marks = this.priceScale.marks();
+    const chartLeft = this.chartLeft, chartRight = this.chartRight;
     for (const m of marks) {
       const y = this.priceTop + m.coord;
       if (y < this.priceTop - 1 || y > this.priceBottom + 1) continue;
       const ys = snapToV(y, dpr);
-      ctx.beginPath();
-      ctx.moveTo(this.chartLeft, ys);
-      ctx.lineTo(this.chartRight, ys);
-      ctx.stroke();
+      hPath.moveTo(chartLeft, ys);
+      hPath.lineTo(chartRight, ys);
     }
-    // Time tick marks for vertical grid lines (including future area)
+    const vPath = new Path2D();
     const timeMarks = this.getTimeMarks();
+    const chartTop = this.chartTop, chartBottom = this.chartBottom;
     for (const m of timeMarks) {
       const x = this.indexToX(m.index);
-      if (x < this.chartLeft || x > this.chartRight) continue;
+      if (x < chartLeft || x > chartRight) continue;
       const xs = snapToH(x, dpr);
-      ctx.beginPath();
-      ctx.moveTo(xs, this.chartTop);
-      ctx.lineTo(xs, this.chartBottom);
-      ctx.stroke();
+      vPath.moveTo(xs, chartTop);
+      vPath.lineTo(xs, chartBottom);
     }
+    ctx.stroke(hPath);
+    ctx.stroke(vPath);
     // v2.14.0 FIX (audit #28): the separator lines + grip handles were drawn
     // HERE, but drawPane() (which runs LATER in the frame) fills each pane
     // with a solid background — covering the grip pill's bottom half. The
@@ -5695,55 +5736,62 @@ class TradingChart {
     ctx.rect(this.chartLeft, this.priceTop, this.chartRight - this.chartLeft, this.priceBottom - this.priceTop);
     ctx.clip();
 
-    // v2.18.2 PERF: Two-pass batched fillStyle. Setting ctx.fillStyle is a
-    // canvas state change — doing it per-candle (500×/frame) is wasteful when
-    // there are only two colors (bull/bear). Two passes set fillStyle ONCE
-    // each and skip candles of the wrong color via a cheap `continue`. Net:
-    // ~498 fewer state changes for the cost of ~500 extra branch checks.
-    const bullColor = this.theme.bull;
-    const bearColor = this.theme.bear;
+    // v2.18.3 PERF: Path2D batching. Instead of calling ctx.fillRect() per
+    // candle per rect (wick + body = ~1000 fillRect calls for 500 candles),
+    // we build ALL bull-candle rects into one Path2D and ALL bear-candle
+    // rects into another, then fill each with a SINGLE ctx.fill(path) call.
+    // The browser rasterizes each color in ONE GPU pass instead of 500
+    // separate pipeline submissions. This is the Canvas-2D equivalent of
+    // WebGL's instanced rendering — without the rewrite cost.
+    //
+    // fillRect N=1000 → fill(path) N=2. The JS-side path building (path.rect)
+    // is faster than ctx.fillRect because it doesn't trigger canvas state
+    // management or pipeline flushes — it just appends to an in-memory path.
+    const bullPath = new Path2D();
+    const bearPath = new Path2D();
     const chartLeft = this.chartLeft, chartRight = this.chartRight;
 
-    for (let pass = 0; pass < 2; pass++) {
-      const wantBull = (pass === 0);
-      ctx.fillStyle = wantBull ? bullColor : bearColor;
-      for (let i = firstIdx; i <= lastIdx; i++) {
-        const c = candles[i];
-        const isBull = c.close >= c.open;
-        if (isBull !== wantBull) continue;
-        const x = this.indexToX(i);
-        if (x < chartLeft - bodyWidth || x > chartRight + bodyWidth) continue;
+    for (let i = firstIdx; i <= lastIdx; i++) {
+      const c = candles[i];
+      const x = this.indexToX(i);
+      if (x < chartLeft - bodyWidth || x > chartRight + bodyWidth) continue;
 
-        const yOpen  = fastPriceToY(c.open);
-        const yClose = fastPriceToY(c.close);
-        const yHigh  = fastPriceToY(c.high);
-        const yLow   = fastPriceToY(c.low);
+      const yOpen  = fastPriceToY(c.open);
+      const yClose = fastPriceToY(c.close);
+      const yHigh  = fastPriceToY(c.high);
+      const yLow   = fastPriceToY(c.low);
 
-        // v2.6.0: Draw wick and body BOTH centered on the same snapped center point.
-        const cxBmp = Math.round(x * dpr);
-        const cx = cxBmp / dpr;             // snapped center (bitmap-aligned)
-        const wickCenter = cx + wickWidth / 2; // center of the wick column
+      const isBull = c.close >= c.open;
+      const path = isBull ? bullPath : bearPath;
 
-        // Vertical extents — snapped to bitmap grid for crisp edges
-        const wickTop = Math.floor(yHigh * dpr) / dpr;
-        const wickBottom = Math.ceil(yLow * dpr) / dpr;
-        const wickH = Math.max(1 / dpr, wickBottom - wickTop);
-        const bodyTop = Math.round(Math.min(yOpen, yClose) * dpr) / dpr;
-        const bodyBottom = Math.round(Math.max(yOpen, yClose) * dpr) / dpr;
-        const bodyH = Math.max(1 / dpr, bodyBottom - bodyTop);
+      // v2.6.0: Draw wick and body BOTH centered on the same snapped center point.
+      const cxBmp = Math.round(x * dpr);
+      const cx = cxBmp / dpr;             // snapped center (bitmap-aligned)
+      const wickCenter = cx + wickWidth / 2; // center of the wick column
 
-        if (drawAsLine) {
-          // LWC-style thin mode: single crisp vertical line from high to low
-          ctx.fillRect(cx, wickTop, wickWidth, wickH);
-        } else {
-          // Wick: bitmap-aligned column
-          ctx.fillRect(cx, wickTop, wickWidth, wickH);
-          // Body: symmetric around the wick column's center
-          const bodyLeft = wickCenter - bodyWidth / 2;
-          ctx.fillRect(bodyLeft, bodyTop, bodyWidth, bodyH);
-        }
+      // Vertical extents — snapped to bitmap grid for crisp edges
+      const wickTop = Math.floor(yHigh * dpr) / dpr;
+      const wickBottom = Math.ceil(yLow * dpr) / dpr;
+      const wickH = Math.max(1 / dpr, wickBottom - wickTop);
+      const bodyTop = Math.round(Math.min(yOpen, yClose) * dpr) / dpr;
+      const bodyBottom = Math.round(Math.max(yOpen, yClose) * dpr) / dpr;
+      const bodyH = Math.max(1 / dpr, bodyBottom - bodyTop);
+
+      // Append rects to the path (no canvas state change — pure JS).
+      path.rect(cx, wickTop, wickWidth, wickH);
+      if (!drawAsLine) {
+        const bodyLeft = wickCenter - bodyWidth / 2;
+        path.rect(bodyLeft, bodyTop, bodyWidth, bodyH);
       }
     }
+
+    // Two fill calls — one per color. The GPU rasterizes all bull rects in
+    // one pass, then all bear rects in one pass.
+    ctx.fillStyle = this.theme.bull;
+    ctx.fill(bullPath);
+    ctx.fillStyle = this.theme.bear;
+    ctx.fill(bearPath);
+
     ctx.restore();
   }
 
