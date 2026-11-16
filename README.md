@@ -4,12 +4,44 @@
 >
 > Pixel-perfect rendering, 14 drawing tools, fully custom indicators via API — you bring the data, the UI, and the indicators. BADI-CHARTS-V2 renders the chart.
 
-[![Version](https://img.shields.io/badge/version-2.19.0-2962ff.svg)](#)
+[![Version](https://img.shields.io/badge/version-2.19.2-2962ff.svg)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-26a69a.svg)](LICENSE)
 [![No Dependencies](https://img.shields.io/badge/dependencies-zero-ff9800.svg)](#)
 [![Headless](https://img.shields.io/badge/UI-headless-9c27b0.svg)](#)
 
 ---
+
+## 🛠 v2.19.2 — Alignment & Interaction Fixes (field-verified)
+
+Four real-world bugs found while testing the WebGL edition on a page whose host
+holds a header bar above the chart:
+
+1. **GL/text canvas misalignment (the "OHLC bar not at the top" bug).** The GL
+   canvas was stretched over the whole host (`inset:0`) — with a header or any
+   sibling above the chart canvas, ALL geometry (candles, grid, panes) rendered
+   ~50-60px ABOVE the text layer, so the currency info bar appeared to float far
+   below the top of the chart. The GL canvas is now measured and pinned to the
+   overlay canvas's exact box (`GLBackend.syncPosition()`), re-synced on every
+   resize AND layout change. Both layouts (full-bleed and header-above) verified
+   pixel-exact.
+2. **Indicator values showed "—".** Object-valued indicators (Bollinger Bands
+   `{mid, upper, lower}` and any custom object shape) formatted to a dash. The
+   legend now renders every numeric member joined by " / " with the proper price
+   formatter: `Bollinger Bands: 1.09939 / 1.10266 / 1.09612`.
+3. **Settings card opened at a hard-coded corner.** It now opens right AFTER the
+   indicator's own legend line (TradingView-style), clamped to stay inside the
+   chart — on mouse AND touch (the icon hit-test now carries its geometry).
+4. **Inline settings editor closed instantly.** The browser's post-mousedown
+   focus change blurred the freshly-focused `<input>` in the same tick, so
+   editing a value (e.g. BB Period 20 → 30) was impossible. Focus is now
+   deferred past the mousedown default action (+ `preventDefault`); verified
+   end-to-end: edit → Enter → Save → recalculation.
+
+Regression proof: 24-check Node suite (new, covers all four fixes), 79-check
+browser-free GL suite, and the full v2.16/v2.17/v2.18 suites — all green. A
+14-step scripted browser run (crosshair, cards, settings save, drawings, pan,
+multi-pane, markers, hide/show, volume profile, status bar, reset) produced
+pixel-verified screenshots for every feature.
 
 ## 🚀 NEW in v2.19.0 — THE COMPLETE STANDALONE WEBGL LIBRARY
 

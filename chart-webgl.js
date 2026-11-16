@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.19.1 — WEBGL EDITION (chart-webgl.js)
+ * BADI-CHARTS-V2 v2.19.2 — WEBGL EDITION (chart-webgl.js)
  * The complete standalone trading chart library, rendered with real WebGL.
  *
  * THIS FILE IS A FULL LIBRARY, NOT A LAYER. Load it INSTEAD of chart.js —
@@ -19,7 +19,7 @@
  *
  * Loading order: include ONLY ONE of { chart.js, chart-webgl.js } per page.
  *   <canvas id="chart"></canvas>
- *   <script src="https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@v2.19.1/chart-webgl.js"></script>
+ *   <script src="https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@v2.19.2/chart-webgl.js"></script>
  *   const chart = new BadiCharts(document.getElementById('chart'), {...});
  *   chart.setData(candles); chart.start();
  * (window.BadiChartsWebGL is the explicit alias when both editions are loaded.)
@@ -385,7 +385,7 @@
 'use strict';
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.19.1';
+const VERSION = '2.19.2';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 // v2.14.0 (audit #12): tracks the chart the user last hovered/touched, so
 // window-level keyboard shortcuts only apply to ONE chart on multi-chart pages.
@@ -1086,17 +1086,51 @@ class GLBackend {
     if (!host) return;
     const st = this.glCanvas.style;
     st.position = 'absolute';
-    st.inset = '0';
-    st.width = '100%';
-    st.height = '100%';
     st.pointerEvents = 'none';
     st.zIndex = '0';
+    st.margin = '0';
     try {
       const ps = hostCanvas.style;
       if (!ps.position || ps.position === 'static') ps.position = 'relative';
       if (!ps.zIndex) ps.zIndex = '1';
     } catch (_) {}
     host.insertBefore(this.glCanvas, hostCanvas);
+    // v2.19.2 FIX: the GL canvas must sit EXACTLY on top of the overlay canvas —
+    // not stretched over the whole host. When the host holds other elements
+    // (a page header above the canvas, side panels, …) `inset:0; width:100%;
+    // height:100%` made the GL geometry canvas start at the HOST corner while
+    // the text canvas started at the CANVAS corner → every grid line, candle
+    // and pane was drawn N px above its legend, and the OHLC bar appeared to
+    // float far below the top of the chart. The overlay canvas rect is now
+    // measured relative to the host and mirrored onto the GL canvas (re-synced
+    // by syncPosition() on every resize).
+    this.syncPosition(hostCanvas);
+  }
+  // v2.19.2: mirror the overlay canvas's box (position + CSS size) onto the GL
+  // canvas. Uses getBoundingClientRect deltas so margins/percent layouts and
+  // statically-positioned hosts are handled identically to the simple case.
+  syncPosition(hostCanvas) {
+    const host = hostCanvas && hostCanvas.parentNode;
+    if (!host || !this.glCanvas) return;
+    const st = this.glCanvas.style;
+    try {
+      const hostRect = host.getBoundingClientRect();
+      const cRect = hostCanvas.getBoundingClientRect();
+      const left = cRect.left - hostRect.left;
+      const top = cRect.top - hostRect.top;
+      // NOTE: `inset` is the shorthand for top/right/bottom/left — assign the
+      // longhands individually; resetting the shorthand afterwards would wipe
+      // the explicit offsets.
+      st.top = top + 'px';
+      st.left = left + 'px';
+      st.right = 'auto';
+      st.bottom = 'auto';
+      st.width = cRect.width + 'px';
+      st.height = cRect.height + 'px';
+    } catch (_) {
+      // getBoundingClientRect unavailable (ancient embed) — fall back to fill
+      st.inset = '0'; st.width = '100%'; st.height = '100%';
+    }
   }
   resize(w, h, dpr) {
     this.W = w; this.H = h; this.dpr = dpr;
@@ -4431,7 +4465,13 @@ class TradingChart {
       // Don't override user CSS width/height — but the pin above guarantees
       // a fallback display size exists when none was specified.
       this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
-      if (this._glBackend) this._glBackend.resize(w, h, this.dpr);   // v2.19.0: GL bitmap + viewport
+      if (this._glBackend) {
+        this._glBackend.resize(w, h, this.dpr);   // v2.19.0: GL bitmap + viewport
+        // v2.19.2: keep the GL canvas glued to the overlay canvas's box — a
+        // host layout change (header wrap, sidebar, flex growth) moves the
+        // canvas inside the host without changing its internal size.
+        this._glBackend.syncPosition(this.canvas);
+      }
       this.W = w;
       this.H = h;
       this.updateLayout();
@@ -4458,6 +4498,10 @@ class TradingChart {
   }
 
   updateLayout() {
+    // v2.19.2: re-glue the GL canvas to the overlay canvas's box — a host
+    // layout change (header height, flex sibling growth) can MOVE the canvas
+    // without resizing it, so the ResizeObserver alone can miss it.
+    if (this._glBackend) this._glBackend.syncPosition(this.canvas);
     // Responsive layout: smaller dimensions on mobile (width < 600px)
     const isMobile = this.W < 600;
     if (isMobile) {
@@ -4835,7 +4879,9 @@ class TradingChart {
       const iconHit = this._hitIcon(this.touchStartX, this.touchStartY);
       if (iconHit) {
         this.isDragging = false;
-        this._handleIconClick(iconHit.indId, iconHit.iconId);
+        // v2.19.2: pass the icon box as anchor so the settings card opens
+        // beside the indicator line on touch devices too.
+        this._handleIconClick(iconHit.indId, iconHit.iconId, { x: iconHit.x, y: iconHit.y, w: iconHit.w, h: iconHit.h });
         return;
       }
       const cardHit = this._hitCard(this.touchStartX, this.touchStartY);
@@ -5195,7 +5241,9 @@ class TradingChart {
   _hitIcon(x, y) {
     for (const h of this._iconHits) {
       if (h.type === 'icon' && x >= h.x && x <= h.x + h.w && y >= h.y && y <= h.y + h.h) {
-        return {indId: h.indId, iconId: h.iconId};
+        // v2.19.2: include the hit box — the settings-card anchor needs the
+        // icon's position to open beside the indicator's legend line.
+        return {indId: h.indId, iconId: h.iconId, x: h.x, y: h.y, w: h.w, h: h.h};
       }
     }
     return null;
@@ -5291,8 +5339,11 @@ class TradingChart {
     });
     input.addEventListener('blur', commit);
     document.body.appendChild(input);
-    input.focus();
-    input.select();
+    // v2.19.2 FIX: defer focus past the mousedown default action — a sync
+    // focus() inside the mousedown handler was immediately undone by the
+    // browser's own focus change (blur → self-close) so field editing was
+    // effectively impossible. Deferring by a macro-task keeps focus.
+    setTimeout(function () { try { input.focus(); input.select(); } catch (_) {} }, 0);
     this._fieldEditor = input;
     this.invalidate();
   }
@@ -5305,7 +5356,10 @@ class TradingChart {
   }
 
   // Handle a click on an indicator icon
-  _handleIconClick(indId, iconId) {
+  // v2.19.2: anchor {x, y} (the icon's box) is passed through so the settings
+  // card opens NEXT TO the indicator's own legend line instead of always at
+  // the top-left corner of the chart.
+  _handleIconClick(indId, iconId, anchor) {
     // Handle the collapse/expand arrow
     if (iconId === 'collapse') {
       this.indicatorsCollapsed = !this.indicatorsCollapsed;
@@ -5339,7 +5393,7 @@ class TradingChart {
         else this.showToast('Editor for ' + indId);
         break;
       case 'settings':
-        this._openSettingsCard(indId, state);
+        this._openSettingsCard(indId, state, anchor);
         break;
       case 'delete':
         this.removeIndicator(indId);
@@ -5417,6 +5471,9 @@ class TradingChart {
           // A small inline DOM <input> is overlaid exactly on the field box;
           // Enter/blur commits, Esc cancels. Requires a document (headless
           // callers keep the current value, same as prompt returning null).
+          // v2.19.2: preventDefault so the browser's post-mousedown focus
+          // change can not immediately blur (and close) the inline editor.
+          if (e && typeof e.preventDefault === 'function') e.preventDefault();
           const fy = sc.y + 36 + scHit.index * 30;
           this._openFieldEditor(f, {
             x: sc.x + 90, y: fy, w: sc.w - 100, h: 20
@@ -5439,7 +5496,7 @@ class TradingChart {
     // 2. Check indicator icons
     const iconHit = this._hitIcon(x, y);
     if (iconHit) {
-      this._handleIconClick(iconHit.indId, iconHit.iconId);
+      this._handleIconClick(iconHit.indId, iconHit.iconId, { x: iconHit.x, y: iconHit.y, w: iconHit.w, h: iconHit.h });
       return;
     }
     // 3. Check indicator cards (click to activate)
@@ -5769,8 +5826,10 @@ class TradingChart {
     });
     input.addEventListener('blur', commit);
     document.body.appendChild(input);
-    input.focus();
-    input.select();
+    // v2.19.2 FIX: defer focus past the mousedown default action — a sync
+    // focus() inside the mousedown handler was immediately undone by the
+    // browser's own focus change (blur → self-close) so editing never worked.
+    setTimeout(function () { try { input.focus(); input.select(); } catch (_) {} }, 0);
     this._fieldEditor = input;
     this.invalidate();
   }
@@ -9377,12 +9436,29 @@ class TradingChart {
       }
       return v.toFixed(2);
     }
-    if (typeof v === 'object' && v !== null) {
-      // Some indicators return objects (e.g., MACD {macd, signal, hist})
-      // Show the first numeric property
-      for (const k in v) {
-        if (typeof v[k] === 'number') return v[k].toFixed(2);
-      }
+    if (typeof v === 'object') {
+      // v2.19.2: object-valued indicators (Bollinger {mid,upper,lower},
+      // custom {a,b,c}, …) now render EVERY numeric member separated by " / "
+      // using the price formatter for overlays — the old loop showed only the
+      // first property (or '—' when the object wrapped the numbers deeper),
+      // which read as a broken legend.
+      const fmt = (n) => {
+        if (def.type === 'overlay') return this.priceScale.formatLogical(n);
+        const pane = this._panes.find(p => p.id === id);
+        return (pane && pane.scale) ? pane.scale.formatLogical(n) : n.toFixed(2);
+      };
+      const parts = [];
+      const flat = (o) => {
+        if (typeof o === 'number' && isFinite(o)) { parts.push(fmt(o)); return; }
+        if (o && typeof o === 'object') {
+          for (const k of Object.keys(o)) {
+            if (parts.length >= 3) break;   // keep the legend compact
+            flat(o[k]);
+          }
+        }
+      };
+      flat(v);
+      if (parts.length > 0) return parts.join(' / ');
     }
     return String(v);
   }
@@ -9588,7 +9664,10 @@ class TradingChart {
   }
 
   // Open a settings card popup for an indicator
-  _openSettingsCard(id, state) {
+  // v2.19.2: anchor (icon box) — the card now opens beside the indicator's
+  // legend line (TradingView-style), clamped to stay fully inside the chart,
+  // instead of a hard-coded top-left corner where it covered the OHLC bar.
+  _openSettingsCard(id, state, anchor) {
     // HEADLESS v2.1.0+: settings fields are auto-generated from the indicator's
     // settings object (any key present becomes an editable field).
     // v2.16.0 FIX (#22c): the previous implementation only knew about a
@@ -9630,10 +9709,28 @@ class TradingChart {
     }
     const w = 220;
     const h = 36 + fields.length * 30 + 40;
+    // v2.19.2: position the card right AFTER the indicator's own legend line
+    // (dot + label + value), so it never covers the row it belongs to —
+    // TradingView-style. Falls back to the classic top-left spot when no
+    // anchor (programmatic open) is given.
+    let cx = this.chartLeft + 50;
+    let cy = this.chartTop + 50;
+    if (anchor && isFinite(anchor.y)) {
+      try {
+        const mctx = this.ctx;
+        mctx.font = '11px -apple-system, Segoe UI, Roboto, sans-serif';
+        const valTxt = this._getIndicatorValueAt(id, this.sim.candles.length - 1) || '';
+        const lineW = 6 /*pad*/ + 10 /*dot+gap*/ + mctx.measureText(((state.def && state.def.label) || id) + ':').width + 6 + mctx.measureText(valTxt).width;
+        cx = this.chartLeft + 6 + lineW + 10;
+      } catch (_) { cx = this.chartLeft + 170; }
+      cy = Math.round(anchor.y) - 6;
+    }
+    cx = clamp(cx, this.chartLeft + 4, Math.max(this.chartLeft + 4, this.W - this.layout.priceAxisW - w - 8));
+    cy = clamp(cy, this.chartTop + 4, Math.max(this.chartTop + 4, this.H - this.layout.timeAxisH - h - 8));
     this.settingsCard = {
       id: id,
-      x: this.chartLeft + 50,
-      y: this.chartTop + 50,
+      x: cx,
+      y: cy,
       w: w,
       h: h,
       fields: fields,
