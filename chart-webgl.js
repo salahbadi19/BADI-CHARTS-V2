@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.19.0 — WEBGL EDITION (chart-webgl.js)
+ * BADI-CHARTS-V2 v2.19.1 — WEBGL EDITION (chart-webgl.js)
  * The complete standalone trading chart library, rendered with real WebGL.
  *
  * THIS FILE IS A FULL LIBRARY, NOT A LAYER. Load it INSTEAD of chart.js —
@@ -19,7 +19,7 @@
  *
  * Loading order: include ONLY ONE of { chart.js, chart-webgl.js } per page.
  *   <canvas id="chart"></canvas>
- *   <script src="https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@v2.19.0/chart-webgl.js"></script>
+ *   <script src="https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@v2.19.1/chart-webgl.js"></script>
  *   const chart = new BadiCharts(document.getElementById('chart'), {...});
  *   chart.setData(candles); chart.start();
  * (window.BadiChartsWebGL is the explicit alias when both editions are loaded.)
@@ -385,7 +385,7 @@
 'use strict';
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.19.0';
+const VERSION = '2.19.1';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 // v2.14.0 (audit #12): tracks the chart the user last hovered/touched, so
 // window-level keyboard shortcuts only apply to ONE chart on multi-chart pages.
