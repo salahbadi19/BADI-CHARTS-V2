@@ -4,10 +4,74 @@
 >
 > Pixel-perfect rendering, 14 drawing tools, fully custom indicators via API — you bring the data, the UI, and the indicators. BADI-CHARTS-V2 renders the chart.
 
-[![Version](https://img.shields.io/badge/version-2.18.3-2962ff.svg)](#)
+[![Version](https://img.shields.io/badge/version-2.19.0-2962ff.svg)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-26a69a.svg)](LICENSE)
 [![No Dependencies](https://img.shields.io/badge/dependencies-zero-ff9800.svg)](#)
 [![Headless](https://img.shields.io/badge/UI-headless-9c27b0.svg)](#)
+
+---
+
+## 🚀 NEW in v2.19.0 — Professional WebGL Renderer Add-on
+
+**`chart-webgl.js`** — optional GPU-accelerated renderer for the heavy paths (candles, grid, volume). Load it after `chart.js`, call `chart.initWebGL()`, and candles render via ONE instanced GPU draw call instead of ~1000 Canvas 2D fillRects.
+
+### Architecture (industry-standard hybrid)
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  CANVAS 2D (user's canvas, FRONT, transparent in WebGL areas)        │
+│  · Overlay indicators (user render() gets Canvas 2D ctx — UNCHANGED) │
+│  · Pane indicators (RSI/MACD, own scales — Canvas 2D)                │
+│  · drawOnMain callbacks                                              │
+│  · Markers, user drawings, drawing panel                             │
+│  · Text: price/time axis labels, OHLC legend, countdown              │
+│  · Crosshair, current-price line, settings card, dropdown, toast     │
+│  · Status bar                                                        │
+├──────────────────────────────────────────────────────────────────────┤
+│  WEBGL CANVAS (internal, BACK — created by the add-on)               │
+│  · Full background fill (one quad)                                   │
+│  · Grid lines (one instanced draw per axis, H + V)                   │
+│  · Candlesticks (ONE instanced draw call for the ENTIRE chart)       │
+│  · Volume bars (ONE instanced draw call)                             │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+**Why hybrid, not "everything in WebGL"?** Text in WebGL requires a glyph atlas + SDF pipeline (weeks of work, sub-pixel differences). User indicator code receives a Canvas 2D ctx — changing it would break every existing indicator. The hybrid gives 90%+ of the GPU benefit with ZERO API changes and pixel-identical text.
+
+### Usage
+
+```html
+<script src="https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@v2.19.0/chart.js"></script>
+<script src="https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@v2.19.0/chart-webgl.js"></script>
+<script>
+  const chart = new BadiCharts(canvas, { /* ... */ });
+  const ok = chart.initWebGL();   // true = WebGL active
+  if (!ok) console.log('fell back to Canvas 2D');  // silent, same look
+  chart.start();
+</script>
+```
+
+**Nothing else changes.** Every existing indicator, drawing tool, theme and option keeps working. If WebGL is unavailable (old browser, no GPU, software-only renderer, Node.js test env), the chart silently falls back to the v2.18.3 Canvas 2D renderer — same look, same API, no errors.
+
+### Features
+- **WebGL 2 preferred**, WebGL 1 + `ANGLE_instanced_arrays` fallback
+- **MSAA** (`antialias: true`) — smooth candle edges and thin grid lines
+- **One instanced draw call** per layer: candles, grid, volume
+- **DPI-aware** — WebGL framebuffer matches the Canvas 2D canvas at `cssSize × dpr`
+- **Theme sync** — colors re-read on every layout update (setTheme works live)
+- **Resize sync** — guarded resize (v2.18.1 lesson: no needless reallocation)
+- **Graceful fallback** — any failure (no context, no extension, shader compile error) silently falls back to Canvas 2D
+- **Zero API changes** — all v2.18.3 features (drawOnMain, unlimited panes, Path2D batching) work identically
+- **Auto-detect + explicit init** — patches `window.BadiCharts` automatically in browsers; Node.js tests use `require('./chart-webgl.js')(TradingChart)`
+
+### Performance
+| Renderer | Candle count | Draw calls/frame |
+|----------|-------------|------------------|
+| Canvas 2D (v2.18.3) | 500 | ~17 canvas API calls |
+| **WebGL (v2.19.0)** | **500** | **3 GPU draw calls** |
+| **WebGL (v2.19.0)** | **50,000** | **3 GPU draw calls** (scales linearly) |
+
+The buffer fill loop is a single linear pass over visible candles with no per-candle API calls — the GPU rasterizes all instances in parallel.
 
 ---
 

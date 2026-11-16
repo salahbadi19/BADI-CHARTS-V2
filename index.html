@@ -56,8 +56,9 @@
   <button data-action="clear"    title="Clear drawings">Clr</button>
 </div>
 
-<!-- BADI-CHARTS-V2 v2.18.3 from CDN -->
-<script src="https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@v2.18.3/chart.js"></script>
+<!-- BADI-CHARTS-V2 v2.19.0: core renderer + optional WebGL add-on -->
+<script src="https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@v2.19.0/chart.js"></script>
+<script src="https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@v2.19.0/chart-webgl.js"></script>
 <script>
   // ─── 1. Create a headless chart instance (no built-in indicators) ──
   const chart = new BadiCharts(document.getElementById('chart'), {
@@ -65,6 +66,9 @@
     timeframe: { label: '1H', ms: 3600000 }
     // No `indicators` option here — we add them below via addIndicator(def).
   });
+  // ─── 1b. Enable the WebGL renderer (GPU candles/grid/volume) ───────
+  // Falls back silently to Canvas 2D if WebGL is unavailable.
+  chart.initWebGL();
   chart.start();
 
   // ─── 2a. Register a CUSTOM drawing tool (v2.1.1+) ─────────────────
