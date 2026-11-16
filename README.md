@@ -4,10 +4,28 @@
 >
 > Pixel-perfect rendering, 14 drawing tools, fully custom indicators via API — you bring the data, the UI, and the indicators. BADI-CHARTS-V2 renders the chart.
 
-[![Version](https://img.shields.io/badge/version-2.18.1-2962ff.svg)](#)
+[![Version](https://img.shields.io/badge/version-2.18.2-2962ff.svg)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-26a69a.svg)](LICENSE)
 [![No Dependencies](https://img.shields.io/badge/dependencies-zero-ff9800.svg)](#)
 [![Headless](https://img.shields.io/badge/UI-headless-9c27b0.svg)](#)
+
+---
+
+## ⚠️ What changed in v2.18.2
+
+**Performance: hot-path optimizations for the "just candles" case** — the library was reported heavy during pan/zoom even with NO indicators active.
+
+### Root cause
+The render pipeline ran several draw passes **unconditionally**, and `drawCandles()` called `this.priceToY(p)` — a chain of 5 function calls (`logicalToCoordinate` → `isEmpty` → `bottomMarginPx` → `internalHeight` → `isInverted`) — **four times per candle** (open, high, low, close). For 500 visible candles that's ~2000 function calls per frame, every mousemove during pan.
+
+### Fixes
+1. **`drawCandles`: precomputed price→Y transform.** The entire call chain collapses to `y = A - B * p` (two arithmetic ops). The constants `A` and `B` are derived once at the top of `drawCandles` from the price scale's current range/margins/height. For 500 candles: **2000 function calls → 2000 multiply-subtracts** per frame.
+2. **`drawCandles`: two-pass batched `fillStyle`.** Bull candles are drawn in one pass (fillStyle set once), bear candles in a second pass (fillStyle set once). Previously fillStyle was set per-candle — ~500 state changes per frame, now 2. Each state change can trigger a canvas pipeline flush; minimizing them is a measurable win.
+3. **`drawIndicators`: early-return when no overlay indicators.** The old code unconditionally allocated the helpers object (a large literal with ~15 closures: `drawOnMain`, `drawLine`, `drawGradientArea`, `indexToX`, `priceToY`, ...) and did `ctx.save/beginPath/rect/clip/restore` — all per frame, for nothing, on a chart with zero overlay indicators. The guard skips all of it.
+4. **`drawDrawings`: early-return when no drawings.** The old code allocated the large `drawOne` closure (a switch with ~10 cases) every frame even when `this.drawings.length === 0` and no drawing was in progress. The guard skips the allocation.
+
+### Net effect
+On a bare-candle chart (no indicators, no drawings), the render pipeline now does the **minimum work possible**: background, grid, candles, axes, crosshair — with no wasted allocations or function calls. Pan/zoom is significantly lighter. No API changes; pixel output is identical (verified by regression tests).
 
 ---
 

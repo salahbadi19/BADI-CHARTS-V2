@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.18.1 — Pixel-Perfect Pure JavaScript Trading Chart Library
+ * BADI-CHARTS-V2 v2.18.2 — Pixel-Perfect Pure JavaScript Trading Chart Library
  *
  * A lightweight, dependency-free candlestick charting library built entirely
  * with the HTML5 Canvas API. Inspired by TradingView Lightweight Charts.
@@ -13,6 +13,25 @@
  *   - Responsive (desktop + mobile with touch/pinch support)
  *   - Crosshair, current price line, OHLC legend
  *   - Clipping for all chart areas (no overflow)
+ *
+ * v2.18.2 — PERF: three hot-path optimizations for the "just candles" case.
+ *   The library was reported heavy during pan/zoom even with NO indicators.
+ *   Root cause: the render pipeline ran several passes unconditionally, and
+ *   drawCandles called this.priceToY(p) — a chain of 5 function calls — FOUR
+ *   times per candle (open, high, low, close), i.e. ~2000 function calls per
+ *   frame for 500 visible candles. Fixes:
+ *   1. drawCandles: precompute the price→Y transform as y = A - B*p (two
+ *      arithmetic ops instead of 5 function calls). 2000 calls → 2000 ops.
+ *   2. drawCandles: two-pass batched fillStyle (bull pass + bear pass) — sets
+ *      fillStyle ONCE per color instead of per-candle (~498 fewer state
+ *      changes per frame).
+ *   3. drawIndicators: early-return when no overlay indicators are active
+ *      (skips helpers allocation + ctx save/clip/restore on every frame).
+ *   4. drawDrawings: early-return when no drawings exist (skips the large
+ *      drawOne closure allocation on every frame).
+ *   Net effect on a bare-candle chart: the render pipeline now does the
+ *   minimum work possible — background, grid, candles, axes, crosshair —
+ *   with no wasted allocations or function calls. No API change.
  *
  * v2.18.1 — perf: guarded bitmap resize in _safeRenderIndicator's rebuild
  *   branch. `entry.canvas.width = pxW` (even when pxW is UNCHANGED) clears the
@@ -323,7 +342,7 @@
 'use strict';
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.18.1';
+const VERSION = '2.18.2';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 // v2.14.0 (audit #12): tracks the chart the user last hovered/touched, so
 // window-level keyboard shortcuts only apply to ONE chart on multi-chart pages.
@@ -5639,50 +5658,90 @@ class TradingChart {
     // overlapping sub-pixel-wide bodies + wicks.
     const drawAsLine = this.barSpacing < 4 || bodyWidthBmp <= 1;
 
+    // v2.18.2 PERF: Precompute the price→Y linear transform. Instead of
+    // calling this.priceToY(p) — which calls logicalToCoordinate → isEmpty →
+    // bottomMarginPx → internalHeight → isInverted (~5 function calls) — FOUR
+    // times per candle (open, high, low, close), we collapse the whole chain
+    // into y = A - B * p (two arithmetic ops). For 500 visible candles that's
+    // 2000 function calls → 2000 multiply-subtracts per frame, a major win
+    // during pan/zoom where this runs every mousemove.
+    //
+    // Derivation (isInverted() is always false for the price scale):
+    //   priceToY(p) = priceTop + logicalToCoordinate(p, 0)
+    //               = priceTop + (_h - 1 - (_bm + (_ih - 1) * (p - min) / (max - min)))
+    //               = [priceTop + _h - 1 - _bm + (_ih - 1) * min / (max - min)]
+    //                 - [(_ih - 1) / (max - min)] * p
+    //               = A - B * p
+    const ps = this.priceScale;
+    const pr = ps._priceRange;
+    let fastPriceToY;
+    if (!pr || pr.min === pr.max) {
+      // Degenerate range — everything maps to the top of the price area.
+      const _top = this.priceTop;
+      fastPriceToY = function () { return _top; };
+    } else {
+      const _ih = ps.internalHeight();
+      const _bm = ps.bottomMarginPx();
+      const _h  = ps._height;
+      const range = pr.max - pr.min;
+      const B = (_ih - 1) / range;
+      const A = this.priceTop + (_h - 1 - _bm) + B * pr.min;
+      fastPriceToY = function (p) { return A - B * p; };
+    }
+
     // Clip to price chart area so candles never overflow into toolbar/volume/axis
     ctx.save();
     ctx.beginPath();
     ctx.rect(this.chartLeft, this.priceTop, this.chartRight - this.chartLeft, this.priceBottom - this.priceTop);
     ctx.clip();
 
-    for (let i = firstIdx; i <= lastIdx; i++) {
-      const c = candles[i];
-      const x = this.indexToX(i);
-      if (x < this.chartLeft - bodyWidth || x > this.chartRight + bodyWidth) continue;
-      const isBull = c.close >= c.open;
-      const color = isBull ? this.theme.bull : this.theme.bear;
-      const yOpen = this.priceToY(c.open);
-      const yClose = this.priceToY(c.close);
-      const yHigh = this.priceToY(c.high);
-      const yLow = this.priceToY(c.low);
+    // v2.18.2 PERF: Two-pass batched fillStyle. Setting ctx.fillStyle is a
+    // canvas state change — doing it per-candle (500×/frame) is wasteful when
+    // there are only two colors (bull/bear). Two passes set fillStyle ONCE
+    // each and skip candles of the wrong color via a cheap `continue`. Net:
+    // ~498 fewer state changes for the cost of ~500 extra branch checks.
+    const bullColor = this.theme.bull;
+    const bearColor = this.theme.bear;
+    const chartLeft = this.chartLeft, chartRight = this.chartRight;
 
-      // v2.6.0: Draw wick and body BOTH centered on the same snapped center point.
-      // The wick is a wickWidthBmp-wide column starting at the snapped center c;
-      // the body is drawn symmetric around that column's center so the wick always
-      // sits exactly in the middle of the body at every zoom level.
-      const cxBmp = Math.round(x * dpr);
-      const cx = cxBmp / dpr;             // snapped center (bitmap-aligned)
-      const wickCenter = cx + wickWidth / 2; // center of the wick column
+    for (let pass = 0; pass < 2; pass++) {
+      const wantBull = (pass === 0);
+      ctx.fillStyle = wantBull ? bullColor : bearColor;
+      for (let i = firstIdx; i <= lastIdx; i++) {
+        const c = candles[i];
+        const isBull = c.close >= c.open;
+        if (isBull !== wantBull) continue;
+        const x = this.indexToX(i);
+        if (x < chartLeft - bodyWidth || x > chartRight + bodyWidth) continue;
 
-      // Vertical extents — snapped to bitmap grid for crisp edges
-      const wickTop = Math.floor(yHigh * dpr) / dpr;
-      const wickBottom = Math.ceil(yLow * dpr) / dpr;
-      const wickH = Math.max(1 / dpr, wickBottom - wickTop);
-      const bodyTop = Math.round(Math.min(yOpen, yClose) * dpr) / dpr;
-      const bodyBottom = Math.round(Math.max(yOpen, yClose) * dpr) / dpr;
-      const bodyH = Math.max(1 / dpr, bodyBottom - bodyTop);
+        const yOpen  = fastPriceToY(c.open);
+        const yClose = fastPriceToY(c.close);
+        const yHigh  = fastPriceToY(c.high);
+        const yLow   = fastPriceToY(c.low);
 
-      ctx.fillStyle = color;
+        // v2.6.0: Draw wick and body BOTH centered on the same snapped center point.
+        const cxBmp = Math.round(x * dpr);
+        const cx = cxBmp / dpr;             // snapped center (bitmap-aligned)
+        const wickCenter = cx + wickWidth / 2; // center of the wick column
 
-      if (drawAsLine) {
-        // LWC-style thin mode: single crisp vertical line from high to low
-        ctx.fillRect(cx, wickTop, wickWidth, wickH);
-      } else {
-        // Wick: bitmap-aligned column
-        ctx.fillRect(cx, wickTop, wickWidth, wickH);
-        // Body: symmetric around the wick column's center
-        const bodyLeft = wickCenter - bodyWidth / 2;
-        ctx.fillRect(bodyLeft, bodyTop, bodyWidth, bodyH);
+        // Vertical extents — snapped to bitmap grid for crisp edges
+        const wickTop = Math.floor(yHigh * dpr) / dpr;
+        const wickBottom = Math.ceil(yLow * dpr) / dpr;
+        const wickH = Math.max(1 / dpr, wickBottom - wickTop);
+        const bodyTop = Math.round(Math.min(yOpen, yClose) * dpr) / dpr;
+        const bodyBottom = Math.round(Math.max(yOpen, yClose) * dpr) / dpr;
+        const bodyH = Math.max(1 / dpr, bodyBottom - bodyTop);
+
+        if (drawAsLine) {
+          // LWC-style thin mode: single crisp vertical line from high to low
+          ctx.fillRect(cx, wickTop, wickWidth, wickH);
+        } else {
+          // Wick: bitmap-aligned column
+          ctx.fillRect(cx, wickTop, wickWidth, wickH);
+          // Body: symmetric around the wick column's center
+          const bodyLeft = wickCenter - bodyWidth / 2;
+          ctx.fillRect(bodyLeft, bodyTop, bodyWidth, bodyH);
+        }
       }
     }
     ctx.restore();
@@ -5870,6 +5929,24 @@ class TradingChart {
   // render(ctx, values, helpers, settings, state) is called inside a clip
   // to the price chart area.
   drawIndicators() {
+    // v2.18.2 PERF: early-return when there are NO active overlay-type
+    // indicators. The old code unconditionally allocated the helpers object
+    // (a large object literal with ~15 closures including drawOnMain,
+    // drawLine, drawGradientArea) and did ctx.save/beginPath/rect/clip/
+    // restore — ALL of that per frame, for nothing, on a chart with zero
+    // overlay indicators (the common "just candles" case). This guard skips
+    // all of it. The loop below still filters by type==='overlay', but the
+    // guard avoids even ENTERING the function's heavy prologue.
+    if (this.activeIndicators.size === 0) return;
+    let hasOverlay = false;
+    for (const id of this.activeIndicators) {
+      const st = this.indicatorStates.get(id);
+      if (st && st.def && st.def.type === 'overlay' && st.visible !== false) {
+        hasOverlay = true; break;
+      }
+    }
+    if (!hasOverlay) return;
+
     const ctx = this.ctx;
     const firstIdx = Math.max(0, Math.floor(this.xToIndex(this.chartLeft)));
     const lastIdx = Math.min(this.sim.candles.length - 1, Math.ceil(this.xToIndex(this.chartRight)));
@@ -6087,6 +6164,12 @@ class TradingChart {
 
   /* --------------------------- Drawings ---------------------------------- */
   drawDrawings() {
+    // v2.18.2 PERF: early-return when there are NO drawings and NO active
+    // drawing-in-progress. The old code unconditionally allocated the large
+    // `drawOne` closure (a switch with ~10 cases, capturing ctx, _dpr, theme,
+    // selectedDrawing, hoverDrawing, customTools) every frame — even on a
+    // bare chart with zero drawings. This guard skips all of it.
+    if (this.drawings.length === 0 && !this.currentDrawing) return;
     const ctx = this.ctx;
     const _dpr = this.dpr;
     const drawOne = (d, isActive = false) => {
