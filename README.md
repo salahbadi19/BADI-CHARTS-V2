@@ -4,12 +4,37 @@
 >
 > Pixel-perfect rendering, 14 drawing tools, fully custom indicators via API — you bring the data, the UI, and the indicators. BADI-CHARTS-V2 renders the chart.
 
-[![Version](https://img.shields.io/badge/version-2.20.2-2962ff.svg)](#)
+[![Version](https://img.shields.io/badge/version-2.20.3-2962ff.svg)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-26a69a.svg)](LICENSE)
 [![No Dependencies](https://img.shields.io/badge/dependencies-zero-ff9800.svg)](#)
 [![Headless](https://img.shields.io/badge/UI-headless-9c27b0.svg)](#)
 
 ---
+
+## 🛠 v2.20.3 — Countdown no longer "stuck" when rAF is throttled
+
+**Bug.** v2.20.2 fixed the "99" clamp, but users on throttled browsers
+(background tab, power-saving mode, throttled iframe, or any case where
+`requestAnimationFrame` fires less than once per second) saw the countdown
+"stuck" at its initial value — e.g. an H1 chart at the start of the hour
+showed "60" forever instead of dropping to "59" after 1 second.
+
+**Root cause.** The countdown's 1-second `setInterval` only called
+`invalidate()` (set `_needsRender = true`) and relied on the rAF loop to
+consume the flag. If rAF was throttled below 1 fps, no rAF tick fired to
+render the new value, so the countdown appeared frozen.
+
+**Fix.** The `setInterval` now ALSO calls `this.render(now)` directly when
+`_lastRenderTime` is more than 500ms stale — guaranteeing at least one
+render per second regardless of rAF behavior. If the rAF loop IS keeping
+up (the normal case), the 500ms gate fails and we don't double-render.
+
+Same fix applied to the 2D edition (`chart.js` v2.18.7).
+
+Verified: a new regression test replaces `requestAnimationFrame` with a
+no-op (simulating a throttled tab) and confirms the countdown still
+updates across a 70-second window. All prior suites (79 WebGL + 42
+momentum + 122 countdown + v2.16/v2.17/v2.18) still green.
 
 ## 🛠 v2.20.2 — Countdown no longer pins at "99"
 

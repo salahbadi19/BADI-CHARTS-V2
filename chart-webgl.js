@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.20.2 — WEBGL EDITION (chart-webgl.js)
+ * BADI-CHARTS-V2 v2.20.3 — WEBGL EDITION (chart-webgl.js)
  * The complete standalone trading chart library, rendered with real WebGL.
  *
  * THIS FILE IS A FULL LIBRARY, NOT A LAYER. Load it INSTEAD of chart.js —
@@ -385,7 +385,7 @@
 'use strict';
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.20.2';
+const VERSION = '2.20.3';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 // v2.14.0 (audit #12): tracks the chart the user last hovered/touched, so
 // window-level keyboard shortcuts only apply to ONE chart on multi-chart pages.
@@ -6779,11 +6779,35 @@ class TradingChart {
   // Internal: start/stop the 1s wakeup interval based on _countdown.enabled.
   // The interval just calls invalidate() — the next rAF tick renders the new
   // value. Stopped when disabled to keep the chart at zero CPU when idle.
+  //
+  // v2.20.3: previously the interval ONLY called invalidate() (sets
+  // _needsRender = true) and relied on the rAF loop to pick it up. But rAF
+  // can be throttled by the browser (background tab, power-saving mode,
+  // throttled iframe, or the loop's idle check skipping frames). In that
+  // case the chart wouldn't re-render even once a second, and the countdown
+  // appeared "stuck" at its initial value (e.g. "60" for H1 at the start of
+  // an hour, even though the value should drop to "59" after 1 second).
+  // Now the interval ALSO renders directly if the rAF loop hasn't rendered
+  // in the last 500ms — guaranteeing at least one render per second.
   _syncCountdownTimer() {
     if (this._countdown && this._countdown.enabled && !this._countdownTimer) {
       const self = this;
       this._countdownTimer = setInterval(function () {
-        try { self.invalidate(); } catch (_) {}
+        try {
+          self.invalidate();
+          // v2.20.3 safety net: if the rAF loop hasn't rendered in the last
+          // 500ms (throttled, background tab, or idle check skipped), render
+          // directly. This guarantees the countdown updates at least once
+          // per second. If the rAF loop IS keeping up, this is a no-op (the
+          // 500ms gate fails) and we don't double-render.
+          const now = (typeof performance !== 'undefined' && performance.now)
+            ? performance.now()
+            : Date.now();
+          const lastRender = self._lastRenderTime || 0;
+          if (now - lastRender > 500 && typeof self.render === 'function') {
+            self.render(now);
+          }
+        } catch (_) {}
       }, 1000);
     } else if ((!this._countdown || !this._countdown.enabled) && this._countdownTimer) {
       clearInterval(this._countdownTimer);

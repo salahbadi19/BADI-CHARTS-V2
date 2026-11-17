@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.18.6 — Pixel-Perfect Pure JavaScript Trading Chart Library
+ * BADI-CHARTS-V2 v2.18.7 — Pixel-Perfect Pure JavaScript Trading Chart Library
  *
  * A lightweight, dependency-free candlestick charting library built entirely
  * with the HTML5 Canvas API. Inspired by TradingView Lightweight Charts.
@@ -378,7 +378,7 @@ var Path2D = (typeof window !== 'undefined' && window.Path2D)
     })();
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.18.6';
+const VERSION = '2.18.7';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 // v2.14.0 (audit #12): tracks the chart the user last hovered/touched, so
 // window-level keyboard shortcuts only apply to ONE chart on multi-chart pages.
@@ -4963,11 +4963,23 @@ class TradingChart {
   // Internal: start/stop the 1s wakeup interval based on _countdown.enabled.
   // The interval just calls invalidate() — the next rAF tick renders the new
   // value. Stopped when disabled to keep the chart at zero CPU when idle.
+  // v2.20.3: also renders directly if the rAF loop hasn't rendered in the
+  // last 500ms (throttled/background-tab safety net). See chart-webgl.js
+  // _syncCountdownTimer for the full rationale.
   _syncCountdownTimer() {
     if (this._countdown && this._countdown.enabled && !this._countdownTimer) {
       const self = this;
       this._countdownTimer = setInterval(function () {
-        try { self.invalidate(); } catch (_) {}
+        try {
+          self.invalidate();
+          const now = (typeof performance !== 'undefined' && performance.now)
+            ? performance.now()
+            : Date.now();
+          const lastRender = self._lastRenderTime || 0;
+          if (now - lastRender > 500 && typeof self.render === 'function') {
+            self.render(now);
+          }
+        } catch (_) {}
       }, 1000);
     } else if ((!this._countdown || !this._countdown.enabled) && this._countdownTimer) {
       clearInterval(this._countdownTimer);
