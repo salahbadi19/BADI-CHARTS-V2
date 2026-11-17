@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.18.4 — Pixel-Perfect Pure JavaScript Trading Chart Library
+ * BADI-CHARTS-V2 v2.18.5 — Pixel-Perfect Pure JavaScript Trading Chart Library
  *
  * A lightweight, dependency-free candlestick charting library built entirely
  * with the HTML5 Canvas API. Inspired by TradingView Lightweight Charts.
@@ -378,7 +378,7 @@ var Path2D = (typeof window !== 'undefined' && window.Path2D)
     })();
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.18.4';
+const VERSION = '2.18.5';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 // v2.14.0 (audit #12): tracks the chart the user last hovered/touched, so
 // window-level keyboard shortcuts only apply to ONE chart on multi-chart pages.
@@ -7009,12 +7009,14 @@ class TradingChart {
   // seconds).
   //
   // v2.14.0 FIX: format 'mm' clamped at 99, so H4/D1 timeframes (240 / 1440
-  // minutes remaining) showed a pinned "99" for hours. 'auto' now renders an
-  // ADAPTIVE clock like TradingView:
-  //   remaining >= 1h  → hh:mm   (e.g. 23:59, 03:59)
-  //   remaining >= 1m  → mm:ss   (e.g. 59:30)
-  //   remaining  < 1m  → ss      (2 digits, e.g. 07)
-  // Explicit formats still supported: 'hh:mm' | 'mm:ss' | 'ss' | 'hh' | 'mm'.
+  // minutes remaining) showed a pinned "99" for hours.
+  //
+  // v2.20.1 FIX: 'auto' used to switch to a CLOCK string ("1:05", "23:59")
+  // when remaining > 60s — that's 3–4 digits + a colon, breaking the
+  // "2-digit number" promise from v2.13.0. Now 'auto' picks the LARGEST
+  // unit whose max value (i.e. the full timeframe period expressed in that
+  // unit) still fits in 2 digits — so the countdown ALWAYS renders as
+  // exactly 2 digits. See chart-webgl.js drawCountdown for the full table.
   drawCountdown(now) {
     if (!this._countdown || !this._countdown.enabled) return;
     const candles = this.sim.candles;
@@ -7033,12 +7035,18 @@ class TradingChart {
     const fmt = this._countdown.format || 'auto';
     let text;
     if (fmt === 'auto') {
-      if (remainingSec >= 3600) {
-        text = Math.floor(remainingSec / 3600) + ':' + pad2(Math.floor((remainingSec % 3600) / 60));
-      } else if (remainingSec >= 60) {
-        text = Math.floor(remainingSec / 60) + ':' + pad2(remainingSec % 60);
+      // v2.20.1: pick the largest unit whose FULL-PERIOD value fits in 2 digits.
+      const tfSec = Math.max(1, Math.round(tfMs / 1000));
+      if (tfSec < 100) {
+        text = pad2(Math.min(99, remainingSec));
+      } else if (tfSec < 6000) {
+        text = pad2(Math.min(99, Math.floor(remainingSec / 60)));
+      } else if (tfSec < 360000) {
+        text = pad2(Math.min(99, Math.floor(remainingSec / 3600)));
+      } else if (tfSec < 8640000) {
+        text = pad2(Math.min(99, Math.floor(remainingSec / 86400)));
       } else {
-        text = pad2(remainingSec);
+        text = pad2(Math.min(99, Math.floor(remainingSec / 604800)));
       }
     } else if (fmt === 'hh:mm') {
       text = Math.floor(remainingSec / 3600) + ':' + pad2(Math.floor((remainingSec % 3600) / 60));

@@ -4,12 +4,47 @@
 >
 > Pixel-perfect rendering, 14 drawing tools, fully custom indicators via API — you bring the data, the UI, and the indicators. BADI-CHARTS-V2 renders the chart.
 
-[![Version](https://img.shields.io/badge/version-2.20.0-2962ff.svg)](#)
+[![Version](https://img.shields.io/badge/version-2.20.1-2962ff.svg)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-26a69a.svg)](LICENSE)
 [![No Dependencies](https://img.shields.io/badge/dependencies-zero-ff9800.svg)](#)
 [![Headless](https://img.shields.io/badge/UI-headless-9c27b0.svg)](#)
 
 ---
+
+## 🛠 v2.20.1 — Countdown fix (2 digits + actually ticking)
+
+Two bugs reported against the floating countdown near the forming candle:
+
+1. **Showed 3 digits instead of 2.** The default `'auto'` format switched to
+   a CLOCK string ("1:05", "23:59") as soon as the remaining time exceeded
+   60 seconds — 3–4 digits plus a colon, breaking the "2-digit number"
+   promise from v2.13.0. `'auto'` now picks the LARGEST unit whose
+   **full-period value fits in 2 digits**, so the countdown ALWAYS renders
+   as exactly 2 digits:
+   | timeframe | unit | example |
+   |---|---|---|
+   | < 100s (1s, 5s, 30s, 60s, 90s) | seconds | "59".."00" |
+   | 100s..99m (1m, 5m, 15m, 30m, 1h, 90m) | minutes | "60".."00" |
+   | 100m..99h (2h, 4h, 6h, 12h, 23h, 1d, 2d, 4d) | hours | "23".."00" |
+   | 100h..99d (1w, 2w, 1M) | days | "07".."00" |
+   | 100d+ (3M, 6M, 1Y) | weeks | "52".."00" |
+
+   Explicit formats (`'hh:mm'`, `'mm:ss'`, `'ss'`, `'mm'`, `'hh'`) still
+   behave exactly as before — only `'auto'` changed.
+
+2. **"Didn't work" (frozen at 00).** The demo's data set the last candle's
+   time to `now - tfSec`, so its close time was `now` and `remainingSec`
+   was 0 (or negative → clamped to 0) from page load onward — the countdown
+   had nothing to count down from. The demo now:
+   - Aligns the last candle's start to `floor(now/tfSec) * tfSec` so its
+     close lands on the NEXT period boundary (a real future timestamp).
+   - Enables `countdown: { enabled: true }` in the constructor opts.
+   - Runs a small live-feed simulation (every 2s jitters the forming
+     candle's close, rolls over to a new candle at the period boundary)
+     that mirrors what a real WebSocket feed would do — so the countdown
+     visibly ticks and the price line moves.
+
+Same `drawCountdown` fix applied to the 2D edition (`chart.js` v2.18.5).
 
 ## 🛠 v2.20.0 — Inertia (momentum scrolling) re-tuned
 

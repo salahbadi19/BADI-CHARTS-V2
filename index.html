@@ -73,14 +73,18 @@
 <!-- ══════════════════════════════════════════════════════════════════
      BADI-CHARTS-V2 v2.19.0 — WEBGL EDITION (complete standalone library).
      ONE file. No chart.js needed. Drop-in: same API as the 2D edition.
-     CDN: https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@v2.20.0/chart-webgl.js
+     CDN: https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@v2.20.1/chart-webgl.js
      ══════════════════════════════════════════════════════════════════ -->
 <script src="chart-webgl.js"></script>
 <script>
   // ─── 1. Create the chart (identical API to the 2D edition) ──────────
   const chart = new BadiCharts(document.getElementById('chart'), {
     symbol:    { label: 'BTCUSDT', priceScale: 100, decimals: 2 },
-    timeframe: { label: '1H', ms: 3600000 }
+    timeframe: { label: '1H', ms: 3600000 },
+    // v2.20.1: enable the floating countdown near the forming candle.
+    // 'auto' format = always 2 digits, picks the unit from the timeframe
+    // (minutes for H1 → "60".."00").
+    countdown: { enabled: true, format: 'auto', color: '#ff9800', fontSize: 12, offsetX: 8 }
   });
   chart.start();
 
@@ -259,18 +263,62 @@
   });
 
   // ─── 4. Feed data (5,000 candles — pan/zoom stays smooth) ───────────
+  // v2.20.1: align the LAST candle's time to the START of the current
+  // period (floor(now/tfSec)*tfSec). That makes its close = the NEXT period
+  // boundary (in the future), so the countdown has a real positive value to
+  // tick down from. Before, last.time = now - tfSec → close = now →
+  // remainingSec clamped to 0 forever → countdown looked frozen at "00".
   (function () {
-    const N = 5000, tf = 3600000;
-    let t = Math.floor(Date.now() / 1000) - N * 3600;
+    const N = 5000, tfSec = 3600, tf = 3600000;
+    const nowSec = Math.floor(Date.now() / 1000);
+    const lastCandleStart = Math.floor(nowSec / tfSec) * tfSec;   // start of current hour
+    const firstCandleStart = lastCandleStart - (N - 1) * tfSec;
     let price = 42000;
     const out = [];
     for (let i = 0; i < N; i++) {
       const o = price;
       price = Math.max(1000, price + (Math.sin(i / 41) + Math.cos(i / 113) + (Math.random() - 0.5)) * 140);
-      out.push({ time: t + i * tf / 1000, open: o, high: Math.max(o, price) + 60, low: Math.min(o, price) - 60, close: price, volume: 800 + Math.random() * 3200 });
+      out.push({ time: firstCandleStart + i * tfSec, open: o, high: Math.max(o, price) + 60, low: Math.min(o, price) - 60, close: price, volume: 800 + Math.random() * 3200 });
     }
     chart.setData(out);
     document.getElementById('nCandles').textContent = N.toLocaleString();
+
+    // v2.20.1: simple live-feed simulation so the countdown is visibly alive.
+    // Every 2s, jitter the forming candle's close/high/low; when the wall
+    // clock crosses the next tf boundary, roll over to a fresh candle via
+    // chart.update() (which appends if the time is newer, replaces if same).
+    let liveTimer = null;
+    function startLiveFeed() {
+      if (liveTimer) return;
+      liveTimer = setInterval(function () {
+        const cs = chart.sim && chart.sim.candles;
+        if (!cs || cs.length === 0) return;
+        const last = cs[cs.length - 1];
+        const tfMs = (chart.timeframe && chart.timeframe.ms) || 3600000;
+        const nowSec2 = Math.floor(Date.now() / 1000);
+        const closeSec = last.time + Math.round(tfMs / 1000);
+        if (nowSec2 >= closeSec) {
+          // Crossed the boundary → push a new forming candle.
+          const newOpen = last.close;
+          chart.update({ time: closeSec, open: newOpen, high: newOpen + 1, low: newOpen - 1, close: newOpen, volume: 800 });
+        } else {
+          // Same period → jitter the forming candle's close (and H/L).
+          const drift = (Math.random() - 0.5) * 80;
+          const nc = Math.max(1000, last.close + drift);
+          const updated = {
+            time: last.time,
+            open: last.open,
+            high: Math.max(last.high, nc),
+            low:  Math.min(last.low,  nc),
+            close: nc,
+            volume: (last.volume || 0) + Math.random() * 50
+          };
+          chart.update(updated);   // same time → replaces the last candle
+        }
+      }, 2000);
+    }
+    startLiveFeed();
+    window.stopLiveFeed = function () { if (liveTimer) { clearInterval(liveTimer); liveTimer = null; } };
   })();
 
   // ─── 5. Toolbar wiring — indicator defs live in a lookup for re-adding ─

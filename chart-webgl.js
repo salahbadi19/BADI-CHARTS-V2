@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.20.0 — WEBGL EDITION (chart-webgl.js)
+ * BADI-CHARTS-V2 v2.20.1 — WEBGL EDITION (chart-webgl.js)
  * The complete standalone trading chart library, rendered with real WebGL.
  *
  * THIS FILE IS A FULL LIBRARY, NOT A LAYER. Load it INSTEAD of chart.js —
@@ -385,7 +385,7 @@
 'use strict';
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.20.0';
+const VERSION = '2.20.1';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 // v2.14.0 (audit #12): tracks the chart the user last hovered/touched, so
 // window-level keyboard shortcuts only apply to ONE chart on multi-chart pages.
@@ -8928,11 +8928,19 @@ class TradingChart {
   // seconds).
   //
   // v2.14.0 FIX: format 'mm' clamped at 99, so H4/D1 timeframes (240 / 1440
-  // minutes remaining) showed a pinned "99" for hours. 'auto' now renders an
-  // ADAPTIVE clock like TradingView:
-  //   remaining >= 1h  → hh:mm   (e.g. 23:59, 03:59)
-  //   remaining >= 1m  → mm:ss   (e.g. 59:30)
-  //   remaining  < 1m  → ss      (2 digits, e.g. 07)
+  // minutes remaining) showed a pinned "99" for hours.
+  //
+  // v2.20.1 FIX: 'auto' used to switch to a CLOCK string ("1:05", "23:59")
+  // when remaining > 60s — that's 3–4 digits + a colon, breaking the
+  // "2-digit number" promise from v2.13.0. Now 'auto' picks the LARGEST
+  // unit whose max value (i.e. the full timeframe period expressed in that
+  // unit) still fits in 2 digits — so the countdown ALWAYS renders as
+  // exactly 2 digits, with a useful range:
+  //   tf < 100s           → seconds (e.g. tf=30s → "30".."00")
+  //   tf < 100m            → minutes  (e.g. tf=1h → "60".."00", tf=5m → "05".."00")
+  //   tf < 100h            → hours    (e.g. tf=4h → "04".."00", tf=1d → "24".."00")
+  //   tf < 100d            → days     (e.g. tf=1w → "07".."00")
+  //   else                 → weeks    (e.g. tf=1M → "04".."00")
   // Explicit formats still supported: 'hh:mm' | 'mm:ss' | 'ss' | 'hh' | 'mm'.
   drawCountdown(now) {
     if (!this._countdown || !this._countdown.enabled) return;
@@ -8952,12 +8960,26 @@ class TradingChart {
     const fmt = this._countdown.format || 'auto';
     let text;
     if (fmt === 'auto') {
-      if (remainingSec >= 3600) {
-        text = Math.floor(remainingSec / 3600) + ':' + pad2(Math.floor((remainingSec % 3600) / 60));
-      } else if (remainingSec >= 60) {
-        text = Math.floor(remainingSec / 60) + ':' + pad2(remainingSec % 60);
+      // v2.20.1: pick the largest unit whose FULL-PERIOD value fits in 2 digits.
+      // tfSec is the full candle period in seconds; we find a unit u such that
+      // tfSec/u < 100, then display remainingSec/u clamped at 99 (defensive —
+      // can't normally happen because tfSec/u < 100 implies remainingSec/u < 100).
+      const tfSec = Math.max(1, Math.round(tfMs / 1000));
+      if (tfSec < 100) {
+        // sub-100s timeframes → seconds (1s, 5s, 10s, 30s, 45s, 60s, 90s)
+        text = pad2(Math.min(99, remainingSec));
+      } else if (tfSec < 6000) {
+        // 100s..99m → minutes (1m, 5m, 15m, 30m, 45m, 60m=1h, 90m, 99m)
+        text = pad2(Math.min(99, Math.floor(remainingSec / 60)));
+      } else if (tfSec < 360000) {
+        // 100m..99h → hours (2h, 4h, 6h, 12h, 23h, 1d, 2d, 4d)
+        text = pad2(Math.min(99, Math.floor(remainingSec / 3600)));
+      } else if (tfSec < 8640000) {
+        // 100h..99d → days (1w, 2w, 1M)
+        text = pad2(Math.min(99, Math.floor(remainingSec / 86400)));
       } else {
-        text = pad2(remainingSec);
+        // 100d+ → weeks (3M, 6M, 1Y)
+        text = pad2(Math.min(99, Math.floor(remainingSec / 604800)));
       }
     } else if (fmt === 'hh:mm') {
       text = Math.floor(remainingSec / 3600) + ':' + pad2(Math.floor((remainingSec % 3600) / 60));
