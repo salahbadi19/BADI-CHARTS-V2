@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.19.2 — WEBGL EDITION (chart-webgl.js)
+ * BADI-CHARTS-V2 v2.20.0 — WEBGL EDITION (chart-webgl.js)
  * The complete standalone trading chart library, rendered with real WebGL.
  *
  * THIS FILE IS A FULL LIBRARY, NOT A LAYER. Load it INSTEAD of chart.js —
