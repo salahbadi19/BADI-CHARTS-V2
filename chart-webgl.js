@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.20.7 — WEBGL EDITION (chart-webgl.js)
+ * BADI-CHARTS-V2 v2.20.8 — WEBGL EDITION (chart-webgl.js)
  * The complete standalone trading chart library, rendered with real WebGL.
  *
  * THIS FILE IS A FULL LIBRARY, NOT A LAYER. Load it INSTEAD of chart.js —
@@ -385,7 +385,7 @@
 'use strict';
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.20.7';
+const VERSION = '2.20.8';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 // v2.14.0 (audit #12): tracks the chart the user last hovered/touched, so
 // window-level keyboard shortcuts only apply to ONE chart on multi-chart pages.
@@ -9078,23 +9078,15 @@ class TradingChart {
   }
 
   /* --------------------------- Price Axis -------------------------------- */
+  // v2.20.8: Lightweight-Charts-style axis — no separate background fill,
+  // no border line. Just the tick labels floating to the right of the chart,
+  // seamless with the chart background. The chart's own background (drawn in
+  // drawBackground) already covers the full canvas including the axis strip,
+  // so there's nothing to fill here.
   drawPriceAxis() {
     const ctx = this.ctx;
     const dpr = this.dpr;
-    // v2.4.0+: Use dedicated axis colors (axisBg, axisBorder, axisText)
-    // Fill the entire right column (price axis + corner with time axis) with axisBg
-    const axisTop = this.chartTop;
-    const axisBottom = (this.layout.paneBottom || this.chartBottom) + this.layout.timeAxisH;
-    ctx.fillStyle = this.theme.axisBg;
-    ctx.fillRect(this.chartRight + 1, axisTop, this.W - this.chartRight - 1, axisBottom - axisTop);
-    ctx.strokeStyle = this.theme.axisBorder;
-    ctx.beginPath();
-    // v2.16.0: bitmap-snapped 1px border (was chartRight + 0.5 — only crisp at integer dpr).
-    const axBorder = snapToH(this.chartRight, dpr);
-    ctx.moveTo(axBorder, this.chartTop);
-    ctx.lineTo(axBorder, this.chartBottom);
-    ctx.stroke();
-
+    // No fill, no border — the chart background shows through seamlessly.
     ctx.font = '11px -apple-system, Segoe UI, Roboto, sans-serif';
     ctx.fillStyle = this.theme.axisText;
     ctx.textBaseline = 'middle';
@@ -9165,18 +9157,14 @@ class TradingChart {
     return this.sim.candles[N - 1].time + (idx - (N - 1)) * (this.timeframe.ms / 1000);
   }
 
+  // v2.20.8: Lightweight-Charts-style time axis — no separate background
+  // fill, no top border line. Just the time labels floating below the chart,
+  // seamless with the chart background.
   drawTimeAxis() {
     const ctx = this.ctx;
     const dpr = this.dpr;
     const axisTop = this.layout.paneBottom || this.chartBottom;
-    // v2.4.0+: Use dedicated axis colors (axisBg, axisBorder, axisText)
-    ctx.fillStyle = this.theme.axisBg;
-    ctx.fillRect(0, axisTop, this.chartRight + 1, this.layout.timeAxisH);
-    ctx.strokeStyle = this.theme.axisBorder;
-    ctx.beginPath();
-    ctx.moveTo(0, snapToV(axisTop, dpr));
-    ctx.lineTo(this.chartRight, snapToV(axisTop, dpr));
-    ctx.stroke();
+    // No fill, no border — the chart background shows through seamlessly.
 
     ctx.font = '11px -apple-system, Segoe UI, Roboto, sans-serif';
     ctx.fillStyle = this.theme.axisText;

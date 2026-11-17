@@ -4,12 +4,42 @@
 >
 > Pixel-perfect rendering, 14 drawing tools, fully custom indicators via API — you bring the data, the UI, and the indicators. BADI-CHARTS-V2 renders the chart.
 
-[![Version](https://img.shields.io/badge/version-2.20.7-2962ff.svg)](#)
+[![Version](https://img.shields.io/badge/version-2.20.8-2962ff.svg)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-26a69a.svg)](LICENSE)
 [![No Dependencies](https://img.shields.io/badge/dependencies-zero-ff9800.svg)](#)
 [![Headless](https://img.shields.io/badge/UI-headless-9c27b0.svg)](#)
 
 ---
+
+## 🛠 v2.20.8 — Lightweight-Charts-style axes (no borders, no separate bg)
+
+**User request.** "لا يعجبني المحاور ضعهم مثل محور المكتبة الخفيفة" — make the
+axes look like TradingView Lightweight Charts.
+
+**Before.** The price axis had a separate background fill (`axisBg`) and a
+visible vertical border line (`axisBorder`) separating it from the chart.
+The time axis had the same — a separate fill + a horizontal border line on
+top. This created two visually distinct "panels" (chart + axis), which the
+user found heavy.
+
+**After.** Both fills and both border lines are REMOVED. Now:
+- The chart's own background (`theme.bg`, drawn full-canvas in
+  `drawBackground()`) extends seamlessly into the axis strips.
+- No vertical line between the chart and the price axis.
+- No horizontal line between the chart and the time axis.
+- The tick labels (price on the right, time at the bottom) float directly
+  on the chart background — exactly the clean, minimal look of
+  TradingView Lightweight Charts.
+
+The crosshair labels, current-price label, and countdown still have their
+solid backgrounds (so they remain readable on top of the chart). Only the
+AXIS FRAME (border + fill) was removed.
+
+Same fix applied to the 2D edition (`chart.js` v2.18.12).
+
+Verified: all prior suites (79 WebGL + 42 momentum + 122 countdown +
+18 time-marks + v2.16/v2.17/v2.18) still green. Visual check confirms
+the chart↔axis boundary pixels are fully transparent (no border line).
 
 ## 🛠 v2.20.7 — Crosshair label REPLACES the axis mark at its position
 
