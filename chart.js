@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.18.8 — Pixel-Perfect Pure JavaScript Trading Chart Library
+ * BADI-CHARTS-V2 v2.18.9 — Pixel-Perfect Pure JavaScript Trading Chart Library
  *
  * A lightweight, dependency-free candlestick charting library built entirely
  * with the HTML5 Canvas API. Inspired by TradingView Lightweight Charts.
@@ -378,7 +378,7 @@ var Path2D = (typeof window !== 'undefined' && window.Path2D)
     })();
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.18.8';
+const VERSION = '2.18.9';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 // v2.14.0 (audit #12): tracks the chart the user last hovered/touched, so
 // window-level keyboard shortcuts only apply to ONE chart on multi-chart pages.
@@ -5668,6 +5668,11 @@ class TradingChart {
 
   // v2.14.0: pane separators + grip handles, drawn AFTER drawPane() so the
   // pane background can never cover them (was inside drawGrid — audit #28).
+  // v2.20.5: the centered grip pill (gray rounded rect with 3 dots) was
+  // REMOVED at the user's request — dragging the separator line itself is
+  // sufficient and the dot was visual clutter. The line's color + thickness
+  // still change on hover/drag for feedback, and the 12px hit-test band
+  // (see _hitPaneSeparator) makes the whole line draggable.
   drawPaneSeparators() {
     if (this._panes.length === 0) return;
     const ctx = this.ctx;
@@ -5683,23 +5688,6 @@ class TradingChart {
       ctx.lineTo(this.W, sepY);
       ctx.stroke();
       ctx.lineWidth = 1;
-      // Centered grip pill on the divider (only on cursor tool so it doesn't
-      // distract while drawing). Default uses theme.textDim so it's visible
-      // against the dark background; on hover/drag it grows + turns accent.
-      if (this.activeTool === 'cursor') {
-        const gx = Math.floor(this.chartLeft + (this.chartRight - this.chartLeft) / 2);
-        const gy = Math.floor(pane.top);
-        const gw = active ? 44 : 38, gh = active ? 6 : 5;
-        ctx.fillStyle = active ? this.theme.accent : this.theme.textDim;
-        this._roundRect(gx - gw / 2, gy - gh / 2, gw, gh, 2);
-        ctx.fill();
-        // Three little dots inside the pill for the classic "grip" look.
-        ctx.fillStyle = this.theme.bg;
-        ctx.beginPath();
-        ctx.arc(gx - 7, gy, 0.9, 0, Math.PI * 2); ctx.fill();
-        ctx.arc(gx,     gy, 0.9, 0, Math.PI * 2); ctx.fill();
-        ctx.arc(gx + 7, gy, 0.9, 0, Math.PI * 2); ctx.fill();
-      }
     }
   }
 

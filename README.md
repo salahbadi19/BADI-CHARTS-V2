@@ -4,12 +4,30 @@
 >
 > Pixel-perfect rendering, 14 drawing tools, fully custom indicators via API — you bring the data, the UI, and the indicators. BADI-CHARTS-V2 renders the chart.
 
-[![Version](https://img.shields.io/badge/version-2.20.4-2962ff.svg)](#)
+[![Version](https://img.shields.io/badge/version-2.20.5-2962ff.svg)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-26a69a.svg)](LICENSE)
 [![No Dependencies](https://img.shields.io/badge/dependencies-zero-ff9800.svg)](#)
 [![Headless](https://img.shields.io/badge/UI-headless-9c27b0.svg)](#)
 
 ---
+
+## 🛠 v2.20.5 — Removed the gray grip pill from pane separators
+
+**User request.** The centered gray pill (rounded rect with 3 dots) on each
+pane separator was visual clutter — dragging the separator LINE itself is
+sufficient and more intuitive.
+
+**Fix.** `drawPaneSeparators()` no longer draws the pill. The separator
+line's color (`axisBorder` vs `toolbarBorder`) and thickness (1.5 vs 1)
+still change on hover/drag for feedback, and the 12-pixel hit-test band
+(`_hitPaneSeparator`: `pane.top ± 6px`) makes the whole line draggable
+across its full width — so removing the pill doesn't affect usability,
+only appearance.
+
+Same fix applied to the 2D edition (`chart.js` v2.18.9).
+
+Verified: all prior suites (79 WebGL + 42 momentum + 122 countdown +
+18 time-marks + v2.16/v2.17/v2.18) still green.
 
 ## 🛠 v2.20.4 — Time axis no longer "jumps" when a new candle appears
 
