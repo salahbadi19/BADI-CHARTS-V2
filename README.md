@@ -4,12 +4,48 @@
 >
 > Pixel-perfect rendering, 14 drawing tools, fully custom indicators via API — you bring the data, the UI, and the indicators. BADI-CHARTS-V2 renders the chart.
 
-[![Version](https://img.shields.io/badge/version-2.20.5-2962ff.svg)](#)
+[![Version](https://img.shields.io/badge/version-2.20.6-2962ff.svg)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-26a69a.svg)](LICENSE)
 [![No Dependencies](https://img.shields.io/badge/dependencies-zero-ff9800.svg)](#)
 [![Headless](https://img.shields.io/badge/UI-headless-9c27b0.svg)](#)
 
 ---
+
+## 🛠 v2.20.6 — No more jumbled numbers on the price/time axes
+
+**Bug.** The user reported that the price axis, the time axis, the current-price
+line label, and the crosshair labels were all overlapping each other — "الارقام
+متداخلة ببعضها ومشوشة" (numbers jumbled on top of each other and confusing).
+
+**Two root causes:**
+
+1. **Price axis labels had no collision detection.** `drawPriceAxis()` drew
+   every mark whose Y was in `[priceTop, priceBottom]`. On a tall chart with
+   a tight price range, marks could be ~10px apart — their 11px-font labels
+   overlapped each other, producing the jumbled stack. The time axis already
+   had X-based collision detection; the price axis didn't.
+
+2. **Current-price label vs. crosshair price label.** Both labels sat at
+   `chartRight + 1` on the price axis. The current-price label was at the
+   last close's Y; the crosshair label at the cursor's Y. When the cursor
+   was near the last close (within ~18px), the two colored rects partially
+   covered each other and their numbers interlocked.
+
+**Fix:**
+
+1. `drawPriceAxis()` now skips any mark whose Y is within 12px of the
+   previous drawn mark's Y — same collision-detection pattern as the time
+   axis. Per-pane scale labels get the same treatment.
+
+2. `drawCurrentPriceLine()` now skips the LABEL (but still draws the dashed
+   line) when the crosshair is active and its Y is within ~22px of the last
+   close. The crosshair label (drawn AFTER, with a solid background) takes
+   precedence — same convention as TradingView.
+
+Same fixes applied to the 2D edition (`chart.js` v2.18.10).
+
+Verified: all prior suites (79 WebGL + 42 momentum + 122 countdown +
+18 time-marks + v2.16/v2.17/v2.18) still green.
 
 ## 🛠 v2.20.5 — Removed the gray grip pill from pane separators
 

@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.18.9 — Pixel-Perfect Pure JavaScript Trading Chart Library
+ * BADI-CHARTS-V2 v2.18.10 — Pixel-Perfect Pure JavaScript Trading Chart Library
  *
  * A lightweight, dependency-free candlestick charting library built entirely
  * with the HTML5 Canvas API. Inspired by TradingView Lightweight Charts.
@@ -378,7 +378,7 @@ var Path2D = (typeof window !== 'undefined' && window.Path2D)
     })();
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.18.9';
+const VERSION = '2.18.10';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 // v2.14.0 (audit #12): tracks the chart the user last hovered/touched, so
 // window-level keyboard shortcuts only apply to ONE chart on multi-chart pages.
@@ -6972,6 +6972,13 @@ class TradingChart {
     const y = this.priceToY(last.close);
     // Only draw if the price line is within the visible price area
     if (y < this.priceTop - 2 || y > this.priceBottom + 2) return;
+    // v2.20.6: skip the LABEL (but still draw the dashed line) when the
+    // crosshair is active and its Y is within ~22px of the last close.
+    // Before, the current-price label and the crosshair price label both
+    // sat at chartRight+1 and overlapped each other when the cursor was
+    // near the last close. Now the crosshair label takes precedence.
+    const crosshairNear = this.mouseInside && this.crosshairIndex !== null &&
+                          Math.abs(this.mouseY - y) < 22;
     const isBull = last.close >= last.open;
     const color = isBull ? this.theme.currentPriceBull : this.theme.currentPriceBear;
     // Dashed line across the chart (stops at chartRight)
@@ -6984,6 +6991,7 @@ class TradingChart {
     ctx.lineTo(this.chartRight, ys);
     ctx.stroke();
     ctx.setLineDash([]);
+    if (crosshairNear) return;   // v2.20.6: let the crosshair label show alone
     // v2.3.1: Price label ON the price axis (chartRight + 1) — this is where it
     // belongs: the axis is "connected to the chart" and the price label sits on it.
     const txt = this.priceScale.formatLogical(last.close);
@@ -7113,23 +7121,33 @@ class TradingChart {
     ctx.fillStyle = this.theme.axisText;
     ctx.textBaseline = 'middle';
     ctx.textAlign = 'left';
+    // v2.20.6: Y-based collision detection for price marks — skip any mark
+    // whose Y is within 12px of the previous drawn mark. Prevents the
+    // jumbled "numbers on top of numbers" when marks are dense.
     const marks = this.priceScale.marks();
+    let prevDrawnY = -Infinity;
     for (const m of marks) {
       const y = this.priceTop + m.coord;
       if (y < this.priceTop - 1 || y > this.priceBottom + 1) continue;
+      if (y - prevDrawnY < 12) continue;   // v2.20.6: collision detection
       ctx.fillText(m.label, this.chartRight + 6, Math.floor(y));
+      prevDrawnY = y;
     }
 
     // v2.13.0: Per-pane scale labels — same axis strip, beside each pane's
     // region. Each pane has its own scale (RSI 0..100, MACD -∞..+∞, ...), so
     // the labels in the strip change as you cross a pane boundary.
+    // v2.20.6: same Y-based collision detection per pane.
     for (const pane of this._panes) {
       if (!pane.scale || !(pane.bottom > pane.top)) continue;
       ctx.fillStyle = this.theme.axisText;
+      let prevPaneY = -Infinity;
       for (const m of pane.scale.marks()) {
         const y = pane.top + m.coord;
         if (y < pane.top + 7 || y > pane.bottom - 5) continue;
+        if (y - prevPaneY < 12) continue;   // v2.20.6: collision detection
         ctx.fillText(m.label, this.chartRight + 6, Math.floor(y));
+        prevPaneY = y;
       }
     }
   }
