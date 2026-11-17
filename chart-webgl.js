@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.20.1 — WEBGL EDITION (chart-webgl.js)
+ * BADI-CHARTS-V2 v2.20.2 — WEBGL EDITION (chart-webgl.js)
  * The complete standalone trading chart library, rendered with real WebGL.
  *
  * THIS FILE IS A FULL LIBRARY, NOT A LAYER. Load it INSTEAD of chart.js —
@@ -385,7 +385,7 @@
 'use strict';
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.20.1';
+const VERSION = '2.20.2';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 // v2.14.0 (audit #12): tracks the chart the user last hovered/touched, so
 // window-level keyboard shortcuts only apply to ONE chart on multi-chart pages.
@@ -8932,15 +8932,21 @@ class TradingChart {
   //
   // v2.20.1 FIX: 'auto' used to switch to a CLOCK string ("1:05", "23:59")
   // when remaining > 60s — that's 3–4 digits + a colon, breaking the
-  // "2-digit number" promise from v2.13.0. Now 'auto' picks the LARGEST
-  // unit whose max value (i.e. the full timeframe period expressed in that
-  // unit) still fits in 2 digits — so the countdown ALWAYS renders as
-  // exactly 2 digits, with a useful range:
-  //   tf < 100s           → seconds (e.g. tf=30s → "30".."00")
-  //   tf < 100m            → minutes  (e.g. tf=1h → "60".."00", tf=5m → "05".."00")
-  //   tf < 100h            → hours    (e.g. tf=4h → "04".."00", tf=1d → "24".."00")
-  //   tf < 100d            → days     (e.g. tf=1w → "07".."00")
-  //   else                 → weeks    (e.g. tf=1M → "04".."00")
+  // "2-digit number" promise from v2.13.0.
+  //
+  // v2.20.2 FIX: v2.20.1 picked the unit from the TIMEFRAME (tfSec), so when
+  // the last candle was future-dated (misaligned feed, or a feed that emits
+  // the next candle ahead of time), remainingSec could exceed tfSec and the
+  // clamp at 99 fired — the countdown pinned at "99" for the whole period.
+  // Now 'auto' picks the unit from remainingSec DIRECTLY: the largest unit
+  // whose value still fits in 2 digits. So as remaining decreases, the unit
+  // gracefully drops (weeks→days→hours→minutes→seconds) but the DISPLAY is
+  // always exactly 2 digits, never a clamped "99":
+  //   < 100s        → seconds (e.g. "59", "07", "00")
+  //   < 100 min     → minutes  (e.g. "60", "30", "01")
+  //   < 100 hours   → hours    (e.g. "23", "04", "01")
+  //   < 100 days    → days     (e.g. "30", "07", "01")
+  //   else          → weeks    (clamped at 99 — only for 2+ year candles)
   // Explicit formats still supported: 'hh:mm' | 'mm:ss' | 'ss' | 'hh' | 'mm'.
   drawCountdown(now) {
     if (!this._countdown || !this._countdown.enabled) return;
@@ -8960,25 +8966,21 @@ class TradingChart {
     const fmt = this._countdown.format || 'auto';
     let text;
     if (fmt === 'auto') {
-      // v2.20.1: pick the largest unit whose FULL-PERIOD value fits in 2 digits.
-      // tfSec is the full candle period in seconds; we find a unit u such that
-      // tfSec/u < 100, then display remainingSec/u clamped at 99 (defensive —
-      // can't normally happen because tfSec/u < 100 implies remainingSec/u < 100).
-      const tfSec = Math.max(1, Math.round(tfMs / 1000));
-      if (tfSec < 100) {
-        // sub-100s timeframes → seconds (1s, 5s, 10s, 30s, 45s, 60s, 90s)
-        text = pad2(Math.min(99, remainingSec));
-      } else if (tfSec < 6000) {
-        // 100s..99m → minutes (1m, 5m, 15m, 30m, 45m, 60m=1h, 90m, 99m)
-        text = pad2(Math.min(99, Math.floor(remainingSec / 60)));
-      } else if (tfSec < 360000) {
-        // 100m..99h → hours (2h, 4h, 6h, 12h, 23h, 1d, 2d, 4d)
-        text = pad2(Math.min(99, Math.floor(remainingSec / 3600)));
-      } else if (tfSec < 8640000) {
-        // 100h..99d → days (1w, 2w, 1M)
-        text = pad2(Math.min(99, Math.floor(remainingSec / 86400)));
+      // v2.20.2: pick the largest unit whose value fits in 2 digits, based on
+      // the ACTUAL remaining time (not the timeframe). This way a misaligned
+      // feed that puts the last candle in the future can't pin the countdown
+      // at "99" — it gracefully shows the right unit (e.g. "03" hours for a
+      // 3-hour-out close on an H1 chart).
+      if (remainingSec < 100) {
+        text = pad2(remainingSec);
+      } else if (remainingSec < 6000) {
+        text = pad2(Math.floor(remainingSec / 60));
+      } else if (remainingSec < 360000) {
+        text = pad2(Math.floor(remainingSec / 3600));
+      } else if (remainingSec < 8640000) {
+        text = pad2(Math.floor(remainingSec / 86400));
       } else {
-        // 100d+ → weeks (3M, 6M, 1Y)
+        // 100+ days → weeks. Clamp at 99 (only fires for 2+ year candles).
         text = pad2(Math.min(99, Math.floor(remainingSec / 604800)));
       }
     } else if (fmt === 'hh:mm') {

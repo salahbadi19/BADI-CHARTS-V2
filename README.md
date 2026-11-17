@@ -4,12 +4,42 @@
 >
 > Pixel-perfect rendering, 14 drawing tools, fully custom indicators via API — you bring the data, the UI, and the indicators. BADI-CHARTS-V2 renders the chart.
 
-[![Version](https://img.shields.io/badge/version-2.20.1-2962ff.svg)](#)
+[![Version](https://img.shields.io/badge/version-2.20.2-2962ff.svg)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-26a69a.svg)](LICENSE)
 [![No Dependencies](https://img.shields.io/badge/dependencies-zero-ff9800.svg)](#)
 [![Headless](https://img.shields.io/badge/UI-headless-9c27b0.svg)](#)
 
 ---
+
+## 🛠 v2.20.2 — Countdown no longer pins at "99"
+
+**Bug.** v2.20.1's `auto` format picked the display unit (seconds / minutes /
+hours / days / weeks) based on the **timeframe** (`tfSec`). So when the last
+candle's `time` was in the future (a misaligned feed, a feed that emits the
+next candle ahead of time, or simply a clock skew), `remainingSec` could
+exceed `tfSec` and the `Math.min(99, …)` clamp fired — the countdown pinned
+at "99" for the whole period.
+
+**Fix.** `auto` now picks the unit from `remainingSec` DIRECTLY: the largest
+unit whose value still fits in 2 digits. The display is always exactly 2
+digits, and the unit gracefully steps down (weeks → days → hours → minutes →
+seconds) as the countdown progresses:
+
+| remaining time | unit | example |
+|---|---|---|
+| < 100 s | seconds | "59".."00" |
+| < 100 min | minutes | "60".."00" |
+| < 100 hours | hours | "23".."00" |
+| < 100 days | days | "30".."00" |
+| 100+ days | weeks | "99".."00" (clamp fires only for 2+ year candles) |
+
+So an H1 chart with a candle 2 hours in the future now shows "03" (hours)
+instead of "99" (clamped minutes). Same fix applied to the 2D edition
+(`chart.js` v2.18.6).
+
+Verified: 122-check countdown regression suite passes for both editions —
+including 5 future-dated scenarios (1m/5m/1h/1d, offsets up to 50 days)
+that all produce a real value, never the "99" clamp.
 
 ## 🛠 v2.20.1 — Countdown fix (2 digits + actually ticking)
 

@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.18.5 — Pixel-Perfect Pure JavaScript Trading Chart Library
+ * BADI-CHARTS-V2 v2.18.6 — Pixel-Perfect Pure JavaScript Trading Chart Library
  *
  * A lightweight, dependency-free candlestick charting library built entirely
  * with the HTML5 Canvas API. Inspired by TradingView Lightweight Charts.
@@ -378,7 +378,7 @@ var Path2D = (typeof window !== 'undefined' && window.Path2D)
     })();
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.18.5';
+const VERSION = '2.18.6';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 // v2.14.0 (audit #12): tracks the chart the user last hovered/touched, so
 // window-level keyboard shortcuts only apply to ONE chart on multi-chart pages.
@@ -7013,10 +7013,13 @@ class TradingChart {
   //
   // v2.20.1 FIX: 'auto' used to switch to a CLOCK string ("1:05", "23:59")
   // when remaining > 60s — that's 3–4 digits + a colon, breaking the
-  // "2-digit number" promise from v2.13.0. Now 'auto' picks the LARGEST
-  // unit whose max value (i.e. the full timeframe period expressed in that
-  // unit) still fits in 2 digits — so the countdown ALWAYS renders as
-  // exactly 2 digits. See chart-webgl.js drawCountdown for the full table.
+  // "2-digit number" promise from v2.13.0.
+  //
+  // v2.20.2 FIX: v2.20.1 picked the unit from the TIMEFRAME (tfSec), so a
+  // future-dated last candle made remainingSec exceed tfSec → clamp fired →
+  // countdown pinned at "99". Now 'auto' picks the unit from remainingSec
+  // DIRECTLY — always 2 digits, never a clamped "99". See chart-webgl.js
+  // drawCountdown for the full table.
   drawCountdown(now) {
     if (!this._countdown || !this._countdown.enabled) return;
     const candles = this.sim.candles;
@@ -7035,16 +7038,16 @@ class TradingChart {
     const fmt = this._countdown.format || 'auto';
     let text;
     if (fmt === 'auto') {
-      // v2.20.1: pick the largest unit whose FULL-PERIOD value fits in 2 digits.
-      const tfSec = Math.max(1, Math.round(tfMs / 1000));
-      if (tfSec < 100) {
-        text = pad2(Math.min(99, remainingSec));
-      } else if (tfSec < 6000) {
-        text = pad2(Math.min(99, Math.floor(remainingSec / 60)));
-      } else if (tfSec < 360000) {
-        text = pad2(Math.min(99, Math.floor(remainingSec / 3600)));
-      } else if (tfSec < 8640000) {
-        text = pad2(Math.min(99, Math.floor(remainingSec / 86400)));
+      // v2.20.2: pick the largest unit whose value fits in 2 digits, based on
+      // the ACTUAL remaining time (not the timeframe).
+      if (remainingSec < 100) {
+        text = pad2(remainingSec);
+      } else if (remainingSec < 6000) {
+        text = pad2(Math.floor(remainingSec / 60));
+      } else if (remainingSec < 360000) {
+        text = pad2(Math.floor(remainingSec / 3600));
+      } else if (remainingSec < 8640000) {
+        text = pad2(Math.floor(remainingSec / 86400));
       } else {
         text = pad2(Math.min(99, Math.floor(remainingSec / 604800)));
       }
