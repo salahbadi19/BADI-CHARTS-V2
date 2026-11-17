@@ -4,12 +4,48 @@
 >
 > Pixel-perfect rendering, 14 drawing tools, fully custom indicators via API — you bring the data, the UI, and the indicators. BADI-CHARTS-V2 renders the chart.
 
-[![Version](https://img.shields.io/badge/version-2.20.3-2962ff.svg)](#)
+[![Version](https://img.shields.io/badge/version-2.20.4-2962ff.svg)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-26a69a.svg)](LICENSE)
 [![No Dependencies](https://img.shields.io/badge/dependencies-zero-ff9800.svg)](#)
 [![Headless](https://img.shields.io/badge/UI-headless-9c27b0.svg)](#)
 
 ---
+
+## 🛠 v2.20.4 — Time axis no longer "jumps" when a new candle appears
+
+**Bug.** When a new candle was appended at the live edge (real-time feed),
+the time axis labels AND the vertical gridlines suddenly JUMPED by
+`stepInBars` bars (e.g. 10 bars at once) instead of gliding smoothly by 1.
+The user saw this as a "strange movement" in `محور الزمن وخطوط الزمن`
+(the time axis and time gridlines) every time a new candle appeared.
+
+**Root cause.** `getTimeMarks()` anchored marks to an INDEX multiple:
+`startMark = ceil(firstIdx / stepInBars) * stepInBars`. When a new candle
+was appended at the live edge, `firstIdx` shifted by 1 (the view scrolled
+by 1 bar). If `firstIdx` crossed a `stepInBars` boundary, ALL marks
+suddenly jumped to the next multiple — a `stepInBars`-bar shift in one
+frame.
+
+**Fix.** Marks are now anchored to natural **TIME boundaries** (epoch
+multiples of a "nice" seconds step: 1m / 5m / 15m / 30m / 1h / 2h / 4h /
+6h / 12h / 1d / 2d / 1w / 2w / 1M / 3M / 6M / 1Y). The mark TIMES don't
+depend on which candle is visible, so as the chart scrolls (or new
+candles appear), the marks glide smoothly by 1 bar per candle instead of
+jumping in `stepInBars` chunks. The mark INDEX is computed AFTER the fact
+(`idx = (markTime - firstCandleTime) / tfSec`) so `indexToX(idx)` still
+positions the label correctly — and the index can be fractional, letting
+a mark sit BETWEEN two candles when `stepSec` isn't a multiple of `tfSec`
+(e.g. 15-min marks on a 7-min chart).
+
+Same fix applied to the 2D edition (`chart.js` v2.18.8).
+
+Verified: a new regression test appends a candle at the live edge and
+confirms:
+- All pre-existing mark TIMES are preserved (marks are TIME-anchored).
+- Marks' X positions shift by exactly 1 bar (smooth scroll), not by
+  `stepInBars` bars (jarring jump).
+All prior suites (79 WebGL + 42 momentum + 122 countdown + v2.16/v2.17/v2.18)
+still green.
 
 ## 🛠 v2.20.3 — Countdown no longer "stuck" when rAF is throttled
 

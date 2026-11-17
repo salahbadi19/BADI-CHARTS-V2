@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.18.7 — Pixel-Perfect Pure JavaScript Trading Chart Library
+ * BADI-CHARTS-V2 v2.18.8 — Pixel-Perfect Pure JavaScript Trading Chart Library
  *
  * A lightweight, dependency-free candlestick charting library built entirely
  * with the HTML5 Canvas API. Inspired by TradingView Lightweight Charts.
@@ -378,7 +378,7 @@ var Path2D = (typeof window !== 'undefined' && window.Path2D)
     })();
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.18.7';
+const VERSION = '2.18.8';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 // v2.14.0 (audit #12): tracks the chart the user last hovered/touched, so
 // window-level keyboard shortcuts only apply to ONE chart on multi-chart pages.
@@ -4193,30 +4193,37 @@ class TradingChart {
     const visibleBars = Math.ceil((this.chartRight - this.chartLeft) / this.barSpacing);
     const firstIdx = Math.floor(this.xToIndex(this.chartLeft));
     const lastIdx = Math.ceil(this.xToIndex(this.chartRight));
-    // v2.15.0: pick the step from NICE numbers. The old loop only doubled
-    // (step = 1, 2, 4, 8, 16…) so labels landed at awkward bar counts and the
-    // niceSteps array right below was dead code. The step is in BARS; since
-    // one bar = one timeframe, index multiples stay time-aligned for regular
-    // (exchange) data.
-    const targetMarks = 10;
-    let step = Math.max(1, Math.ceil(visibleBars / targetMarks));
-    const niceSteps = [1, 2, 3, 5, 10, 15, 20, 30, 60, 120, 240, 300, 480, 600,
-                       960, 1200, 1920, 2400, 3840, 4800];
-    let stepInBars = niceSteps.find(n => n >= step);
-    if (stepInBars == null) {
-      stepInBars = Math.ceil(step / 4800) * 4800;   // beyond the table: keep rounding to multiples of 4800
-    }
-    // Build marks
+    const tfSec = (this.timeframe.ms || 60000) / 1000;
+    // v2.20.4: TIME-ANCHORED marks (was INDEX-anchored). When a new candle
+    // was appended at the live edge, the old INDEX-anchored formula
+    // (startMark = ceil(firstIdx / stepInBars) * stepInBars) caused ALL marks
+    // to suddenly jump by `stepInBars` bars whenever firstIdx crossed a step
+    // boundary — visible as a jarring "strange movement" in the time axis +
+    // vertical gridlines. Now marks are anchored to natural TIME boundaries
+    // (epoch multiples of a "nice" seconds step), so they glide smoothly by
+    // 1 bar per new candle. See chart-webgl.js getTimeMarks for the full
+    // rationale + the nice-time-step table.
+    const firstTime = this._timeAtIndex(firstIdx);
+    const lastTime = this._timeAtIndex(lastIdx);
+    const spanSec = Math.max(1, lastTime - firstTime);
+    const niceTimeSteps = [
+      60, 120, 300, 900, 1800, 3600, 7200, 14400, 21600, 43200,
+      86400, 172800, 604800, 1209600, 2592000, 7776000, 15552000, 31536000
+    ];
+    const targetStepSec = spanSec / 10;
+    let stepSec = niceTimeSteps.find(s => s >= targetStepSec);
+    if (!stepSec) stepSec = Math.ceil(targetStepSec / 31536000) * 31536000;
+    if (stepSec < tfSec) stepSec = tfSec;
+    const startMarkTime = Math.ceil(firstTime / stepSec) * stepSec;
     const marks = [];
-    const startMark = Math.ceil(firstIdx / stepInBars) * stepInBars;
-    for (let i = startMark; i <= lastIdx; i += stepInBars) {
-      const t = this._timeAtIndex(i);
+    const firstCandleTime = this.sim.candles.length > 0 ? this.sim.candles[0].time : 0;
+    for (let t = startMarkTime; t <= lastTime + stepSec; t += stepSec) {
       if (t <= 0) continue;
-      // Assign weight based on time boundaries
-      const tfSec = this.timeframe.ms / 1000;
+      const idx = (t - firstCandleTime) / tfSec;
+      if (idx < firstIdx - 1 || idx > lastIdx + 1) continue;
       const prevT = t - tfSec;
       const w = assignTimeWeight(prevT, t);
-      marks.push({index: i, time: t, weight: w});
+      marks.push({ index: idx, time: t, weight: w });
     }
     this._timeMarksCache = marks;
     return marks;

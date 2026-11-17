@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.20.3 — WEBGL EDITION (chart-webgl.js)
+ * BADI-CHARTS-V2 v2.20.4 — WEBGL EDITION (chart-webgl.js)
  * The complete standalone trading chart library, rendered with real WebGL.
  *
  * THIS FILE IS A FULL LIBRARY, NOT A LAYER. Load it INSTEAD of chart.js —
@@ -385,7 +385,7 @@
 'use strict';
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.20.3';
+const VERSION = '2.20.4';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 // v2.14.0 (audit #12): tracks the chart the user last hovered/touched, so
 // window-level keyboard shortcuts only apply to ONE chart on multi-chart pages.
@@ -6008,30 +6008,69 @@ class TradingChart {
     const visibleBars = Math.ceil((this.chartRight - this.chartLeft) / this.barSpacing);
     const firstIdx = Math.floor(this.xToIndex(this.chartLeft));
     const lastIdx = Math.ceil(this.xToIndex(this.chartRight));
-    // v2.15.0: pick the step from NICE numbers. The old loop only doubled
-    // (step = 1, 2, 4, 8, 16…) so labels landed at awkward bar counts and the
-    // niceSteps array right below was dead code. The step is in BARS; since
-    // one bar = one timeframe, index multiples stay time-aligned for regular
-    // (exchange) data.
-    const targetMarks = 10;
-    let step = Math.max(1, Math.ceil(visibleBars / targetMarks));
-    const niceSteps = [1, 2, 3, 5, 10, 15, 20, 30, 60, 120, 240, 300, 480, 600,
-                       960, 1200, 1920, 2400, 3840, 4800];
-    let stepInBars = niceSteps.find(n => n >= step);
-    if (stepInBars == null) {
-      stepInBars = Math.ceil(step / 4800) * 4800;   // beyond the table: keep rounding to multiples of 4800
-    }
-    // Build marks
+    const tfSec = (this.timeframe.ms || 60000) / 1000;
+    // v2.20.4: TIME-ANCHORED marks (was INDEX-anchored before).
+    // The old code computed startMark = ceil(firstIdx / stepInBars) * stepInBars
+    // — a multiple of stepInBars (an INDEX). When a new candle was appended
+    // at the live edge, the view scrolled left by 1 bar, firstIdx crossed a
+    // stepInBars boundary, and ALL marks suddenly jumped by `stepInBars`
+    // bars (e.g. 10 bars at once) — visible as a jarring "strange movement"
+    // in the time axis + vertical gridlines.
+    //
+    // Now marks are anchored to natural TIME boundaries (epoch multiples of
+    // a "nice" seconds step). The mark TIMES don't depend on which candle
+    // is visible, so as the chart scrolls (or new candles appear), the marks
+    // glide smoothly by 1 bar per candle instead of jumping in stepInBars
+    // chunks. The mark INDEX is computed AFTER the fact (time → fractional
+    // index) so indexToX(idx) still positions the label correctly.
+    const firstTime = this._timeAtIndex(firstIdx);
+    const lastTime = this._timeAtIndex(lastIdx);
+    const spanSec = Math.max(1, lastTime - firstTime);
+    // "Nice" time steps (in seconds) — natural boundaries a user expects:
+    // minutes → hours → days → weeks → months → years.
+    const niceTimeSteps = [
+      60,         // 1 min
+      120,        // 2 min
+      300,        // 5 min
+      900,        // 15 min
+      1800,       // 30 min
+      3600,       // 1 hour
+      7200,       // 2 hours
+      14400,      // 4 hours
+      21600,      // 6 hours
+      43200,      // 12 hours
+      86400,      // 1 day
+      172800,     // 2 days
+      604800,     // 1 week
+      1209600,    // 2 weeks
+      2592000,    // ~1 month
+      7776000,    // ~3 months
+      15552000,   // ~6 months
+      31536000    // 1 year
+    ];
+    const targetStepSec = spanSec / 10;   // aim for ~10 marks across the visible span
+    let stepSec = niceTimeSteps.find(s => s >= targetStepSec);
+    if (!stepSec) stepSec = Math.ceil(targetStepSec / 31536000) * 31536000;
+    // Step must be at least tfSec — otherwise marks would be denser than one
+    // per candle and labels would overlap.
+    if (stepSec < tfSec) stepSec = tfSec;
+    // First mark time >= firstTime, aligned to stepSec (epoch-anchored).
+    const startMarkTime = Math.ceil(firstTime / stepSec) * stepSec;
+    // Build marks. Each mark has a TIME and a (possibly fractional) INDEX.
+    // The index is what indexToX() uses to position the label; making it
+    // fractional lets a mark sit BETWEEN two candles when stepSec isn't a
+    // multiple of tfSec (e.g. 15-min marks on a 5-min chart align exactly,
+    // but 15-min marks on a 7-min chart fall between candles — which is the
+    // correct visual: the mark represents a time, not a candle).
     const marks = [];
-    const startMark = Math.ceil(firstIdx / stepInBars) * stepInBars;
-    for (let i = startMark; i <= lastIdx; i += stepInBars) {
-      const t = this._timeAtIndex(i);
+    const firstCandleTime = this.sim.candles.length > 0 ? this.sim.candles[0].time : 0;
+    for (let t = startMarkTime; t <= lastTime + stepSec; t += stepSec) {
       if (t <= 0) continue;
-      // Assign weight based on time boundaries
-      const tfSec = this.timeframe.ms / 1000;
+      const idx = (t - firstCandleTime) / tfSec;
+      if (idx < firstIdx - 1 || idx > lastIdx + 1) continue;
       const prevT = t - tfSec;
       const w = assignTimeWeight(prevT, t);
-      marks.push({index: i, time: t, weight: w});
+      marks.push({ index: idx, time: t, weight: w });
     }
     this._timeMarksCache = marks;
     return marks;
