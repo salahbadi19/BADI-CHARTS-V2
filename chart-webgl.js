@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.20.6 — WEBGL EDITION (chart-webgl.js)
+ * BADI-CHARTS-V2 v2.20.7 — WEBGL EDITION (chart-webgl.js)
  * The complete standalone trading chart library, rendered with real WebGL.
  *
  * THIS FILE IS A FULL LIBRARY, NOT A LAYER. Load it INSTEAD of chart.js —
@@ -385,7 +385,7 @@
 'use strict';
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.20.6';
+const VERSION = '2.20.7';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 // v2.14.0 (audit #12): tracks the chart the user last hovered/touched, so
 // window-level keyboard shortcuts only apply to ONE chart on multi-chart pages.
@@ -9099,6 +9099,16 @@ class TradingChart {
     ctx.fillStyle = this.theme.axisText;
     ctx.textBaseline = 'middle';
     ctx.textAlign = 'left';
+    // v2.20.7: when the crosshair is active and over the price area, SKIP
+    // marks that fall within the crosshair price label's Y range. Before,
+    // the axis mark at (or near) the cursor's Y was drawn separately from
+    // the crosshair label — even though the crosshair label's solid rect
+    // covered it, marks at the EDGE of the rect were partially visible,
+    // producing two numbers jumbled together. Now only ONE number shows at
+    // the cursor's Y: the crosshair label (drawn later, on top).
+    const chActive = this.mouseInside && this.crosshairIndex !== null;
+    const chY = (chActive && this.mouseY >= this.priceTop - 2 && this.mouseY <= this.priceBottom + 2)
+      ? this.mouseY : null;
     // v2.20.6: Y-based collision detection for price marks. The old code
     // drew every mark whose Y was in [priceTop, priceBottom] — on a tall
     // chart with a tight price range, marks were ~10px apart and their
@@ -9111,6 +9121,7 @@ class TradingChart {
       const y = this.priceTop + m.coord;
       if (y < this.priceTop - 1 || y > this.priceBottom + 1) continue;
       if (y - prevDrawnY < 12) continue;   // v2.20.6: collision detection
+      if (chY !== null && Math.abs(y - chY) < 14) continue;   // v2.20.7: crosshair label takes this slot
       ctx.fillText(m.label, this.chartRight + 6, Math.floor(y));
       prevDrawnY = y;
     }
@@ -9119,14 +9130,19 @@ class TradingChart {
     // region. Each pane has its own scale (RSI 0..100, MACD -∞..+∞, ...), so
     // the labels in the strip change as you cross a pane boundary.
     // v2.20.6: same Y-based collision detection per pane.
+    // v2.20.7: skip marks under the crosshair label when the cursor is in
+    // this pane's region.
     for (const pane of this._panes) {
       if (!pane.scale || !(pane.bottom > pane.top)) continue;
       ctx.fillStyle = this.theme.axisText;
+      const paneChY = (chActive && this.mouseY >= pane.top && this.mouseY <= pane.bottom)
+        ? this.mouseY : null;
       let prevPaneY = -Infinity;
       for (const m of pane.scale.marks()) {
         const y = pane.top + m.coord;
         if (y < pane.top + 7 || y > pane.bottom - 5) continue;
         if (y - prevPaneY < 12) continue;   // v2.20.6: collision detection
+        if (paneChY !== null && Math.abs(y - paneChY) < 14) continue;   // v2.20.7
         ctx.fillText(m.label, this.chartRight + 6, Math.floor(y));
         prevPaneY = y;
       }
@@ -9173,10 +9189,19 @@ class TradingChart {
     // — every label assumed 6px per char and either overlapped or wasted
     // space. Collision detection now uses the real measured width.
     const tzOpts = {locale: this._locale, timezone: this._timezone, hour12: this._hour12};
+    // v2.20.7: when the crosshair is active, SKIP time marks whose X is
+    // within ~45px of the crosshair's X. The crosshair time label (drawn
+    // later, with a solid background) takes the slot — only ONE time
+    // number shows at the cursor's X. Before, the axis mark at (or near)
+    // the cursor's X was drawn separately and could be partially visible
+    // at the edge of the crosshair label, creating two jumbled numbers.
+    const chActiveT = this.mouseInside && this.crosshairIndex !== null;
+    const chX = chActiveT ? this.indexToX(Math.round(this.crosshairIndex)) : null;
     let prevRightEdge = -Infinity;
     for (const m of marks) {
       const x = this.indexToX(m.index);
       if (x < this.chartLeft || x > this.chartRight) continue;
+      if (chX !== null && Math.abs(x - chX) < 45) continue;   // v2.20.7: crosshair label takes this slot
       // Use the time stored in the mark (works for past, present, and future)
       const label = formatTickMark(m.time, m.weight, this.timeframe.label, tzOpts);
       const labelW = ctx.measureText(label).width + 8;

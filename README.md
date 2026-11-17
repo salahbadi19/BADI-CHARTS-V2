@@ -4,12 +4,45 @@
 >
 > Pixel-perfect rendering, 14 drawing tools, fully custom indicators via API — you bring the data, the UI, and the indicators. BADI-CHARTS-V2 renders the chart.
 
-[![Version](https://img.shields.io/badge/version-2.20.6-2962ff.svg)](#)
+[![Version](https://img.shields.io/badge/version-2.20.7-2962ff.svg)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-26a69a.svg)](LICENSE)
 [![No Dependencies](https://img.shields.io/badge/dependencies-zero-ff9800.svg)](#)
 [![Headless](https://img.shields.io/badge/UI-headless-9c27b0.svg)](#)
 
 ---
+
+## 🛠 v2.20.7 — Crosshair label REPLACES the axis mark at its position
+
+**Bug.** v2.20.6 added collision detection between axis marks and hid the
+current-price label near the crosshair, but the user still saw jumbled
+numbers: "رقم محوري الفارة يختلط برقم محور الزمن والسعر" (the crosshair
+number mixes with the time-axis and price-axis numbers). The crosshair
+label's solid rect DID cover the axis mark directly underneath, but axis
+marks at the EDGE of the rect (within ~10–14px but not exactly at the
+cursor's Y/X) were still partially visible — two numbers side by side at
+nearly the same position.
+
+**Fix.** Now the axis marks themselves get out of the way:
+
+1. **Price axis**: `drawPriceAxis()` skips any mark whose Y is within **14px**
+   of the crosshair's Y (when the crosshair is active and over the price
+   area). Per-pane scale marks get the same treatment when the cursor is
+   in that pane. So at the cursor's Y, only ONE number shows — the
+   crosshair label (drawn later, on top).
+
+2. **Time axis**: `drawTimeAxis()` skips any mark whose X is within **45px**
+   of the crosshair's X (when the crosshair is active). So at the cursor's
+   X, only ONE time number shows — the crosshair time label.
+
+This is what the user meant by "اجعلهم يتحركو داخله لكي يكون نفس الارقام"
+(make them move inside it so it becomes the same numbers): the axis number
+vacates its slot when the crosshair label arrives, so there's never two
+numbers fighting for the same position.
+
+Same fix applied to the 2D edition (`chart.js` v2.18.11).
+
+Verified: all prior suites (79 WebGL + 42 momentum + 122 countdown +
+18 time-marks + v2.16/v2.17/v2.18) still green.
 
 ## 🛠 v2.20.6 — No more jumbled numbers on the price/time axes
 
