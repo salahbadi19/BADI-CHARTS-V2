@@ -4,12 +4,35 @@
 >
 > Pixel-perfect rendering, 14 drawing tools, fully custom indicators via API — you bring the data, the UI, and the indicators. BADI-CHARTS-V2 renders the chart.
 
-[![Version](https://img.shields.io/badge/version-2.20.8-2962ff.svg)](#)
+[![Version](https://img.shields.io/badge/version-2.20.9-2962ff.svg)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-26a69a.svg)](LICENSE)
 [![No Dependencies](https://img.shields.io/badge/dependencies-zero-ff9800.svg)](#)
 [![Headless](https://img.shields.io/badge/UI-headless-9c27b0.svg)](#)
 
 ---
+
+## 🛠 v2.20.9 — Restored axis border lines (user wanted the frame to stay)
+
+**User feedback.** v2.20.8 removed BOTH the axis background fill AND the
+border lines. The user clarified: "لا تنزع الحدود الإطار لماذا نزعته إطار
+المحور الزمني والسعري الي بين الشارت" — don't remove the border frame!
+The border between the chart and the time/price axes should stay.
+
+**Fix.** Restored the subtle border lines (`theme.axisBorder`, 1px) in
+both `drawPriceAxis()` (vertical line between chart and price axis) and
+`drawTimeAxis()` (horizontal line between chart and time axis). The
+seamless background (no separate `axisBg` fill — the chart's own `bg`
+extends into the axis strips) is KEPT from v2.20.8. So now:
+
+- ✓ Subtle border line between chart and price axis (restored)
+- ✓ Subtle border line between chart and time axis (restored)
+- ✓ No separate axis background fill (kept from v2.20.8 — seamless with chart bg)
+- ✓ Clean, minimal tick labels (kept from v2.20.8)
+
+Same fix applied to the 2D edition (`chart.js` v2.18.13).
+
+Verified: all prior suites (79 WebGL + 42 momentum + 122 countdown +
+18 time-marks + v2.16/v2.17/v2.18) still green.
 
 ## 🛠 v2.20.8 — Lightweight-Charts-style axes (no borders, no separate bg)
 

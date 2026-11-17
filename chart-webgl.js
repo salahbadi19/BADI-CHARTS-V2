@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.20.8 — WEBGL EDITION (chart-webgl.js)
+ * BADI-CHARTS-V2 v2.20.9 — WEBGL EDITION (chart-webgl.js)
  * The complete standalone trading chart library, rendered with real WebGL.
  *
  * THIS FILE IS A FULL LIBRARY, NOT A LAYER. Load it INSTEAD of chart.js —
@@ -385,7 +385,7 @@
 'use strict';
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.20.8';
+const VERSION = '2.20.9';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 // v2.14.0 (audit #12): tracks the chart the user last hovered/touched, so
 // window-level keyboard shortcuts only apply to ONE chart on multi-chart pages.
@@ -9078,15 +9078,23 @@ class TradingChart {
   }
 
   /* --------------------------- Price Axis -------------------------------- */
-  // v2.20.8: Lightweight-Charts-style axis — no separate background fill,
-  // no border line. Just the tick labels floating to the right of the chart,
-  // seamless with the chart background. The chart's own background (drawn in
-  // drawBackground) already covers the full canvas including the axis strip,
-  // so there's nothing to fill here.
+  // v2.20.8: Lightweight-Charts-style axis — no separate background fill
+  // (the chart bg extends seamlessly), but KEEP the subtle border line
+  // between the chart and the price axis (the user wants the frame to stay).
+  // v2.20.9: restored the border line that v2.20.8 removed.
   drawPriceAxis() {
     const ctx = this.ctx;
     const dpr = this.dpr;
-    // No fill, no border — the chart background shows through seamlessly.
+    // Subtle vertical border line between chart and price axis.
+    ctx.strokeStyle = this.theme.axisBorder;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    const axBorder = snapToH(this.chartRight, dpr);
+    ctx.moveTo(axBorder, this.chartTop);
+    ctx.lineTo(axBorder, this.chartBottom);
+    ctx.stroke();
+    ctx.lineWidth = 1;
+
     ctx.font = '11px -apple-system, Segoe UI, Roboto, sans-serif';
     ctx.fillStyle = this.theme.axisText;
     ctx.textBaseline = 'middle';
@@ -9158,13 +9166,20 @@ class TradingChart {
   }
 
   // v2.20.8: Lightweight-Charts-style time axis — no separate background
-  // fill, no top border line. Just the time labels floating below the chart,
-  // seamless with the chart background.
+  // fill, but KEEP the subtle top border line between chart and time axis.
+  // v2.20.9: restored the border line that v2.20.8 removed.
   drawTimeAxis() {
     const ctx = this.ctx;
     const dpr = this.dpr;
     const axisTop = this.layout.paneBottom || this.chartBottom;
-    // No fill, no border — the chart background shows through seamlessly.
+    // Subtle horizontal border line between chart and time axis.
+    ctx.strokeStyle = this.theme.axisBorder;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(0, snapToV(axisTop, dpr));
+    ctx.lineTo(this.chartRight, snapToV(axisTop, dpr));
+    ctx.stroke();
+    ctx.lineWidth = 1;
 
     ctx.font = '11px -apple-system, Segoe UI, Roboto, sans-serif';
     ctx.fillStyle = this.theme.axisText;
