@@ -378,7 +378,7 @@ var Path2D = (typeof window !== 'undefined' && window.Path2D)
     })();
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.18.3';
+const VERSION = '2.18.4';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 // v2.14.0 (audit #12): tracks the chart the user last hovered/touched, so
 // window-level keyboard shortcuts only apply to ONE chart on multi-chart pages.
@@ -1450,6 +1450,12 @@ class TradingChart {
     this._cacheHits = 0; this._cacheMisses = 0;  // debug counters
     this._momentumThreshold = 0.05; // px/ms — below this, momentum stops
     this._momentumMaxVelocity = 1.2; // px/ms cap so flicks never fly across the chart
+    // v2.20.0: Momentum only fires on FAST flicks that STARTED NEAR a chart
+    // edge — a small/slow drag in the middle of the chart now stops dead on
+    // release instead of drifting a few extra bars (which made the chart feel
+    // heavy even though it isn't). See _shouldStartMomentum().
+    this._momentumFastVelocity = 0.45; // px/ms ≈ 450 px/s — real flick, not a nudge
+    this._momentumEdgeRatio    = 0.20; // 20% of chart width from each side = edge zone
     // v2.12.0: Per-frame offscreen-rebuild budget — at most 2 indicators rebuild
     // their cached bitmap in a single frame. When many indicators all need a
     // rebuild at once (window resize, bulk data reset), the rest are deferred
@@ -3286,9 +3292,10 @@ class TradingChart {
     this._dragHandle = null;
     this._dragWhole = null;
     // v2.4.0+: Start momentum scrolling on touch release (if panning velocity is significant)
+    // v2.20.0: only if the flick was fast AND it started near a chart edge.
     if (this.isDragging) {
       this.isDragging = false;
-      if (Math.abs(this._panVelocity) > this._momentumThreshold) {
+      if (this._shouldStartMomentum(this.touchStartX)) {
         this._momentum = { velocity: this._panVelocity, lastTime: performance.now() };
       }
       this._panVelocity = 0;
@@ -3801,7 +3808,8 @@ class TradingChart {
     if (this.isDragging) {
       this.isDragging = false;
       // v2.4.0+: Start momentum scrolling if the pan velocity is significant
-      if (Math.abs(this._panVelocity) > this._momentumThreshold) {
+      // v2.20.0: only if the flick was fast AND it started near a chart edge.
+      if (this._shouldStartMomentum(this.dragStartX)) {
         this._momentum = { velocity: this._panVelocity, lastTime: performance.now() };
       }
       this._panVelocity = 0;
@@ -8181,6 +8189,32 @@ class TradingChart {
     if (this._indCache2) this._indCache2.clear();
     this.markers = [];
     this._destroyed = true;
+  }
+  // v2.20.0: Decide whether the just-ended pan should coast (inertia) or stop
+  // dead. The chart only coasts when BOTH are true:
+  //   1. The release velocity exceeds _momentumFastVelocity (a real flick, not
+  //      a slow reposition). The old code only checked _momentumThreshold
+  //      (0.05 px/ms ≈ 50 px/s) so even a slow drag drifted a few extra bars,
+  //      which read as "the chart is heavy".
+  //   2. The drag STARTED inside one of the edge zones — the leftmost or
+  //      rightmost _momentumEdgeRatio of the chart area. A drag that started
+  //      in the center is treated as a precise reposition and stops on release.
+  // startX is the canvas-space X where the drag began (dragStartX for mouse,
+  // touchStartX for touch).
+  _shouldStartMomentum(startX) {
+    const v = Math.abs(this._panVelocity);
+    if (v < this._momentumThreshold) return false;      // baseline: pointer basically still
+    if (v < this._momentumFastVelocity) return false;   // must be a real flick
+    if (startX === undefined || startX === null) return false;
+    const left = this.chartLeft  || 0;
+    const right = this.chartRight || (this.W || 0);
+    const w = right - left;
+    if (w <= 0) return false;                            // layout not ready yet
+    const edge = w * this._momentumEdgeRatio;
+    const xRel = startX - left;
+    if (xRel < 0 || xRel > w) return false;              // started outside the chart area
+    // Edge zone = first `edge` px OR last `edge` px of the chart area.
+    return (xRel <= edge) || (xRel >= w - edge);
   }
   // v2.4.0+: Apply momentum scrolling. Called every frame from the render loop.
   // Moves the chart by velocity * deltaTime, then applies friction. Stops when

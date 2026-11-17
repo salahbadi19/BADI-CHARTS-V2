@@ -4,12 +4,43 @@
 >
 > Pixel-perfect rendering, 14 drawing tools, fully custom indicators via API — you bring the data, the UI, and the indicators. BADI-CHARTS-V2 renders the chart.
 
-[![Version](https://img.shields.io/badge/version-2.19.2-2962ff.svg)](#)
+[![Version](https://img.shields.io/badge/version-2.20.0-2962ff.svg)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-26a69a.svg)](LICENSE)
 [![No Dependencies](https://img.shields.io/badge/dependencies-zero-ff9800.svg)](#)
 [![Headless](https://img.shields.io/badge/UI-headless-9c27b0.svg)](#)
 
 ---
+
+## 🛠 v2.20.0 — Inertia (momentum scrolling) re-tuned
+
+**Problem.** The momentum/inertia after a pan used to fire for *any* drag whose
+release velocity was above `0.05 px/ms` (~50 px/s) — i.e. essentially every
+drag, including tiny slow repositions. A 3-pixel nudge could drift the chart a
+few extra bars after release, which read as *"the chart is heavy"*, even though
+the renderer itself was fast.
+
+**Fix.** Momentum now fires **only when BOTH** are true:
+
+1. **The flick was fast.** Release velocity must exceed `_momentumFastVelocity`
+   (0.45 px/ms ≈ 450 px/s) — a real flick, not a nudge.
+2. **The drag started near a chart edge.** The press-down X must be inside the
+   leftmost or rightmost `_momentumEdgeRatio` (20%) of the chart area. A drag
+   that started in the center is treated as a precise reposition and stops dead
+   on release, exactly like TradingView and Binance.
+
+Small/slow drags in the middle → no inertia → the chart feels light and
+responsive. Fast flicks from the edges still coast naturally with friction.
+
+The new gate lives in a single helper, `BadiCharts.prototype._shouldStartMomentum(startX)`,
+called from both `onMouseUp` and `onTouchEnd`. `_applyMomentum()` (the per-frame
+friction step) is unchanged. The same fix is applied to the 2D edition
+(`chart.js` v2.18.4) for parity.
+
+Tuning knobs (constructor, override per-instance if needed):
+```js
+chart._momentumFastVelocity = 0.45; // px/ms — flick gate (lower = easier to fling)
+chart._momentumEdgeRatio    = 0.20; // 0..0.5 — edge zone fraction from each side
+```
 
 ## 🛠 v2.19.2 — Alignment & Interaction Fixes (field-verified)
 
