@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.18.13 — Pixel-Perfect Pure JavaScript Trading Chart Library
+ * BADI-CHARTS-V2 v2.18.14 — Pixel-Perfect Pure JavaScript Trading Chart Library
  *
  * A lightweight, dependency-free candlestick charting library built entirely
  * with the HTML5 Canvas API. Inspired by TradingView Lightweight Charts.
@@ -378,7 +378,7 @@ var Path2D = (typeof window !== 'undefined' && window.Path2D)
     })();
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.18.13';
+const VERSION = '2.18.14';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 // v2.14.0 (audit #12): tracks the chart the user last hovered/touched, so
 // window-level keyboard shortcuts only apply to ONE chart on multi-chart pages.
@@ -7043,10 +7043,14 @@ class TradingChart {
     const last = candles[N - 1];
     if (!last || !last.time) return;
     const tfMs = this.timeframe.ms || 60000;
-    const candleCloseSec = last.time + Math.round(tfMs / 1000);
+    const tfSec = Math.round(tfMs / 1000);
+    const candleCloseSec = last.time + tfSec;
     const nowSec = Math.floor(Date.now() / 1000);   // v2.14.0: real Unix time
     let remainingSec = candleCloseSec - nowSec;
     if (remainingSec < 0) remainingSec = 0;
+    // v2.21.1: CLAMP remaining to tfSec - 1 so the countdown never shows
+    // more than the timeframe's natural max (e.g. 59 for 1m, not 63).
+    if (remainingSec >= tfSec) remainingSec = tfSec - 1;
     // v2.16.0 (#22d): the local `pad2` here shadowed the module-level helper
     // — same implementation, but the shadow was a code-smell flag in the
     // audit. Reusing the module helper; behavior is identical.

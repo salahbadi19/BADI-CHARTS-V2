@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.20.9 — WEBGL EDITION (chart-webgl.js)
+ * BADI-CHARTS-V2 v2.21.1 — WEBGL EDITION (chart-webgl.js)
  * The complete standalone trading chart library, rendered with real WebGL.
  *
  * THIS FILE IS A FULL LIBRARY, NOT A LAYER. Load it INSTEAD of chart.js —
@@ -385,7 +385,7 @@
 'use strict';
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.20.9';
+const VERSION = '2.21.1';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 // v2.14.0 (audit #12): tracks the chart the user last hovered/touched, so
 // window-level keyboard shortcuts only apply to ONE chart on multi-chart pages.
@@ -9017,10 +9017,19 @@ class TradingChart {
     const last = candles[N - 1];
     if (!last || !last.time) return;
     const tfMs = this.timeframe.ms || 60000;
-    const candleCloseSec = last.time + Math.round(tfMs / 1000);
+    const tfSec = Math.round(tfMs / 1000);
+    const candleCloseSec = last.time + tfSec;
     const nowSec = Math.floor(Date.now() / 1000);   // v2.14.0: real Unix time
     let remainingSec = candleCloseSec - nowSec;
     if (remainingSec < 0) remainingSec = 0;
+    // v2.21.1: CLAMP remaining to tfSec so the countdown never shows more
+    // than the timeframe's natural max. When a data feed returns a candle
+    // with a future-dated time (or the live feed overshoots), remainingSec
+    // could exceed tfSec — e.g. 63s on a 1-minute chart, or "63" (minutes)
+    // on an H1 chart. Now it's capped at tfSec - 1 (e.g. 59 for 1m, 3599
+    // for H1 which displays as "59" minutes). This matches the user's
+    // expectation that the countdown starts at 59, not 60+.
+    if (remainingSec >= tfSec) remainingSec = tfSec - 1;
     // v2.16.0 (#22d): the local `pad2` here shadowed the module-level helper
     // — same implementation, but the shadow was a code-smell flag in the
     // audit. Reusing the module helper; behavior is identical.
