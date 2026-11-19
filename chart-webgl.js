@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.21.1 — WEBGL EDITION (chart-webgl.js)
+ * BADI-CHARTS-V2 v2.21.2 — WEBGL EDITION (chart-webgl.js)
  * The complete standalone trading chart library, rendered with real WebGL.
  *
  * THIS FILE IS A FULL LIBRARY, NOT A LAYER. Load it INSTEAD of chart.js —
@@ -385,7 +385,7 @@
 'use strict';
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.21.1';
+const VERSION = '2.21.2';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 // v2.14.0 (audit #12): tracks the chart the user last hovered/touched, so
 // window-level keyboard shortcuts only apply to ONE chart on multi-chart pages.
@@ -3475,6 +3475,7 @@ class TradingChart {
     this.indicatorsCollapsed = false;
     // Settings card popup state
     this.settingsCard = null; // {id, x, y, w, h, fields, onSave}
+    this._settingsCardDrag = null;  // v2.21.2: drag state for settings card
     // Icon hit-test registry (rebuilt each frame in drawLegend)
     this._iconHits = [];
 
@@ -5146,6 +5147,21 @@ class TradingChart {
     this.mouseY = y;
     this.mouseInside = true;
     _lastActiveChartInstance = this;   // v2.14.0: multi-chart keyboard guard
+    // v2.21.2: if dragging the settings card, update its position and return
+    // (don't process pan/crosshair while dragging the card).
+    if (this._settingsCardDrag && this.settingsCard) {
+      const dx = x - this._settingsCardDrag.startMouseX;
+      const dy = y - this._settingsCardDrag.startMouseY;
+      const sc = this.settingsCard;
+      sc.x = clamp(this._settingsCardDrag.startCardX + dx,
+                   this.chartLeft + 4,
+                   Math.max(this.chartLeft + 4, this.W - sc.w - 4));
+      sc.y = clamp(this._settingsCardDrag.startCardY + dy,
+                   this.chartTop + 4,
+                   Math.max(this.chartTop + 4, this.H - sc.h - 4));
+      this.invalidate();
+      return;
+    }
     this.hoverButton = this.hitButton(x, y);
     // Check icon hover
     this.hoverIcon = this._hitIcon(x, y);
@@ -5166,6 +5182,10 @@ class TradingChart {
                             this._hitPaneSeparator(x, y) : null;
     if (this._paneResize || this._paneSepHoverId != null) {
       try { this.canvas.style.cursor = 'ns-resize'; } catch (_) {}
+    } else if (this.settingsCard && this._hitSettingsCard(x, y) &&
+               this._hitSettingsCard(x, y).action === 'drag') {
+      // v2.21.2: grab cursor over the settings card's title bar
+      try { this.canvas.style.cursor = 'grab'; } catch (_) {}
     } else if (this.activeTool === 'cursor') {
       try { this.canvas.style.cursor = ''; } catch (_) {}
     }
@@ -5274,9 +5294,17 @@ class TradingChart {
   _hitSettingsCard(x, y) {
     if (!this.settingsCard) return null;
     const sc = this.settingsCard;
-    // Close button (X)
+    // v2.21.2: title bar (top 30px) is a drag handle — user can drag the
+    // card anywhere on the chart. Must be checked BEFORE the close button
+    // so the close button (top-right corner, within the title bar) still
+    // works.
+    // Close button (X) — top-right corner, within the title bar
     if (x >= sc.x + sc.w - 22 && x <= sc.x + sc.w - 6 && y >= sc.y + 8 && y <= sc.y + 22) {
       return {action: 'close'};
+    }
+    // Title bar drag handle (top 30px, excluding the close button)
+    if (x >= sc.x && x <= sc.x + sc.w - 22 && y >= sc.y && y <= sc.y + 30) {
+      return {action: 'drag'};
     }
     // Cancel button
     const btnY = sc.y + sc.h - 32;
@@ -5437,6 +5465,15 @@ class TradingChart {
     // 1. Check settings card first (topmost overlay)
     const scHit = this._hitSettingsCard(x, y);
     if (scHit) {
+      if (scHit.action === 'drag') {
+        // v2.21.2: start dragging the settings card by its title bar
+        this._settingsCardDrag = {
+          startMouseX: x, startMouseY: y,
+          startCardX: this.settingsCard.x, startCardY: this.settingsCard.y
+        };
+        try { this.canvas.style.cursor = 'grabbing'; } catch (_) {}
+        return;
+      }
       if (scHit.action === 'close' || scHit.action === 'cancel') {
         this.settingsCard = null;
       } else if (scHit.action === 'save') {
@@ -5611,6 +5648,12 @@ class TradingChart {
   }
 
   onMouseUp() {
+    // v2.21.2: stop dragging the settings card
+    if (this._settingsCardDrag) {
+      this._settingsCardDrag = null;
+      try { this.canvas.style.cursor = ''; } catch (_) {}
+      this.invalidate();
+    }
     // v2.12.0: Pane separator drag end — finalize the user height and let the
     // cursor style revert on the next mousemove.
     if (this._paneResize) {
@@ -9414,11 +9457,19 @@ class TradingChart {
     // Lines 2+: Indicator labels stacked VERTICALLY (TradingView-style)
     // Each indicator on its own line, with icons shown when active (clicked).
     if (isMobile) return;
-    // HEADLESS v2.1.0+: legend lists only overlay-type indicators.
-    // (Pane indicators are drawn inside drawPane, volume indicators inside drawVolume.)
+    // HEADLESS v2.1.0+: legend lists overlay-type indicators.
+    // v2.21.2: ALSO list hidden PANE indicators here — when a pane indicator
+    // is hidden, its window is removed from _panes (see updateLayout), so its
+    // label line disappears too. Without this, the user can't click the hide
+    // icon again to re-show it (it looked like the indicator was "deleted").
+    // Now hidden pane indicators show as dimmed lines in the top-left legend,
+    // with their icons available to toggle visibility back on.
     const overlayIds = Array.from(this.activeIndicators).filter(id => {
       const s = this.indicatorStates.get(id);
-      return s && s.def && s.def.type === 'overlay';
+      if (!s || !s.def) return false;
+      if (s.def.type === 'overlay') return true;
+      if (s.def.type === 'pane' && s.visible === false) return true;  // v2.21.2
+      return false;
     });
     if (overlayIds.length === 0) return;
     // If collapsed, draw only the expand arrow (downward) and return
@@ -9858,20 +9909,16 @@ class TradingChart {
     }
     const w = 220;
     const h = 36 + fields.length * 30 + 40;
-    // v2.19.2: position the card right AFTER the indicator's own legend line
-    // (dot + label + value), so it never covers the row it belongs to —
-    // TradingView-style. Falls back to the classic top-left spot when no
-    // anchor (programmatic open) is given.
-    let cx = this.chartLeft + 50;
-    let cy = this.chartTop + 50;
+    // v2.21.2: position the card in the CENTER of the chart by default
+    // (was top-left or next to the legend line). The user can drag it
+    // anywhere with the mouse — see _hitSettingsCard 'drag' action.
+    const chartW = this.chartRight - this.chartLeft;
+    const chartH = (this.layout.paneBottom || this.chartBottom) - this.chartTop;
+    let cx = this.chartLeft + (chartW - w) / 2;
+    let cy = this.chartTop + (chartH - h) / 2;
+    // If an anchor is given (clicked from the legend), offset slightly so
+    // the card doesn't cover the clicked indicator's line.
     if (anchor && isFinite(anchor.y)) {
-      try {
-        const mctx = this.ctx;
-        mctx.font = '11px -apple-system, Segoe UI, Roboto, sans-serif';
-        const valTxt = this._getIndicatorValueAt(id, this.sim.candles.length - 1) || '';
-        const lineW = 6 /*pad*/ + 10 /*dot+gap*/ + mctx.measureText(((state.def && state.def.label) || id) + ':').width + 6 + mctx.measureText(valTxt).width;
-        cx = this.chartLeft + 6 + lineW + 10;
-      } catch (_) { cx = this.chartLeft + 170; }
       cy = Math.round(anchor.y) - 6;
     }
     cx = clamp(cx, this.chartLeft + 4, Math.max(this.chartLeft + 4, this.W - this.layout.priceAxisW - w - 8));
@@ -9917,6 +9964,15 @@ class TradingChart {
     ctx.fillStyle = this.theme.textBright;
     ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
     ctx.fillText(sc.title + ' Settings', sc.x + 10, sc.y + 14);
+    // v2.21.2: drag handle grip (three small dots on the right side of the
+    // title bar, before the close button) — visual hint that the card is
+    // draggable by its title bar.
+    ctx.fillStyle = this.theme.textDim;
+    for (let i = 0; i < 3; i++) {
+      ctx.beginPath();
+      ctx.arc(sc.x + sc.w - 36, sc.y + 10 + i * 4, 1.2, 0, Math.PI * 2);
+      ctx.fill();
+    }
     // Close button (X)
     ctx.strokeStyle = this.theme.textDim;
     ctx.lineWidth = 1.2;
