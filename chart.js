@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.18.15 — Pixel-Perfect Pure JavaScript Trading Chart Library
+ * BADI-CHARTS-V2 v2.18.16 — Pixel-Perfect Pure JavaScript Trading Chart Library
  *
  * A lightweight, dependency-free candlestick charting library built entirely
  * with the HTML5 Canvas API. Inspired by TradingView Lightweight Charts.
@@ -378,7 +378,7 @@ var Path2D = (typeof window !== 'undefined' && window.Path2D)
     })();
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.18.15';
+const VERSION = '2.18.16';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 // v2.14.0 (audit #12): tracks the chart the user last hovered/touched, so
 // window-level keyboard shortcuts only apply to ONE chart on multi-chart pages.
@@ -1427,9 +1427,17 @@ class TradingChart {
     // the chart idle between interactions — the throttle only made drags
     // choppy. Removed; the loop now runs uncapped on all devices and still
     // costs zero CPU when idle.
+    // v2.21.4: opts.renderThrottleMs lets the user re-introduce a cap on slow
+    // devices. Default 0 = uncapped (60fps+). Set to 33 for a 30fps cap.
     this._isMobile = isMobileDevice;
-    this._renderThrottleMs = 0;
+    this._renderThrottleMs = (typeof opts.renderThrottleMs === 'number' && opts.renderThrottleMs >= 0)
+      ? opts.renderThrottleMs : 0;
     this._lastRenderTime = 0;
+    // v2.21.4: PERF INSTRUMENTATION — tracks per-frame render time.
+    this.perf = {
+      enabled: false, lastFrameMs: 0, avgFrameMs: 0, maxFrameMs: 0,
+      frames: 0, _window: [], _maxWindow: 60
+    };
 
     // v2.4.0+: Momentum scrolling (inertia) — after the user releases the mouse/touch
     // after panning, the chart continues to move with decreasing speed, like
@@ -5523,6 +5531,8 @@ class TradingChart {
   // so multiple charts on the same page don't interfere with each other.
   render(now) {
     if (!now) now = performance.now();
+    const _perfEnabled = this.perf && this.perf.enabled;
+    const _perfStart = _perfEnabled ? performance.now() : 0;
     const savedTheme = THEME;
     THEME = this.theme;
     // v2.12.0: reset the per-frame cache rebuild budget at the START of each
@@ -5575,7 +5585,45 @@ class TradingChart {
       // colors (and writes to window.THEME did nothing). Re-publish the live
       // THEME here at the END of every render so external code can read it.
       if (typeof window !== 'undefined') window.THEME = savedTheme;
+      // v2.21.4: perf instrumentation — record this frame's wall-clock time.
+      if (_perfEnabled) {
+        const dt = performance.now() - _perfStart;
+        const p = this.perf;
+        p.lastFrameMs = dt;
+        p.frames++;
+        const w = p._window;
+        w.push(dt);
+        if (w.length > p._maxWindow) w.shift();
+        let sum = 0, mx = 0;
+        for (let i = 0; i < w.length; i++) {
+          sum += w[i];
+          if (w[i] > mx) mx = w[i];
+        }
+        p.avgFrameMs = sum / w.length;
+        p.maxFrameMs = mx;
+      }
     }
+  }
+  // v2.21.4: getPerfReport() — returns a human-readable perf summary.
+  getPerfReport() {
+    const p = this.perf;
+    if (!p.enabled) return 'Perf instrumentation is OFF. Enable with chart.perf.enabled = true.';
+    if (p.frames === 0) return 'No frames rendered yet.';
+    const fps = p.avgFrameMs > 0 ? (1000 / p.avgFrameMs).toFixed(1) : '∞';
+    return [
+      'BADI-CHARTS-V2 (2D) perf report',
+      '  frames rendered: ' + p.frames,
+      '  last frame:      ' + p.lastFrameMs.toFixed(2) + ' ms',
+      '  avg frame:       ' + p.avgFrameMs.toFixed(2) + ' ms  (~' + fps + ' fps)',
+      '  worst frame:     ' + p.maxFrameMs.toFixed(2) + ' ms',
+      '  budget @60fps:   ' + (p.avgFrameMs < 16.67 ? 'OK' : 'OVER') +
+        ' (' + p.avgFrameMs.toFixed(2) + '/' + 16.67 + ' ms)',
+      '  candles:         ' + this.sim.candles.length,
+      '  indicators:      ' + this.activeIndicators.size,
+      '  drawings:        ' + this.drawings.length,
+      '  dpr:             ' + this.dpr,
+      '  canvas:          ' + this.W + '×' + this.H
+    ].join('\n');
   }
 
   /* --------------------------- Background -------------------------------- */
@@ -7459,16 +7507,31 @@ class TradingChart {
     ctx.font = '11px -apple-system, Segoe UI, Roboto, sans-serif';
     ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
     const labelTxt = meta.label + ':';
-    const labelW = ctx.measureText(labelTxt).width;
+    // v2.21.4 PERF: cache label width per indicator (label never changes).
+    let labelW;
+    if (state._labelW && state._labelWKey === labelTxt) {
+      labelW = state._labelW;
+    } else {
+      labelW = ctx.measureText(labelTxt).width;
+      state._labelW = labelW;
+      state._labelWKey = labelTxt;
+    }
     // v2.21.3: fixed-width value area — truncate long values with "…"
+    // v2.21.4 PERF: binary search instead of char-by-char while loop.
     const VAL_FIXED_W = 72;
+    const VAL_MAX_W = VAL_FIXED_W - 4;
     let valTxt = String(val || '');
-    if (ctx.measureText(valTxt).width > VAL_FIXED_W - 4) {
-      let t = valTxt;
-      while (t.length > 1 && ctx.measureText(t + '…').width > VAL_FIXED_W - 4) {
-        t = t.slice(0, -1);
+    if (ctx.measureText(valTxt).width > VAL_MAX_W) {
+      let lo = 1, hi = valTxt.length, best = 1;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        if (ctx.measureText(valTxt.slice(0, mid) + '…').width <= VAL_MAX_W) {
+          best = mid; lo = mid + 1;
+        } else {
+          hi = mid - 1;
+        }
       }
-      valTxt = t + '…';
+      valTxt = valTxt.slice(0, best) + '…';
     }
     const valW = VAL_FIXED_W;   // always the SAME width — icons never shift
     // v2.8.0: reserve space for the red "!" error badge when this indicator threw
