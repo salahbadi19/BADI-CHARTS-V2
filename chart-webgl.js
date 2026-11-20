@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.21.2 — WEBGL EDITION (chart-webgl.js)
+ * BADI-CHARTS-V2 v2.21.3 — WEBGL EDITION (chart-webgl.js)
  * The complete standalone trading chart library, rendered with real WebGL.
  *
  * THIS FILE IS A FULL LIBRARY, NOT A LAYER. Load it INSTEAD of chart.js —
@@ -385,7 +385,7 @@
 'use strict';
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.21.2';
+const VERSION = '2.21.3';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 // v2.14.0 (audit #12): tracks the chart the user last hovered/touched, so
 // window-level keyboard shortcuts only apply to ONE chart on multi-chart pages.
@@ -9494,6 +9494,13 @@ class TradingChart {
 
   // Draw a single indicator line (label + value + icons when active)
   // Stacked vertically like TradingView.
+  // v2.21.3: FIXED-VALUE-WIDTH — the icons used to be positioned AFTER the
+  // value text (valW = measureText(value).width). When the value changed
+  // (price ticks every second), valW changed and the icons SHIFTED — the
+  // user couldn't click delete/settings because the icons kept moving.
+  // Now the value area has a FIXED width (VAL_FIXED_W): long values are
+  // truncated with "…", short ones leave blank space, and the icons (and
+  // their hit-test boxes) stay at the SAME position every frame.
   _drawIndicatorLine(x, y, id, meta, state, val) {
     const ctx = this.ctx;
     const isActive = this.activeIndicatorCard === id;
@@ -9503,9 +9510,18 @@ class TradingChart {
     ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
     const labelTxt = meta.label + ':';
     const labelW = ctx.measureText(labelTxt).width;
-    const valTxt = val || '';
-    const valW = ctx.measureText(valTxt).width;
-    // v2.8.0: reserve space for the red "!" error badge when this indicator threw
+    // v2.21.3: fixed-width value area — truncate long values with "…"
+    const VAL_FIXED_W = 72;
+    let valTxt = String(val || '');
+    if (ctx.measureText(valTxt).width > VAL_FIXED_W - 4) {
+      // Truncate until it fits (add ellipsis)
+      let t = valTxt;
+      while (t.length > 1 && ctx.measureText(t + '…').width > VAL_FIXED_W - 4) {
+        t = t.slice(0, -1);
+      }
+      valTxt = t + '…';
+    }
+    const valW = VAL_FIXED_W;   // always the SAME width — icons never shift
     const errW = state._errFlag ? 14 : 0;
     // Background when active (subtle highlight)
     const allIcons = state.icons.concat(state.customIcons.map(c => c.id));
@@ -9530,7 +9546,7 @@ class TradingChart {
     ctx.arc(x + padX + 3, centerY, 3.5, 0, Math.PI * 2);
     ctx.fill();
     ctx.fillText(labelTxt, x + padX + 10, centerY);
-    // Value
+    // Value (clipped to the fixed-width area so it never touches the icons)
     ctx.fillStyle = isVisible ? this.theme.text : this.theme.textDim;
     ctx.fillText(valTxt, x + padX + 10 + labelW + 6, centerY);
     // v2.8.0: red "!" badge — this indicator's calculate()/render() threw
@@ -9546,7 +9562,7 @@ class TradingChart {
       ctx.fillText('!', bx, centerY + 0.5);
       ctx.textAlign = 'left';
     }
-    // Icons (only when active)
+    // Icons (only when active) — FIXED positions (never shift with the value)
     if (isActive) {
       let ix = x + padX + 10 + labelW + 6 + valW + 8 + errW;
       for (const iconId of allIcons) {
