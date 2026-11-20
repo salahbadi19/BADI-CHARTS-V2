@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.21.4 — WEBGL EDITION (chart-webgl.js)
+ * BADI-CHARTS-V2 v2.22.0 — WEBGL EDITION (chart-webgl.js)
  * The complete standalone trading chart library, rendered with real WebGL.
  *
  * THIS FILE IS A FULL LIBRARY, NOT A LAYER. Load it INSTEAD of chart.js —
@@ -385,7 +385,7 @@
 'use strict';
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.21.4';
+const VERSION = '2.22.0';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 // v2.14.0 (audit #12): tracks the chart the user last hovered/touched, so
 // window-level keyboard shortcuts only apply to ONE chart on multi-chart pages.
@@ -3232,6 +3232,33 @@ class TradingChart {
       _maxWindow: 60
     };
 
+    // v2.22.0: BAR REPLAY ENGINE (TradingView-style backtest replay).
+    // The chart can freeze history at a cutoff bar, then reveal historical
+    // candles one-by-one (manual step) or animated (play at 0.5x–20x with
+    // an intra-candle tick simulation). During replay the countdown counts
+    // REPLAY time, a blue replay line marks the start bar, a REPLAY badge
+    // + playback bar (canvas UI) appear, and update()/append() are blocked
+    // so a live feed can't corrupt the replayed history.
+    this.replay = {
+      active: false,
+      fullData: [],        // complete dataset — restored on stopReplay()
+      startTime: 0,        // cutoff candle time (the replay start bar)
+      playing: false,
+      speed: 1,            // candles per second (1x = 1 candle/sec)
+      showBar: true,       // draw the canvas playback bar
+      _timer: null,        // tick interval during playback
+      _stepStartMs: 0,     // when the current forming candle started
+      _progress: 0,        // 0..1 reveal progress of the forming candle
+      _warnedExternal: false
+    };
+    this._replayHits = [];      // playback-bar hit registry (rebuilt per frame)
+    this._replayHover = null;   // hovered bar button id
+    // Replay event hooks (assign chart.onReplayStep = fn etc., or via opts):
+    this.onReplayStart = null;  // (replayState) => {}
+    this.onReplayStep = null;   // (lastCandle, candlesShown) => {}
+    this.onReplayEnd = null;    // () => {} — revealed the last historical bar
+    this.onReplayStop = null;   // () => {} — user exited replay mode
+
     // v2.4.0+: Momentum scrolling (inertia) — after the user releases the mouse/touch
     // after panning, the chart continues to move with decreasing speed, like
     // TradingView / Binance. Velocity is tracked in pixels/ms during drag, then
@@ -3538,6 +3565,9 @@ class TradingChart {
   // zoom/pan position instead of resetting to the default view — useful for
   // "refresh" flows where the user's viewport should not jump.
   setData(candles, opts) {
+    // v2.22.0: a full data replace exits replay mode first — the replay's
+    // saved fullData would otherwise restore stale history on stopReplay().
+    if (this.replay && this.replay.active) this._replayStopInternal(false);
     this.sim.setData(candles);
     this._dataVersion++;                       // v2.14.0: stamp invalidation
     this._contentVersion++;                    // v2.16.0 (#11): full replace → all indicator outputs change
@@ -3569,6 +3599,18 @@ class TradingChart {
   // input is normalized through sim._norm() again; the stored object is
   // always a private clone.
   update(candle) {
+    // v2.22.0: external ticks are BLOCKED during replay — the replay engine
+    // owns the data while active (a live feed would corrupt the replayed
+    // history by appending future candles). One console warning per session.
+    if (this.replay && this.replay.active) {
+      if (!this.replay._warnedExternal) {
+        this.replay._warnedExternal = true;
+        if (typeof console !== 'undefined') {
+          console.warn('[BadiCharts] update() ignored — replay mode is active. Call stopReplay() to resume live updates.');
+        }
+      }
+      return this;
+    }
     const c = this.sim._norm(candle);
     if (!c) return this;                       // invalid input — ignore (was: stored raw)
     const cs = this.sim.candles;
@@ -3624,6 +3666,16 @@ class TradingChart {
   // Append multiple candles
   append(candles) {
     if (!Array.isArray(candles)) return this;
+    // v2.22.0: blocked during replay (same guard as update()).
+    if (this.replay && this.replay.active) {
+      if (!this.replay._warnedExternal) {
+        this.replay._warnedExternal = true;
+        if (typeof console !== 'undefined') {
+          console.warn('[BadiCharts] append() ignored — replay mode is active. Call stopReplay() to resume live updates.');
+        }
+      }
+      return this;
+    }
     const before = this.sim.candles.length;
     this.sim.append(candles);
     const appended = this.sim.candles.length - before;
@@ -5181,6 +5233,9 @@ class TradingChart {
       return;
     }
     this.hoverButton = this.hitButton(x, y);
+    // v2.22.0: replay playback-bar hover state (button highlight)
+    this._replayHover = (this.replay.active && this.replay.showBar)
+      ? ((this._hitReplayBar(x, y) || {}).id || null) : null;
     // Check icon hover
     this.hoverIcon = this._hitIcon(x, y);
     // Check drawing panel hover
@@ -5554,6 +5609,17 @@ class TradingChart {
     if (this.settingsCard) {
       this.settingsCard = null;
       return;
+    }
+
+    // 1a-bis. v2.22.0: REPLAY playback bar (overlay UI, above everything
+    // except the settings card). Clicking a button must NOT start a chart
+    // drag or place a drawing.
+    if (this.replay.active && this.replay.showBar) {
+      const rHit = this._hitReplayBar(x, y);
+      if (rHit) {
+        this._handleReplayClick(rHit);
+        return;
+      }
     }
 
     // 1b. Check drawing properties panel (if a drawing is selected)
@@ -5942,6 +6008,27 @@ class TradingChart {
     if (e.key === 'r' || e.key === 'R') { this.resetView(); }
     if (e.key === '+' || e.key === '=') this.zoomAtCenter(1.1);
     if (e.key === '-' || e.key === '_') this.zoomAtCenter(1/1.1);
+    // v2.22.0: REPLAY keyboard shortcuts — only while replay mode is active.
+    // Space toggles playback (preventDefault stops the page from scrolling),
+    // ←/→ step back/forward, Escape exits replay.
+    if (this.replay.active) {
+      if (e.key === ' ') {
+        e.preventDefault();
+        if (this.replay.playing) this.replayPause(); else this.replayPlay();
+        return;
+      }
+      if (e.key === 'ArrowRight') { e.preventDefault(); this.replayStep(1); return; }
+      if (e.key === 'ArrowLeft')  { e.preventDefault(); this.replayStep(-1); return; }
+      if (e.key === 'Escape') {
+        this.currentDrawing = null;
+        this._drawAnchor = null;
+        this.setTool('cursor');
+        this.dropdown = null;
+        this.deselectDrawing();
+        this.stopReplay();
+        return;
+      }
+    }
     if (e.key === 'Escape') {
       // v2.10.0: cancel pending preview (with feedback), then deselect
       if (this.currentDrawing) this.showToast('Drawing cancelled');
@@ -6915,6 +7002,525 @@ class TradingChart {
     }
   }
 
+  /* ==================== BAR REPLAY ENGINE (v2.22.0) ====================== */
+  // TradingView-style backtest replay. Public API:
+  //   chart.startReplay(timeOrIndex)  — freeze history at a bar, enter replay
+  //   chart.replayStep(n)             — reveal n candles (n<0 steps back)
+  //   chart.replayPlay(speed?)        — animated playback (0.5x–20x)
+  //   chart.replayPause()             — pause playback
+  //   chart.replaySetSpeed(x)         — set playback speed
+  //   chart.stopReplay()              — exit replay, restore full data
+  //   chart.isReplaying()             — true while replay mode is active
+  // Events: chart.onReplayStart / onReplayStep / onReplayEnd / onReplayStop
+  // Keyboard (while replaying): Space=play/pause, ←/→=step, Esc=exit.
+  //
+  // WHY THE ENGINE LIVES IN THE LIBRARY (not a standalone script):
+  //  1. The countdown must count REPLAY time, not wall-clock time — it reads
+  //     the internal forming-candle progress every frame.
+  //  2. Stepping uses the data layer's incremental path (batched indicator
+  //     recompute + rightOffset pinning) — a script calling setData() per
+  //     step would rebuild everything and flicker.
+  //  3. The replay line, badge and playback bar draw INSIDE the chart's
+  //     canvas z-order (over candles, under the settings card).
+  //  4. Keyboard shortcuts integrate with the existing multi-chart guard.
+  //  5. A live WebSocket feed must be BLOCKED during replay — only the
+  //     library can intercept update()/append().
+
+  // Enter replay mode at the bar containing `timeOrIndex`. Accepts:
+  //   - epoch SECONDS (>1e8, i.e. anything after 1973)  ← most common
+  //   - epoch MILLISECONDS (>1e11)
+  //   - a 0-based candle INDEX (0..length-1)
+  //   - null/undefined → default cutoff at 2/3 through the dataset
+  // Everything AFTER that bar is hidden; the cutoff bar itself is the last
+  // visible complete candle.
+  startReplay(timeOrIndex) {
+    // (Re)enter — stop any previous session FIRST (it restores fullData),
+    // then read the restored array. Reading before the stop would slice the
+    // stale truncated array into fullData and LOSE history.
+    if (this.replay.active) this._replayStopInternal(false);
+    const candles = this.sim.candles;
+    if (!candles || candles.length === 0) {
+      this.showToast('No data to replay');
+      return this;
+    }
+    // Resolve the cutoff index — disambiguate time-vs-index by magnitude:
+    // an index is always < 1e8 for any real dataset; epoch seconds are > 1e8
+    // for anything after 1973; epoch ms are > 1e11.
+    let cutIdx;
+    if (timeOrIndex == null) {
+      cutIdx = Math.floor(candles.length * 2 / 3);
+    } else if (typeof timeOrIndex === 'number' && timeOrIndex > 1e11) {
+      cutIdx = this._indexForTime(timeOrIndex / 1000);            // ms epoch
+    } else if (typeof timeOrIndex === 'number' && timeOrIndex > 1e8) {
+      cutIdx = this._indexForTime(timeOrIndex);                   // s epoch
+    } else if (typeof timeOrIndex === 'number') {
+      const i = Math.max(0, Math.min(candles.length - 1, Math.floor(timeOrIndex)));
+      cutIdx = this._indexForTime(candles[i].time);               // index
+    } else {
+      cutIdx = Math.floor(candles.length * 2 / 3);
+    }
+    if (!(cutIdx >= 1)) cutIdx = 1;
+    if (cutIdx > candles.length - 1) cutIdx = candles.length - 1;
+    this.replay.active = true;
+    this.replay.fullData = candles.slice();     // keep the complete dataset safe
+    this.replay.startTime = candles[cutIdx].time;
+    this.replay.playing = false;
+    this.replay._progress = 0;
+    this.replay._warnedExternal = false;
+    // Truncate the live array to the cutoff (keep the cutoff bar visible)
+    this.sim.candles = this.replay.fullData.slice(0, cutIdx + 1);
+    this._lastDataLen = this.sim.candles.length;
+    this._dataVersion++;
+    this._contentVersion++;
+    // Scroll so the replay edge is at the RIGHT side of the view (TV-style)
+    this.rightOffset = 6;
+    this.constrainRightOffset();
+    this.computeIndicators();
+    this.autoScale();
+    this.invalidateTimeMarks();
+    this.invalidate();
+    if (typeof this.onReplayStart === 'function') {
+      try { this.onReplayStart(this.replay); } catch (_) {}
+    }
+    return this;
+  }
+
+  // Exit replay mode — restores the complete dataset.
+  stopReplay() { return this._replayStopInternal(true); }
+  _replayStopInternal(fireEvent) {
+    if (!this.replay.active) return this;
+    this._replayClearTimers();
+    this.replay.active = false;
+    this.replay.playing = false;
+    if (this.replay.fullData && this.replay.fullData.length > 0) {
+      this.sim.candles = this.replay.fullData;   // restore complete history
+      this.replay.fullData = [];
+    }
+    this._lastDataLen = this.sim.candles.length;
+    this._dataVersion++;
+    this._contentVersion++;
+    this.computeIndicators();
+    this.autoScale();
+    this.invalidateTimeMarks();
+    this.invalidate();
+    if (fireEvent && typeof this.onReplayStop === 'function') {
+      try { this.onReplayStop(); } catch (_) {}
+    }
+    return this;
+  }
+  isReplaying() { return !!this.replay.active; }
+
+  // Reveal n candles. n > 0 steps FORWARD (each revealed candle appears
+  // COMPLETE — manual stepping never animates), n < 0 steps BACK (removes
+  // the last candle). Returns true if a step happened.
+  replayStep(n) {
+    if (!this.replay.active) return false;
+    n = (typeof n === 'number') ? Math.trunc(n) : 1;
+    if (this.replay.playing) this.replayPause();
+    let did = false;
+    for (let k = 0; k < Math.abs(n); k++) {
+      if (n > 0) did = this._replayRevealComplete() || did;
+      else did = this._replayStepBack() || did;
+    }
+    if (did) this._replayAfterDataChange();
+    return did;
+  }
+
+  // Start animated playback. speed = candles-per-second multiplier: 1x
+  // reveals one candle per second with a 4-tick intra-candle simulation.
+  replayPlay(speed) {
+    if (!this.replay.active) return this;
+    if (speed != null) this.replaySetSpeed(speed);
+    if (this.replay.playing) return this;
+    // If the previous candle is still forming (paused mid-candle), finish it
+    this._replayFinalizeForming();
+    // Past the end of history? Nothing to play.
+    if (this.sim.candles.length >= this.replay.fullData.length) {
+      if (typeof this.onReplayEnd === 'function') { try { this.onReplayEnd(); } catch (_) {} }
+      return this;
+    }
+    this.replay.playing = true;
+    this.replay._progress = 0;
+    this.replay._stepStartMs = performance.now();
+    this._replayRevealForming();          // push the next candle as forming
+    const self = this;
+    const tickMs = this._replayTickMs();
+    this.replay._timer = setInterval(function () { self._replayTick(); }, tickMs);
+    this.invalidate();
+    return this;
+  }
+  replayPause() {
+    if (!this.replay.active || !this.replay.playing) return this;
+    this._replayClearTimers();
+    this.replay.playing = false;
+    this._replayFinalizeForming();        // complete the partial candle
+    this._replayAfterDataChange();
+    return this;
+  }
+  replaySetSpeed(x) {
+    const speeds = [0.5, 1, 2, 5, 10, 20];
+    if (speeds.indexOf(x) < 0) x = 1;
+    this.replay.speed = x;
+    // Live-adjust a running timer
+    if (this.replay.playing && this.replay._timer != null) {
+      this._replayClearTimers();
+      const self = this;
+      this.replay._timer = setInterval(function () { self._replayTick(); }, this._replayTickMs());
+    }
+    this.invalidate();
+    return this;
+  }
+  replayCycleSpeed() {
+    const speeds = [0.5, 1, 2, 5, 10, 20];
+    const i = speeds.indexOf(this.replay.speed);
+    this.replaySetSpeed(speeds[(i + 1) % speeds.length]);
+    return this;
+  }
+  _replayTickMs() {
+    // One candle per `1000/speed` ms; ticks run 4× per candle (clamped ≥25ms
+    // so 20x speed still fires reliably — progress just advances faster).
+    return Math.max(25, 1000 / this.replay.speed / 4);
+  }
+  _replayClearTimers() {
+    if (this.replay._timer != null) { clearInterval(this.replay._timer); this.replay._timer = null; }
+  }
+
+  // ---- internal data mechanics ----
+  // Push the next historical candle as a FORMING candle (open only).
+  _replayRevealForming() {
+    const r = this.replay;
+    const curLen = this.sim.candles.length;
+    if (curLen >= r.fullData.length) return false;
+    const t = r.fullData[curLen];
+    const eps = Math.max(Math.abs(t.close) * 0.00005, 1e-9);
+    this.sim.candles.push({
+      time: t.time, open: t.open,
+      high: t.open + eps, low: t.open - eps,
+      close: t.open, volume: 0
+    });
+    this._lastDataLen = this.sim.candles.length;
+    this._dataVersion++;
+    this._contentVersion++;
+    this._scheduleCompute();
+    this.autoScale();
+    this.invalidate();
+    return true;
+  }
+  // Push the next historical candle COMPLETE (manual step path).
+  _replayRevealComplete() {
+    const r = this.replay;
+    const curLen = this.sim.candles.length;
+    if (curLen >= r.fullData.length) return false;
+    const t = r.fullData[curLen];
+    this.sim.candles.push({ time: t.time, open: t.open, high: t.high, low: t.low, close: t.close, volume: t.volume });
+    this._lastDataLen = this.sim.candles.length;
+    this._dataVersion++;
+    this._contentVersion++;
+    if (typeof this.onReplayStep === 'function') {
+      try { this.onReplayStep(this.sim.candles[this.sim.candles.length - 1], this.sim.candles.length); } catch (_) {}
+    }
+    if (this.sim.candles.length >= r.fullData.length && typeof this.onReplayEnd === 'function') {
+      try { this.onReplayEnd(); } catch (_) {}
+    }
+    return true;
+  }
+  // One tick of the playback loop: advance the forming candle's reveal
+  // progress; finalize when the candle's time is up and chain to the next.
+  _replayTick() {
+    const r = this.replay;
+    if (!r.active || !r.playing) return;
+    const stepMs = 1000 / r.speed;               // real ms per candle
+    const now = performance.now();
+    r._progress = Math.min(1.0001, (now - r._stepStartMs) / stepMs);
+    const curLen = this.sim.candles.length;
+    const forming = this.sim.candles[curLen - 1];
+    const target = r.fullData[curLen - 1];
+    if (!forming || !target || forming.time !== target.time) return;
+    // Mid-candle reveal: NEVER leaks beyond the true candle's range, and the
+    // final state is copied EXACTLY from history (clamped interpolation).
+    const p = Math.min(1, r._progress);
+    // ease-out so the candle "closes" with visible ticks near the end
+    const ep = p * p * (3 - 2 * p);   // smoothstep
+    const noise = (Math.random() - 0.5) * Math.max(Math.abs(target.close - target.open) * 0.12, Math.abs(target.close) * 0.00004) * (1 - p);
+    let close = target.open + (target.close - target.open) * ep + noise;
+    close = Math.max(target.low, Math.min(target.high, close));
+    forming.close = close;
+    forming.high = Math.min(target.high, Math.max(forming.high, close + Math.abs(noise)));
+    forming.low  = Math.max(target.low,  Math.min(forming.low,  close - Math.abs(noise)));
+    forming.volume = target.volume * ep;
+    this._dataVersion++;
+    this._scheduleCompute();
+    this.autoScale();
+    this.invalidate();
+    if (r._progress >= 1) {
+      // Candle complete — finalize exactly, fire the step event, chain next.
+      this._replayFinalizeForming();
+      if (typeof this.onReplayStep === 'function') {
+        try { this.onReplayStep(this.sim.candles[this.sim.candles.length - 1], this.sim.candles.length); } catch (_) {}
+      }
+      if (this.sim.candles.length >= r.fullData.length) {
+        // History fully revealed — stop at the end
+        r.playing = false;
+        this._replayClearTimers();
+        this._replayAfterDataChange();
+        if (typeof this.onReplayEnd === 'function') { try { this.onReplayEnd(); } catch (_) {} }
+        return;
+      }
+      r._progress = 0;
+      r._stepStartMs = performance.now();
+      this._replayRevealForming();
+    }
+  }
+  // Copy the TRUE historical OHLCV into the forming candle (exact history).
+  _replayFinalizeForming() {
+    const curLen = this.sim.candles.length;
+    if (curLen === 0) return;
+    const last = this.sim.candles[curLen - 1];
+    const target = this.replay.fullData[curLen - 1];
+    if (!target || !last || last.time !== target.time) return;
+    last.open = target.open; last.high = target.high;
+    last.low = target.low;   last.close = target.close;
+    last.volume = target.volume;
+    this._dataVersion++;
+    this._contentVersion++;
+    this._scheduleCompute();
+    this.autoScale();
+    this.invalidate();
+  }
+  // Remove the last candle (step back).
+  _replayStepBack() {
+    const curLen = this.sim.candles.length;
+    if (curLen <= 1 || curLen - 1 <= this._replayStartIdx()) return false;
+    this._replayFinalizeForming();   // safe no-op if not forming
+    this.sim.candles.pop();
+    this._lastDataLen = this.sim.candles.length;
+    this._dataVersion++;
+    this._contentVersion++;
+    return true;
+  }
+  // Index (in fullData) of the replay start bar — the minimum visible length.
+  _replayStartIdx() {
+    const r = this.replay;
+    for (let i = 0; i < r.fullData.length; i++) {
+      if (r.fullData[i].time === r.startTime) return i;
+    }
+    return 0;
+  }
+  // Jump the replay position to absolute index k in fullData (progress-bar
+  // click). k < startIdx is clamped to startIdx.
+  _replayJumpTo(k) {
+    const r = this.replay;
+    if (!r.active) return;
+    const startIdx = this._replayStartIdx();
+    k = Math.max(startIdx + 1, Math.min(r.fullData.length, Math.trunc(k)));
+    this._replayClearTimers();
+    r.playing = false;
+    r._progress = 0;
+    this.sim.candles = r.fullData.slice(0, k);
+    this._lastDataLen = this.sim.candles.length;
+    this._dataVersion++;
+    this._contentVersion++;
+    this._replayAfterDataChange();
+  }
+  // Shared post-mutation work: recompute + rescale + repaint.
+  _replayAfterDataChange() {
+    this.computeIndicators();
+    this.autoScale();
+    this.invalidateTimeMarks();
+    this.invalidate();
+  }
+
+  /* ------------------- Replay drawing (line/badge/bar) ------------------- */
+  // Blue vertical line at the replay START bar (TradingView-style anchor).
+  drawReplayLine() {
+    if (!this.replay.active) return;
+    const idx = this._indexForTime(this.replay.startTime);
+    if (idx < 0) return;
+    const x = this.indexToX(idx);
+    if (x < this.chartLeft - 2 || x > this.chartRight + 2) return;
+    const ctx = this.ctx;
+    ctx.save();
+    ctx.strokeStyle = '#2962ff';
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([4, 3]);
+    ctx.beginPath();
+    ctx.moveTo(x, this.chartTop);
+    ctx.lineTo(x, this.chartBottom);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    // Anchor handle at the top
+    ctx.fillStyle = '#2962ff';
+    ctx.beginPath();
+    ctx.arc(x, this.chartTop + 6, 4, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+  // REPLAY badge (top-right) + playback bar (over the time axis, centered).
+  drawReplayOverlay() {
+    if (!this.replay.active) return;
+    const ctx = this.ctx;
+    // ---- badge ----
+    const label = 'REPLAY ' + this.replay.speed + 'x' + (this.replay.playing ? '' : ' ⏸');
+    ctx.font = 'bold 11px -apple-system, Segoe UI, Roboto, sans-serif';
+    const bw = ctx.measureText(label).width + 16;
+    const bx = this.chartRight - bw - 8;
+    const by = this.chartTop + 8;
+    ctx.fillStyle = '#2962ff';
+    this._roundRect(bx, by, bw, 20, 10);
+    ctx.fill();
+    ctx.fillStyle = '#ffffff';
+    ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+    ctx.fillText(label, bx + 8, by + 11);
+    if (!this.replay.showBar) return;
+    // ---- playback bar over the time axis ----
+    const barH = 30;
+    const barY = this.H - this.layout.timeAxisH - barH - 2;
+    // Buttons: [⏮ start] [◀ back] [play/pause] [▶ step] [speed] ... [progress] ... [✕]
+    const BTN = 30, GAP = 2;
+    const speedsW = 46;
+    const exitW = 30;
+    const barW = 6 * 4 + BTN * 4 + speedsW + exitW + 24;   // paddings + 4 btns + speed + exit
+    const progW = Math.max(120, Math.min(320, (this.W - barW - 40) * 0.55));
+    const totalW = barW + progW + 8;
+    let x = Math.max(this.chartLeft + 8, (this.W - totalW) / 2);
+    const y = barY;
+    // Bar background
+    ctx.fillStyle = 'rgba(30,34,45,0.96)';
+    this._roundRect(x, y, totalW, barH, 6);
+    ctx.fill();
+    ctx.strokeStyle = '#2a2e39';
+    ctx.lineWidth = 1;
+    this._roundRect(x + 0.5, y + 0.5, totalW - 1, barH - 1, 6);
+    ctx.stroke();
+    this._replayHits = [];
+    const cy = y + barH / 2;
+    const self = this;
+    // Button painter — simple vector glyphs (no emoji/unicode dependence)
+    const drawBtn = function (id, w, glyph) {
+      const hovered = self._replayHover === id;
+      if (hovered) {
+        ctx.fillStyle = 'rgba(41,98,255,0.25)';
+        self._roundRect(x + 1, y + 3, w - 2, barH - 6, 4);
+        ctx.fill();
+      }
+      ctx.fillStyle = self.theme.text;
+      ctx.strokeStyle = self.theme.text;
+      glyph(x + w / 2, cy);
+      self._replayHits.push({ id: id, x: x, y: y, w: w, h: barH });
+      x += w + GAP;
+    };
+    const triRight = function (cx, cy, s) {
+      ctx.beginPath();
+      ctx.moveTo(cx - s * 0.5, cy - s * 0.7);
+      ctx.lineTo(cx - s * 0.5, cy + s * 0.7);
+      ctx.lineTo(cx + s * 0.7, cy);
+      ctx.closePath(); ctx.fill();
+    };
+    const triLeft = function (cx, cy, s) {
+      ctx.beginPath();
+      ctx.moveTo(cx + s * 0.5, cy - s * 0.7);
+      ctx.lineTo(cx + s * 0.5, cy + s * 0.7);
+      ctx.lineTo(cx - s * 0.7, cy);
+      ctx.closePath(); ctx.fill();
+    };
+    // 1. jump-to-start
+    drawBtn('start', BTN, function (cx, cy) {
+      ctx.fillRect(cx - 8, cy - 6, 2, 12);
+      triRight(cx + 1, cy, 8);
+    });
+    // 2. step back
+    drawBtn('back', BTN - 4, function (cx, cy) {
+      ctx.fillRect(cx - 7, cy - 6, 2, 12);
+      triLeft(cx + 2, cy, 7);
+    });
+    // 3. play / pause
+    drawBtn('play', BTN, function (cx, cy) {
+      if (self.replay.playing) {
+        ctx.fillRect(cx - 5, cy - 6, 3.5, 12);
+        ctx.fillRect(cx + 1.5, cy - 6, 3.5, 12);
+      } else {
+        triRight(cx - 1, cy, 10);
+      }
+    });
+    // 4. step forward
+    drawBtn('step', BTN - 4, function (cx, cy) {
+      triRight(cx - 2, cy, 7);
+      ctx.fillRect(cx + 5, cy - 6, 2, 12);
+    });
+    // 5. speed
+    drawBtn('speed', speedsW, function (cx, cy) {
+      ctx.font = 'bold 11px -apple-system, Segoe UI, Roboto, sans-serif';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillStyle = '#2962ff';
+      ctx.fillText(self.replay.speed + 'x', cx, cy);
+    });
+    // 6. progress bar (click to jump)
+    {
+      const startIdx = this._replayStartIdx();
+      const total = this.replay.fullData.length - startIdx - 1;
+      const shown = Math.max(0, this.sim.candles.length - startIdx - 1);
+      const frac = total > 0 ? Math.min(1, shown / total) : 1;
+      const px = x + 2, pw = progW - 4;
+      ctx.fillStyle = '#2a2e39';
+      this._roundRect(px, cy - 4, pw, 8, 4);
+      ctx.fill();
+      ctx.fillStyle = '#2962ff';
+      if (frac > 0) {
+        this._roundRect(px, cy - 4, Math.max(6, pw * frac), 8, 4);
+        ctx.fill();
+      }
+      this._replayHits.push({ id: 'progress', x: px - 2, y: y, w: pw + 4, h: barH,
+                              meta: { startIdx: startIdx, total: total } });
+      x += progW + GAP;
+    }
+    // 7. exit
+    drawBtn('exit', exitW, function (cx, cy) {
+      ctx.lineWidth = 1.6;
+      ctx.beginPath();
+      ctx.moveTo(cx - 5, cy - 5); ctx.lineTo(cx + 5, cy + 5);
+      ctx.moveTo(cx + 5, cy - 5); ctx.lineTo(cx - 5, cy + 5);
+      ctx.stroke();
+    });
+  }
+  // Hit-test the replay playback bar. Returns {id, meta} or null.
+  _hitReplayBar(x, y) {
+    for (const h of this._replayHits) {
+      if (x >= h.x && x <= h.x + h.w && y >= h.y && y <= h.y + h.h) {
+        return { id: h.id, meta: h.meta };
+      }
+    }
+    return null;
+  }
+  _handleReplayClick(hit) {
+    switch (hit.id) {
+      case 'start': {
+        // Rewind to the replay start (keep the start bar visible)
+        this._replayJumpTo(this._replayStartIdx() + 1);
+        break;
+      }
+      case 'back': this.replayStep(-1); break;
+      case 'play':
+        if (this.replay.playing) this.replayPause();
+        else this.replayPlay();
+        break;
+      case 'step': this.replayStep(1); break;
+      case 'speed': this.replayCycleSpeed(); break;
+      case 'exit': this.stopReplay(); break;
+      case 'progress': {
+        // Click position → absolute index in fullData
+        const m = hit.meta || {};
+        if (m.total > 0) {
+          // Map click x within the progress hit-box to 0..1
+          const h = this._replayHits.find(function (q) { return q.id === 'progress'; });
+          const frac = Math.max(0, Math.min(1, (this.mouseX - h.x) / h.w));
+          this._replayJumpTo(m.startIdx + 1 + Math.round(frac * m.total));
+        }
+        break;
+      }
+    }
+    this.invalidate();
+  }
+
   // Build the helpers object passed to each indicator's render() function.
   // Contains coordinate-conversion functions and current chart geometry.
   // v2.17.0 FIX: `kind` — which render context the helpers serve:
@@ -7481,8 +8087,10 @@ class TradingChart {
       this.drawTimeAxis();
       this.drawCurrentPriceLine();  // After axes so the price label sits ON TOP
       this.drawCountdown(now);     // v2.13.0: 2-digit countdown near forming candle
+      this.drawReplayLine();       // v2.22.0: blue replay anchor line (over data, under UI)
       this.drawCrosshair();
       this.drawLegend();
+      this.drawReplayOverlay();     // v2.22.0: REPLAY badge + playback bar
       this.drawSettingsCard();      // Settings popup (drawn last so it overlays everything)
       // HEADLESS (v2.0.0+): built-in toolbar removed — drawToolbar() is now a no-op.
       if (this._showStatusBar) this.drawStatusBar();
@@ -9125,10 +9733,22 @@ class TradingChart {
     if (!last || !last.time) return;
     const tfMs = this.timeframe.ms || 60000;
     const tfSec = Math.round(tfMs / 1000);
-    const candleCloseSec = last.time + tfSec;
-    const nowSec = Math.floor(Date.now() / 1000);   // v2.14.0: real Unix time
-    let remainingSec = candleCloseSec - nowSec;
-    if (remainingSec < 0) remainingSec = 0;
+    // v2.22.0: BAR REPLAY — during replay the countdown counts REPLAY time
+    // (the forming candle's remaining life in simulated seconds), NOT
+    // wall-clock time. When replay is paused (no forming candle), the
+    // countdown hides — the REPLAY badge takes over.
+    let remainingSec;
+    if (this.replay && this.replay.active) {
+      if (!this.replay.playing) return;   // paused → no live countdown
+      const p = Math.max(0, Math.min(1, this.replay._progress));
+      remainingSec = Math.max(0, Math.round(tfSec * (1 - p)));
+      // fall through to the shared formatting/position code below
+    } else {
+      const candleCloseSec = last.time + tfSec;
+      const nowSec = Math.floor(Date.now() / 1000);   // v2.14.0: real Unix time
+      remainingSec = candleCloseSec - nowSec;
+      if (remainingSec < 0) remainingSec = 0;
+    }
     // v2.21.1: CLAMP remaining to tfSec so the countdown never shows more
     // than the timeframe's natural max. When a data feed returns a candle
     // with a future-dated time (or the live feed overshoots), remainingSec
@@ -10413,6 +11033,13 @@ class TradingChart {
       clearInterval(this._countdownTimer);
       this._countdownTimer = null;
     }
+    // v2.22.0: stop the replay playback timer (the interval would otherwise
+    // keep ticking on a destroyed chart and re-render it).
+    if (this.replay && this.replay._timer != null) {
+      clearInterval(this.replay._timer);
+      this.replay._timer = null;
+    }
+    this.replay.active = false;
     if (this._listeners) {
       for (const [target, type, fn, options] of this._listeners) {
         try { target.removeEventListener(type, fn, options); } catch (_) {}
