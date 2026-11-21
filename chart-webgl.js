@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.24.0 — WEBGL EDITION (chart-webgl.js)
+ * BADI-CHARTS-V2 v2.25.0 — WEBGL EDITION (chart-webgl.js)
  * The complete standalone trading chart library, rendered with real WebGL.
  *
  * THIS FILE IS A FULL LIBRARY, NOT A LAYER. Load it INSTEAD of chart.js —
@@ -385,7 +385,7 @@
 'use strict';
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.24.0';
+const VERSION = '2.25.0';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 // v2.14.0 (audit #12): tracks the chart the user last hovered/touched, so
 // window-level keyboard shortcuts only apply to ONE chart on multi-chart pages.
@@ -3173,7 +3173,18 @@ class TradingChart {
     // unavailable, GLCtx forwards every call to the native 2D context and the
     // chart behaves exactly like the 2D edition (zero feature loss).
     this._glBackend = (typeof createGLBackend === 'function') ? createGLBackend(canvas) : null;
-    this.ctx = new GLCtx(this._glBackend, canvas, canvas.getContext('2d'));
+    const _ctx2d = canvas.getContext('2d');
+    this.ctx = new GLCtx(this._glBackend, canvas, _ctx2d);
+    // v2.25.0 FIX (RTL text scrambling): canvas fillText applies the Unicode
+    // bidi algorithm using the PAGE's direction by default ('inherit'), so in
+    // an RTL document (dir="rtl", e.g. an Arabic UI) mixed labels like
+    // "21 Nov, 21:21" (or "21 نوفمبر، 21:21") reorder into scrambled text
+    // ("21 21:50, نوفمبر"). TradingView charts always read LTR regardless of
+    // the UI language — the chart canvas is now pinned to LTR too. An
+    // integrator who prefers RTL rendering can set
+    // chart.ctx._nc.direction = 'inherit' (WebGL edition, raw 2D context)
+    // after construction.
+    try { _ctx2d.direction = 'ltr'; } catch (_) {}
     if (this._glBackend) this._glBackend.attach(canvas);
 
     // v2.3.0+: Mobile optimization — cap DPR at 2 on mobile to avoid the
@@ -6435,79 +6446,151 @@ class TradingChart {
   invalidateTimeMarks() { this._timeMarksCache = null; }
 
   getTimeMarks() {
-    // v2.15.0: this method was called up to 3× per frame (drawTimeAxis,
-    // drawPane, background) and REBUILT the mark array every time. The result
+    // v2.15.0: this method was called up to 3x per frame (drawTimeAxis,
+    // drawGrid, background) and REBUILT the mark array every time. The result
     // is now cached in _timeMarksCache; autoScale() clears it whenever the
     // viewport or data changes, so all call sites within one frame share
     // exactly one build.
     if (this._timeMarksCache) return this._timeMarksCache;
-    const visibleBars = Math.ceil((this.chartRight - this.chartLeft) / this.barSpacing);
     const firstIdx = Math.floor(this.xToIndex(this.chartLeft));
     const lastIdx = Math.ceil(this.xToIndex(this.chartRight));
     const tfSec = (this.timeframe.ms || 60000) / 1000;
-    // v2.20.4: TIME-ANCHORED marks (was INDEX-anchored before).
-    // The old code computed startMark = ceil(firstIdx / stepInBars) * stepInBars
-    // — a multiple of stepInBars (an INDEX). When a new candle was appended
-    // at the live edge, the view scrolled left by 1 bar, firstIdx crossed a
-    // stepInBars boundary, and ALL marks suddenly jumped by `stepInBars`
-    // bars (e.g. 10 bars at once) — visible as a jarring "strange movement"
-    // in the time axis + vertical gridlines.
+    const candles = this.sim.candles;
+    const N = candles.length;
+    if (N === 0) { this._timeMarksCache = []; return this._timeMarksCache; }
+
+    // v2.25.0: BAR-ANCHORED marks — TradingView/LWC semantics. This replaces
+    // the v2.20.4 uniform-arithmetic mapping (idx = (t - firstCandleTime) /
+    // tfSec) and fixes two visible defects on feeds whose candle times have
+    // GAPS (OTC brokers, session breaks, weekend gaps, reconnects — fewer
+    // candles than elapsed minutes):
     //
-    // Now marks are anchored to natural TIME boundaries (epoch multiples of
-    // a "nice" seconds step). The mark TIMES don't depend on which candle
-    // is visible, so as the chart scrolls (or new candles appear), the marks
-    // glide smoothly by 1 bar per candle instead of jumping in stepInBars
-    // chunks. The mark INDEX is computed AFTER the fact (time → fractional
-    // index) so indexToX(idx) still positions the label correctly.
-    const firstTime = this._timeAtIndex(firstIdx);
-    const lastTime = this._timeAtIndex(lastIdx);
-    const spanSec = Math.max(1, lastTime - firstTime);
+    //   BUG 1 (label drift): the old formula ASSUMED uniform candle times,
+    //   so every mark landed to the RIGHT of the candle that actually owns
+    //   its time; the crosshair (which reads real candle times) disagreed
+    //   with the axis labels — visibly: crosshair "21:21:50" while the label
+    //   one bar away read "21:38".
+    //
+    //   BUG 2 (vanishing half-axis): marks whose arithmetic index fell
+    //   outside [firstIdx-1, lastIdx+1] were dropped — with a big gap the
+    //   left half of the axis rendered NO labels and NO vertical grid lines
+    //   at all.
+    //
+    //   LWC (TradingView's engine, src/model/tick-marks.ts) anchors every
+    //   tick to an actual BAR and enforces maxIndexesPerMark =
+    //   ceil(maxLabelWidth / barSpacing) between labels, higher weights
+    //   (year > month > day > time) winning the space first. We now do the
+    //   same, using nice TIME boundaries only to choose WHICH bars get the
+    //   marks:
+    //     1. A visible bar becomes a mark when it is the FIRST bar at or
+    //        after an epoch boundary (multiple of a "nice" step). The label
+    //        shows the bar's REAL time — a label always names the candle
+    //        underneath it, whatever gaps the feed has.
+    //     2. Weight = change vs the PREVIOUS REAL candle time, so day /
+    //        month / year marks land exactly where TradingView puts them
+    //        (e.g. the first bar after a weekend gap shows the day number).
+    //     3. Density: Time-weight marks need maxIdxPerMark bars of spacing;
+    //        higher-weight marks are always kept (LWC priority rule).
+    //     4. Past / future areas (beyond the data) snap boundaries to the
+    //        nearest bar of the uniform extrapolated grid — ticks stay ON
+    //        bars there too.
+    //
+    //   The smooth-scroll property of v2.20.4 is preserved: each mark is
+    //   tied to a fixed boundary time or a fixed candle, so appending a
+    //   live candle moves marks exactly 1 bar — never jumping.
+    const spanSec = Math.max(1, this._timeAtIndex(lastIdx) - this._timeAtIndex(firstIdx));
     // "Nice" time steps (in seconds) — natural boundaries a user expects:
-    // minutes → hours → days → weeks → months → years.
+    // minutes -> hours -> days -> weeks -> months -> years.
     const niceTimeSteps = [
-      60,         // 1 min
-      120,        // 2 min
-      300,        // 5 min
-      900,        // 15 min
-      1800,       // 30 min
-      3600,       // 1 hour
-      7200,       // 2 hours
-      14400,      // 4 hours
-      21600,      // 6 hours
-      43200,      // 12 hours
-      86400,      // 1 day
-      172800,     // 2 days
-      604800,     // 1 week
-      1209600,    // 2 weeks
-      2592000,    // ~1 month
-      7776000,    // ~3 months
-      15552000,   // ~6 months
-      31536000    // 1 year
+      60, 120, 300, 900, 1800, 3600, 7200, 14400, 21600, 43200,
+      86400, 172800, 604800, 1209600, 2592000, 7776000, 15552000, 31536000
     ];
     const targetStepSec = spanSec / 10;   // aim for ~10 marks across the visible span
     let stepSec = niceTimeSteps.find(s => s >= targetStepSec);
     if (!stepSec) stepSec = Math.ceil(targetStepSec / 31536000) * 31536000;
-    // Step must be at least tfSec — otherwise marks would be denser than one
-    // per candle and labels would overlap.
     if (stepSec < tfSec) stepSec = tfSec;
-    // First mark time >= firstTime, aligned to stepSec (epoch-anchored).
-    const startMarkTime = Math.ceil(firstTime / stepSec) * stepSec;
-    // Build marks. Each mark has a TIME and a (possibly fractional) INDEX.
-    // The index is what indexToX() uses to position the label; making it
-    // fractional lets a mark sit BETWEEN two candles when stepSec isn't a
-    // multiple of tfSec (e.g. 15-min marks on a 5-min chart align exactly,
-    // but 15-min marks on a 7-min chart fall between candles — which is the
-    // correct visual: the mark represents a time, not a candle).
+    // LWC tick-marks.ts: maxIndexesPerMark = ceil(maxWidth / spacing) — the
+    // minimum BAR distance between two labels so text never collides. 52px
+    // conservatively covers the widest axis labels ("21:38", "21 Nov") at
+    // the axis font; drawTimeAxis still measures real widths as a guard.
+    const maxIdxPerMark = Math.max(1, Math.ceil(52 / this.barSpacing));
+
     const marks = [];
-    const firstCandleTime = this.sim.candles.length > 0 ? this.sim.candles[0].time : 0;
-    for (let t = startMarkTime; t <= lastTime + stepSec; t += stepSec) {
-      if (t <= 0) continue;
-      const idx = (t - firstCandleTime) / tfSec;
-      if (idx < firstIdx - 1 || idx > lastIdx + 1) continue;
-      const prevT = t - tfSec;
-      const w = assignTimeWeight(prevT, t);
-      marks.push({ index: idx, time: t, weight: w });
+    let lastKept = -Infinity;   // index of the last kept mark (chain rule)
+
+    // -- PAST area (idx < 0): synthetic bars firstT - k*tfSec ---------------
+    // Two passes: collect candidates by DESCENDING boundary, then filter in
+    // ASCENDING index order (the LWC spacing chain is directional — a
+    // descending walk with an ascending chain rule would keep nothing).
+    if (firstIdx < 0) {
+      const firstT = candles[0].time;
+      const past = [];
+      let b = Math.floor(firstT / stepSec) * stepSec;   // last boundary <= firstT
+      while (b > 0) {
+        const k = Math.max(1, Math.round((firstT - b) / tfSec));
+        const idx = -k;
+        if (idx < firstIdx - 1) break;
+        const t = firstT - k * tfSec;
+        if (t > 0) {
+          const w = assignTimeWeight(t - tfSec, t);
+          past.push({ index: idx, time: t, weight: w });
+        }
+        b -= stepSec;
+        if (past.length > 400) break;   // safety valve at extreme zoom-out
+      }
+      past.reverse();                   // ascending index
+      let lastKeptP = -Infinity;
+      for (const m of past) {
+        if (m.index <= lastKeptP) continue;   // dedupe snapped collisions
+        if (m.weight > TickMarkWeight.Time || m.index - lastKeptP >= maxIdxPerMark) {
+          marks.push(m);
+          lastKeptP = m.index;
+        }
+      }
+      lastKept = marks.length ? marks[marks.length - 1].index : -Infinity;
     }
+
+    // -- REAL bars: boundary walk over visible candles ----------------------
+    const visFirst = Math.max(0, firstIdx);
+    const visLast = Math.min(lastIdx, N - 1);
+    if (visFirst <= visLast) {
+      // First boundary that can mark a VISIBLE candle: the first boundary
+      // after the previous candle's time (a boundary falling between
+      // candles [visFirst-1] and [visFirst] marks candle visFirst itself).
+      const prevAnchor = (visFirst > 0 ? candles[visFirst - 1].time : candles[visFirst].time - tfSec);
+      let b = (Math.floor(prevAnchor / stepSec) + 1) * stepSec;
+      for (let i = visFirst; i <= visLast; i++) {
+        const t = candles[i].time;
+        if (t < b) continue;                       // candle before the next boundary
+        const prevT = i > 0 ? candles[i - 1].time : t - tfSec;
+        const w = assignTimeWeight(prevT, t);
+        if (w > TickMarkWeight.Time || i - lastKept >= maxIdxPerMark) {
+          marks.push({ index: i, time: t, weight: w });
+          lastKept = i;
+        }
+        b = (Math.floor(t / stepSec) + 1) * stepSec;   // next boundary strictly after t
+      }
+    }
+
+    // -- FUTURE area (idx >= N): synthetic bars lastT + k*tfSec -------------
+    if (lastIdx >= N) {
+      const lastT = candles[N - 1].time;
+      let b = (Math.floor(lastT / stepSec) + 1) * stepSec;   // first boundary after lastT
+      while (true) {
+        const k = Math.max(1, Math.round((b - lastT) / tfSec));
+        const idx = (N - 1) + k;
+        if (idx > lastIdx + 1) break;
+        const t = lastT + k * tfSec;
+        const w = assignTimeWeight(t - tfSec, t);
+        if (idx > lastKept && (w > TickMarkWeight.Time || idx - lastKept >= maxIdxPerMark)) {
+          marks.push({ index: idx, time: t, weight: w });
+          lastKept = idx;
+        }
+        b += stepSec;
+        if (marks.length > 400) break;   // safety valve at extreme zoom-out
+      }
+    }
+
     this._timeMarksCache = marks;
     return marks;
   }
@@ -10389,28 +10472,51 @@ class TradingChart {
     const t = this._timeAtIndex(idx);
     const date = new Date(t * 1000);
     const tfSec = (this.timeframe.ms || 60000) / 1000;
+    // v2.25.0 FIX (TradingView semantics): the crosshair axis label is now
+    // SINGLE-FIELD — time only for intraday ("HH:MM", "HH:MM:SS" below one
+    // minute), date only for daily+. The old intraday format mixed a
+    // localized MONTH word with digits ("21 Nov, 21:21" — or with a locale:
+    // "21 نوفمبر، 21:21"), a bidi-fragile string that canvas fillText
+    // reorders under an RTL page direction into scrambled text like
+    // "21 21:50, نوفمبر". The date context lives on the axis's day-boundary
+    // tick labels instead (getTimeMarks weights) — exactly how TradingView
+    // does it.
+    // Also: when only a timezone was configured, Intl.DateTimeFormat
+    // received `undefined` as locale and picked up the VISITOR's browser
+    // language (Arabic month names on an English UI). The fallback locale is
+    // now pinned to 'en-US' unless the integrator passes opts.locale.
     let timeStr;
-    if (this._locale || this._timezone) {
-      // Use Intl for locale + timezone display. The format chooses fields
-      // automatically based on the timeframe span (matches the UTC branches
-      // below: day+ for daily+, time+seconds for sub-minute).
-      try {
-        const opts = {};
-        if (tfSec >= 86400) { opts.year = 'numeric'; opts.month = 'short'; opts.day = '2-digit'; }
-        else if (tfSec < 60) { opts.hour = '2-digit'; opts.minute = '2-digit'; opts.second = '2-digit'; }
-        else { opts.month = 'short'; opts.day = '2-digit'; opts.hour = '2-digit'; opts.minute = '2-digit'; }
-        if (this._timezone) opts.timeZone = this._timezone;
-        if (this._hour12 != null) opts.hour12 = this._hour12;
-        timeStr = new Intl.DateTimeFormat(this._locale || undefined, opts).format(date);
-      } catch (_) { timeStr = String(t); }
-    } else {
-      const pad2 = (n) => n < 10 ? '0' + n : '' + n;
-      if (tfSec >= 86400) {
-        timeStr = date.getUTCFullYear() + '-' + pad2(date.getUTCMonth() + 1) + '-' + pad2(date.getUTCDate());
-      } else if (tfSec < 60) {
-        timeStr = pad2(date.getUTCHours()) + ':' + pad2(date.getUTCMinutes()) + ':' + pad2(date.getUTCSeconds());
+    if (tfSec >= 86400) {
+      // Daily and above → date only
+      if (this._locale || this._timezone) {
+        try {
+          const opts = { year: 'numeric', month: 'short', day: '2-digit' };
+          if (this._timezone) opts.timeZone = this._timezone;
+          if (this._hour12 != null) opts.hour12 = this._hour12;
+          timeStr = new Intl.DateTimeFormat(this._locale || 'en-US', opts).format(date);
+        } catch (_) { timeStr = String(t); }
       } else {
-        timeStr = pad2(date.getUTCMonth() + 1) + '-' + pad2(date.getUTCDate()) + ' ' + pad2(date.getUTCHours()) + ':' + pad2(date.getUTCMinutes());
+        const pad2 = (n) => n < 10 ? '0' + n : '' + n;
+        timeStr = date.getUTCFullYear() + '-' + pad2(date.getUTCMonth() + 1) + '-' + pad2(date.getUTCDate());
+      }
+    } else {
+      // Intraday → time only (seconds for sub-minute timeframes)
+      if (this._locale || this._timezone) {
+        try {
+          const opts = (tfSec < 60)
+            ? { hour: '2-digit', minute: '2-digit', second: '2-digit' }
+            : { hour: '2-digit', minute: '2-digit' };
+          if (this._timezone) opts.timeZone = this._timezone;
+          if (this._hour12 != null) opts.hour12 = this._hour12;
+          timeStr = new Intl.DateTimeFormat(this._locale || 'en-US', opts).format(date);
+        } catch (_) { timeStr = String(t); }
+      } else {
+        const pad2 = (n) => n < 10 ? '0' + n : '' + n;
+        if (tfSec < 60) {
+          timeStr = pad2(date.getUTCHours()) + ':' + pad2(date.getUTCMinutes()) + ':' + pad2(date.getUTCSeconds());
+        } else {
+          timeStr = pad2(date.getUTCHours()) + ':' + pad2(date.getUTCMinutes());
+        }
       }
     }
     ctx.font = '11px -apple-system, Segoe UI, Roboto, sans-serif';
