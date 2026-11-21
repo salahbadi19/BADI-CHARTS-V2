@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.19.1 — Pixel-Perfect Pure JavaScript Trading Chart Library
+ * BADI-CHARTS-V2 v2.19.2 — Pixel-Perfect Pure JavaScript Trading Chart Library
  *
  * A lightweight, dependency-free candlestick charting library built entirely
  * with the HTML5 Canvas API. Inspired by TradingView Lightweight Charts.
@@ -378,7 +378,7 @@ var Path2D = (typeof window !== 'undefined' && window.Path2D)
     })();
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.19.1';
+const VERSION = '2.19.2';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 // v2.14.0 (audit #12): tracks the chart the user last hovered/touched, so
 // window-level keyboard shortcuts only apply to ONE chart on multi-chart pages.
@@ -3871,9 +3871,22 @@ class TradingChart {
       }
     } else if (this.activeTool === 'eraser') {
       if (this.hoverDrawing) {
-        this.drawings = this.drawings.filter(d => d !== this.hoverDrawing);
+        const removed = this.hoverDrawing;
+        this.drawings = this.drawings.filter(d => d !== removed);
         this.hoverDrawing = null;
+        // v2.22.2 (the "frozen chart after erase" bug): if the erased drawing
+        // was also the selected one, drop the selection — a dangling
+        // selectedDrawing kept its properties panel alive on a ghost object.
+        if (this.selectedDrawing === removed) this.deselectDrawing();
         this.showToast('Drawing deleted');
+        // v2.22.2 (TradingView semantics): the eraser is a ONE-SHOT action —
+        // after it deletes a drawing the tool returns to cursor so panning
+        // works again immediately. Previously the tool STAYED 'eraser': every
+        // drag on empty space did nothing (the eraser branch never starts a
+        // pan), so the chart appeared frozen until the user manually picked
+        // the cursor tool again. Reverting also fires onToolChange.
+        this.setTool('cursor');
+        this.invalidate();
       }
     } else if (this.inChartArea(x, y)) {
       // v2.10.0: two-step drawing. A 2nd click on an armed preview PLACES the
@@ -7470,6 +7483,7 @@ class TradingChart {
             this.drawings = this.drawings.filter(function (dd) { return dd !== d; });
             this.selectedDrawing = null;
             this.showToast('Drawing deleted');
+            this.invalidate();   // v2.22.2: showToast does NOT repaint — delete did
             break;
           case 'lock':
             d.locked = !d.locked;
