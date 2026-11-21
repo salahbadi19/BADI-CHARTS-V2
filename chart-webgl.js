@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.23.0 — WEBGL EDITION (chart-webgl.js)
+ * BADI-CHARTS-V2 v2.24.0 — WEBGL EDITION (chart-webgl.js)
  * The complete standalone trading chart library, rendered with real WebGL.
  *
  * THIS FILE IS A FULL LIBRARY, NOT A LAYER. Load it INSTEAD of chart.js —
@@ -385,7 +385,7 @@
 'use strict';
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.23.0';
+const VERSION = '2.24.0';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 // v2.14.0 (audit #12): tracks the chart the user last hovered/touched, so
 // window-level keyboard shortcuts only apply to ONE chart on multi-chart pages.
@@ -3477,6 +3477,32 @@ class TradingChart {
     this._instanceTools = [];     // v2.5.0+: per-instance tool metadata (don't pollute global DRAW_TOOLS)
     this._drawPanelHits = [];     // hit-test for drawing properties panel
 
+    // v2.24.0: USER-OWNED drawing settings strip ("شريط إعدادات الأداة").
+    // The user controls WHETHER it appears (enabled / show/hide/toggle), its
+    // SHAPE (position, offset, button size, height, radius, colors) and its
+    // CONTENT (actions list — subset, order, and custom buttons). Defaults
+    // preserve the classic v2.2.0 strip: top-center, all buttons.
+    this._drawPanelCfg = Object.assign({
+      enabled: true,                        // master switch — false → never rendered
+      actions: ['delete','lock','|','color','|','width','|','duplicate','settings'],
+                                            // '|' or 'divider' = separator; custom ids allowed
+      colors: ['#2962ff','#26a69a','#ef5350','#ff9800','#9c27b0','#e91e63','#f0f3fa','#787b86'],
+      widths: [1, 1.5, 2, 3, 5],
+      position: 'top',                      // 'top' | 'bottom' | 'near' | {x,y}
+      offset: 4,                            // px from the anchor edge
+      btnSize: 20,                          // icon button square (px)
+      height: 30,                           // strip height (px)
+      draggable: false,                     // user can drag the strip by its background
+      bg: 'rgba(26,30,42,0.95)',
+      radius: 5,
+      fg: null                              // icon color override (default: theme.textDim)
+    }, (opts.drawingPanel && typeof opts.drawingPanel === 'object') ? opts.drawingPanel : {});
+    if (this._drawPanelCfg.actions) this._drawPanelActionsCustomized = true;
+    this._drawPanelCustomActions = {};      // id → { icon, title, onClick(d, inst) }
+    this._drawPanelRect = null;             // {x,y,w,h} of the rendered strip (drag + background hit)
+    this._drawPanelPos = null;              // manual {x,y} after a user drag (per-selection)
+    this._drawPanelDrag = null;             // in-flight strip drag state
+
     // v2.7.0: Candle markers (arrows/icons drawn above/below candles)
     this.markers = [];
     // v2.7.0: Drawing drag state (handle drag + whole-drawing drag)
@@ -4446,9 +4472,104 @@ class TradingChart {
   // The selected drawing is stored in this.selectedDrawing.
   selectDrawing(drawing) {
     this.selectedDrawing = drawing;
+    // v2.24.0: the strip's dragged position is PER-SELECTION — reselecting
+    // (or selecting another drawing) restores the configured anchor.
+    this._drawPanelPos = null;
+    this._drawPanelDrag = null;
   }
   deselectDrawing() {
     this.selectedDrawing = null;
+    this._drawPanelPos = null;
+    this._drawPanelDrag = null;
+  }
+
+  // ─── v2.24.0: user-owned drawing settings strip API ──────────────────────
+  // The strip is no longer a hard-wired rectangle: the integrator (and any
+  // end-user UI built on top) controls visibility, shape and content.
+  // Merge a PARTIAL config: setDrawingPanel({ enabled:false, actions:['delete','lock'],
+  // position:'near', draggable:true, btnSize:24, height:36, bg:'#111' })
+  setDrawingPanel(cfg) {
+    if (!cfg || typeof cfg !== 'object') return this;
+    const c = this._drawPanelCfg;
+    const KEYS = ['enabled','actions','colors','widths','position','offset','btnSize','height','draggable','bg','radius','fg'];
+    for (let i = 0; i < KEYS.length; i++) {
+      const k = KEYS[i];
+      if (cfg[k] !== undefined) c[k] = cfg[k];
+    }
+    if (cfg.actions) this._drawPanelActionsCustomized = true;
+    // A reshaped/disabled strip must not keep stale hit areas or a stale
+    // dragged position alive.
+    this._drawPanelPos = null;
+    this._drawPanelDrag = null;
+    this.invalidate();
+    return this;
+  }
+  // Snapshot of the current strip config (safe copy).
+  getDrawingPanel() {
+    const c = this._drawPanelCfg;
+    return {
+      enabled: c.enabled,
+      actions: (c.actions || []).slice(),
+      colors: (c.colors || []).slice(),
+      widths: (c.widths || []).slice(),
+      position: c.position,
+      offset: c.offset,
+      btnSize: c.btnSize,
+      height: c.height,
+      draggable: c.draggable,
+      bg: c.bg,
+      radius: c.radius,
+      fg: c.fg
+    };
+  }
+  // Visibility — the USER decides whether the strip appears at all.
+  showDrawingPanel()  { this._drawPanelCfg.enabled = true;  this.invalidate(); return this; }
+  hideDrawingPanel()  { this._drawPanelCfg.enabled = false; this._drawPanelHits = []; this._drawPanelRect = null; this.invalidate(); return this; }
+  toggleDrawingPanel() {
+    return this._drawPanelCfg.enabled ? this.hideDrawingPanel() : this.showDrawingPanel();
+  }
+  // Register a custom strip button: { id, icon, title, onClick(drawing, inst) }.
+  // icon: string (text/emoji, rendered centered) or function(ctx, cx, cy, drawing).
+  // Include the id in `actions` to place it (auto-appended while the actions
+  // list was never customized, so it shows up immediately).
+  addDrawingPanelAction(def) {
+    if (!def || !def.id) return this;
+    this._drawPanelCustomActions[def.id] = {
+      icon: def.icon || '◆',
+      title: def.title || def.id,
+      onClick: (typeof def.onClick === 'function') ? def.onClick : null
+    };
+    const acts = this._drawPanelCfg.actions;
+    if (!this._drawPanelActionsCustomized && acts && acts.indexOf(def.id) < 0) {
+      acts.push(def.id);   // never-customized list → the new button just appears
+    }
+    this.invalidate();
+    return this;
+  }
+  removeDrawingPanelAction(id) {
+    if (this._drawPanelCustomActions[id]) delete this._drawPanelCustomActions[id];
+    const acts = this._drawPanelCfg.actions;
+    if (acts) {
+      const i = acts.indexOf(id);
+      if (i >= 0) acts.splice(i, 1);
+    }
+    this.invalidate();
+    return this;
+  }
+  // Drop the manual (dragged) strip position — back to the configured anchor.
+  resetDrawingPanelPos() { this._drawPanelPos = null; this.invalidate(); return this; }
+  // Bounding box (media px) around a drawing's control points — used by the
+  // 'near' strip position to hug the selected drawing.
+  _drawingBBox(d) {
+    const hs = this._getDrawingHandles(d);
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (let i = 0; i < hs.length; i++) {
+      minX = Math.min(minX, hs[i].x); maxX = Math.max(maxX, hs[i].x);
+      minY = Math.min(minY, hs[i].y); maxY = Math.max(maxY, hs[i].y);
+    }
+    if (!isFinite(minX)) return { x: this.chartLeft, y: this.chartTop, w: 120, h: 60 };
+    const pad = 24;
+    return { x: minX - pad, y: minY - pad, w: (maxX - minX) + pad * 2, h: (maxY - minY) + pad * 2 };
   }
   updateDrawingStyle(drawing, style) {
     if (!drawing) return;
@@ -5138,6 +5259,17 @@ class TradingChart {
       }
       return;
     }
+    // v2.24.0: dragging the user-owned drawing settings strip (touch)
+    if (this._drawPanelDrag && touches.length >= 1) {
+      const t0 = touches[0];
+      const x = t0.clientX - r.left, y = t0.clientY - r.top;
+      this._drawPanelPos = {
+        x: clamp(x - this._drawPanelDrag.dx, this.chartLeft + 2, Math.max(this.chartLeft + 2, this.W - (this._drawPanelRect ? this._drawPanelRect.w : 60) - 2)),
+        y: clamp(y - this._drawPanelDrag.dy, this.chartTop + 2, Math.max(this.chartTop + 2, this.H - (this._drawPanelRect ? this._drawPanelRect.h : 30) - 2))
+      };
+      this.invalidate();
+      return;
+    }
     // v2.7.0: Drawing handle drag takes priority over everything else (touch)
     if (this._dragHandle && touches.length >= 1) {
       const t0 = touches[0];
@@ -5229,6 +5361,12 @@ class TradingChart {
       this._paneResize = null;
       try { this.canvas.style.cursor = ''; } catch (_) {}
     }
+    // v2.24.0: release the drawing settings strip drag (touch)
+    if (this._drawPanelDrag) {
+      this._drawPanelDrag = null;
+      try { this.canvas.style.cursor = ''; } catch (_) {}
+      this.invalidate();
+    }
     // v2.7.0: clear drawing drag states
     this._dragHandle = null;
     this._dragWhole = null;
@@ -5297,6 +5435,16 @@ class TradingChart {
       sc.y = clamp(this._settingsCardDrag.startCardY + dy,
                    this.chartTop + 4,
                    Math.max(this.chartTop + 4, this.H - sc.h - 4));
+      this.invalidate();
+      return;
+    }
+    // v2.24.0: dragging the user-owned drawing settings strip — move it
+    // freely and return (no pan/crosshair while the strip is being dragged).
+    if (this._drawPanelDrag) {
+      this._drawPanelPos = {
+        x: clamp(x - this._drawPanelDrag.dx, this.chartLeft + 2, Math.max(this.chartLeft + 2, this.W - (this._drawPanelRect ? this._drawPanelRect.w : 60) - 2)),
+        y: clamp(y - this._drawPanelDrag.dy, this.chartTop + 2, Math.max(this.chartTop + 2, this.H - (this._drawPanelRect ? this._drawPanelRect.h : 30) - 2))
+      };
       this.invalidate();
       return;
     }
@@ -5865,6 +6013,12 @@ class TradingChart {
     // v2.21.2: stop dragging the settings card
     if (this._settingsCardDrag) {
       this._settingsCardDrag = null;
+      try { this.canvas.style.cursor = ''; } catch (_) {}
+      this.invalidate();
+    }
+    // v2.24.0: stop dragging the drawing settings strip
+    if (this._drawPanelDrag) {
+      this._drawPanelDrag = null;
       try { this.canvas.style.cursor = ''; } catch (_) {}
       this.invalidate();
     }
@@ -9419,42 +9573,82 @@ class TradingChart {
   }
 
   /* --------------------------- Drawing Properties Panel ------------------- */
-  // Floating rectangle that appears when a drawing is selected.
-  // v2.2.0+: The panel is ALWAYS positioned at the top of the chart (not next
-  // to the drawing) so it never overlaps the price/time axes and stays in a
-  // predictable location. Contains: delete, lock, color picker, stroke width.
+  // v2.24.0: the strip is USER-OWNED — its visibility, shape and content all
+  // come from this._drawPanelCfg (see setDrawingPanel / showDrawingPanel /
+  // hideDrawingPanel / toggleDrawingPanel / addDrawingPanelAction). Defaults
+  // reproduce the classic v2.2.0 strip exactly: top-center, delete+lock+
+  // colors+widths+duplicate+settings, 20px buttons, 30px height.
   drawDrawingPanel() {
-    if (!this.selectedDrawing) { this._drawPanelHits = []; return; }
+    const cfg = this._drawPanelCfg;
+    if (!this.selectedDrawing || !cfg || cfg.enabled === false) {
+      this._drawPanelHits = [];
+      this._drawPanelRect = null;
+      return;
+    }
     const d = this.selectedDrawing;
     const ctx = this.ctx;
     this._drawPanelHits = [];
 
-    // Panel dimensions
-    const iconSize = 20;
-    const iconGap = 4;
-    const panelH = 30;
-    // Icons: delete, lock, color, width, duplicate
-    const colors = ['#2962ff','#26a69a','#ef5350','#ff9800','#9c27b0','#e91e63','#f0f3fa','#787b86'];
-    const widths = [1, 1.5, 2, 3, 5];
-    const numIcons = 5 + colors.length + widths.length; // delete + lock + colorSwatches + widthButtons + duplicate
-    const panelW = 8 + numIcons * (iconSize - 6) + 8;
+    // ── shape (user-configurable) ──
+    const iconSize = Math.max(12, cfg.btnSize | 0);
+    const panelH = Math.max(iconSize + 10, cfg.height | 0);
+    const colors = Array.isArray(cfg.colors) ? cfg.colors : [];
+    const widths = Array.isArray(cfg.widths) ? cfg.widths : [];
+    const acts = Array.isArray(cfg.actions) ? cfg.actions : [];
+    const SWATCH_STEP = 12, WIDTH_STEP = 13, DIV_STEP = 4;
 
-    // v2.2.0+: Always position at the top-center of the chart area.
-    const anchorX = clamp(this.chartLeft + (this.chartRight - this.chartLeft - panelW) / 2,
-                          this.chartLeft + 4, this.chartRight - panelW - 4);
-    const anchorY = this.chartTop + 4;
+    // Measure the strip width EXACTLY (same advances the draw pass uses).
+    let panelW = 6;   // left padding
+    for (let i = 0; i < acts.length; i++) {
+      const a = acts[i];
+      if (a === '|' || a === 'divider') { panelW += DIV_STEP; continue; }
+      if (a === 'color') { panelW += colors.length * SWATCH_STEP; continue; }
+      if (a === 'width') { panelW += widths.length * WIDTH_STEP; continue; }
+      panelW += iconSize - 4;   // any icon button (built-in or custom)
+    }
+    panelW += 6;      // right padding
 
-    // Draw panel background
-    ctx.fillStyle = 'rgba(26,30,42,0.95)';
-    this._roundRect(anchorX, anchorY, panelW, panelH, 5);
+    // ── anchor (user-configurable; a user drag wins over everything) ──
+    let ax, ay;
+    if (this._drawPanelPos) {
+      ax = this._drawPanelPos.x; ay = this._drawPanelPos.y;
+    } else {
+      const off = Math.max(0, cfg.offset | 0);
+      if (cfg.position === 'bottom') {
+        ax = clamp(this.chartLeft + (this.chartRight - this.chartLeft - panelW) / 2,
+                   this.chartLeft + 4, this.chartRight - panelW - 4);
+        ay = this.chartBottom - panelH - off;
+      } else if (cfg.position === 'near') {
+        // Hug the selected drawing: above its bounding box, flip below when
+        // the strip would leave the chart area.
+        const hb = this._drawingBBox(d);
+        ax = clamp(hb.x + hb.w / 2 - panelW / 2, this.chartLeft + 4, this.chartRight - panelW - 4);
+        ay = hb.y - panelH - off;
+        if (ay < this.chartTop + 2) ay = hb.y + hb.h + off;
+        ay = clamp(ay, this.chartTop + 2, this.chartBottom - panelH - 2);
+      } else if (cfg.position && typeof cfg.position === 'object') {
+        ax = cfg.position.x | 0; ay = cfg.position.y | 0;
+      } else {
+        // 'top' — the classic v2.2.0 anchor
+        ax = clamp(this.chartLeft + (this.chartRight - this.chartLeft - panelW) / 2,
+                   this.chartLeft + 4, this.chartRight - panelW - 4);
+        ay = this.chartTop + off;
+      }
+    }
+
+    // Draw panel background (user colors/radius)
+    ctx.fillStyle = cfg.bg || 'rgba(26,30,42,0.95)';
+    this._roundRect(ax, ay, panelW, panelH, cfg.radius | 0 || 5);
     ctx.fill();
     ctx.strokeStyle = this.theme.toolbarBorder;
     ctx.lineWidth = 1;
-    this._roundRect(anchorX + 0.5, anchorY + 0.5, panelW - 1, panelH - 1, 5);
+    this._roundRect(ax + 0.5, ay + 0.5, panelW - 1, panelH - 1, cfg.radius | 0 || 5);
     ctx.stroke();
+    this._drawPanelRect = { x: ax, y: ay, w: panelW, h: panelH };
 
-    let ix = anchorX + 6;
-    const iy = anchorY + 5;
+    let ix = ax + 6;
+    const iy = ay + (panelH - iconSize) / 2;
+    const iconColor = cfg.fg || this.theme.textDim;
     const drawIconBtn = function (iconFn, action, tooltip) {
       const isHover = this._hoverDrawPanelIcon === action;
       if (isHover) {
@@ -9462,124 +9656,163 @@ class TradingChart {
         this._roundRect(ix - 2, iy - 1, iconSize + 2, iconSize + 2, 3);
         ctx.fill();
       }
-      ctx.strokeStyle = isHover ? this.theme.textBright : this.theme.textDim;
-      ctx.fillStyle = isHover ? this.theme.textBright : this.theme.textDim;
+      ctx.strokeStyle = isHover ? this.theme.textBright : iconColor;
+      ctx.fillStyle = isHover ? this.theme.textBright : iconColor;
       ctx.lineWidth = 1.3;
       ctx.lineCap = 'round'; ctx.lineJoin = 'round';
-      iconFn(ix + iconSize / 2, iy + iconSize / 2);
+      try { iconFn(ix + iconSize / 2, iy + iconSize / 2); } catch (_) {}
       this._drawPanelHits.push({ action: action, x: ix - 2, y: iy - 1, w: iconSize + 2, h: iconSize + 2 });
       ix += iconSize - 4;
     }.bind(this);
 
-    // 1. Delete (trash) icon
-    drawIconBtn(function (cx, cy) {
-      ctx.beginPath();
-      ctx.moveTo(cx - 4, cy - 3); ctx.lineTo(cx + 4, cy - 3);
-      ctx.moveTo(cx - 3, cy - 3); ctx.lineTo(cx - 3, cy + 4);
-      ctx.lineTo(cx + 3, cy + 4); ctx.lineTo(cx + 3, cy - 3);
-      ctx.moveTo(cx - 2, cy - 4); ctx.lineTo(cx + 2, cy - 4);
-      ctx.stroke();
-    }, 'delete', 'Delete');
-
-    // 2. Lock icon
-    drawIconBtn(function (cx, cy) {
-      if (d.locked) {
-        ctx.fillStyle = this.theme.accent;
+    // Built-in icon painters (extracted verbatim from the classic strip)
+    const ICONS = {
+      delete: function (cx, cy) {
         ctx.beginPath();
-        ctx.roundRect ? ctx.roundRect(cx - 4, cy - 1, 8, 6, 1) : ctx.rect(cx - 4, cy - 1, 8, 6);
-        ctx.fill();
-        ctx.strokeStyle = this.theme.accent;
-        ctx.beginPath();
-        ctx.arc(cx, cy - 1, 2.5, Math.PI, 0);
+        ctx.moveTo(cx - 4, cy - 3); ctx.lineTo(cx + 4, cy - 3);
+        ctx.moveTo(cx - 3, cy - 3); ctx.lineTo(cx - 3, cy + 4);
+        ctx.lineTo(cx + 3, cy + 4); ctx.lineTo(cx + 3, cy - 3);
+        ctx.moveTo(cx - 2, cy - 4); ctx.lineTo(cx + 2, cy - 4);
         ctx.stroke();
-      } else {
+      },
+      lock: function (cx, cy) {
+        if (d.locked) {
+          ctx.fillStyle = this.theme.accent;
+          ctx.beginPath();
+          ctx.roundRect ? ctx.roundRect(cx - 4, cy - 1, 8, 6, 1) : ctx.rect(cx - 4, cy - 1, 8, 6);
+          ctx.fill();
+          ctx.strokeStyle = this.theme.accent;
+          ctx.beginPath();
+          ctx.arc(cx, cy - 1, 2.5, Math.PI, 0);
+          ctx.stroke();
+        } else {
+          ctx.beginPath();
+          ctx.rect(cx - 4, cy - 1, 8, 6);
+          ctx.stroke();
+          ctx.beginPath();
+          ctx.arc(cx, cy - 1, 2.5, Math.PI, 0);
+          ctx.stroke();
+        }
+      },
+      duplicate: function (cx, cy) {
         ctx.beginPath();
-        ctx.rect(cx - 4, cy - 1, 8, 6);
+        ctx.rect(cx - 4, cy - 4, 6, 6);
+        ctx.rect(cx - 2, cy - 2, 6, 6);
+        ctx.stroke();
+      },
+      settings: function (cx, cy) {
+        ctx.beginPath();
+        ctx.arc(cx, cy, 3.2, 0, Math.PI * 2);
         ctx.stroke();
         ctx.beginPath();
-        ctx.arc(cx, cy - 1, 2.5, Math.PI, 0);
+        ctx.arc(cx, cy, 1.2, 0, Math.PI * 2);
         ctx.stroke();
+        for (let a = 0; a < 8; a++) {
+          const ang = (a / 8) * Math.PI * 2;
+          ctx.beginPath();
+          ctx.moveTo(cx + Math.cos(ang) * 3.2, cy + Math.sin(ang) * 3.2);
+          ctx.lineTo(cx + Math.cos(ang) * 5, cy + Math.sin(ang) * 5);
+          ctx.stroke();
+        }
       }
-    }, 'lock', 'Lock');
+    };
 
-    // 3. Divider
-    ctx.strokeStyle = this.theme.toolbarBorder;
-    ctx.beginPath(); ctx.moveTo(ix, iy + 2); ctx.lineTo(ix, iy + iconSize - 4); ctx.stroke();
-    ix += 4;
-
-    // 4. Color swatches
-    for (let ci = 0; ci < colors.length; ci++) {
-      const isSelected = d.color === colors[ci];
-      ctx.fillStyle = colors[ci];
-      ctx.beginPath();
-      ctx.arc(ix + 5, iy + iconSize / 2, isSelected ? 6 : 5, 0, Math.PI * 2);
-      ctx.fill();
-      if (isSelected) {
-        ctx.strokeStyle = this.theme.textBright;
-        ctx.lineWidth = 1.5;
-        ctx.beginPath();
-        ctx.arc(ix + 5, iy + iconSize / 2, 7, 0, Math.PI * 2);
-        ctx.stroke();
+    // Render the user's action list, in the user's order.
+    for (let i = 0; i < acts.length; i++) {
+      const a = acts[i];
+      if (a === '|' || a === 'divider') {
+        ctx.strokeStyle = this.theme.toolbarBorder;
+        ctx.beginPath(); ctx.moveTo(ix, iy + 2); ctx.lineTo(ix, iy + iconSize - 4); ctx.stroke();
+        ix += DIV_STEP;
+        continue;
       }
-      this._drawPanelHits.push({ action: 'color', value: colors[ci], x: ix - 1, y: iy - 1, w: 12, h: iconSize + 2 });
-      ix += 12;
+      switch (a) {
+        case 'color':
+          for (let ci = 0; ci < colors.length; ci++) {
+            const isSelected = d.color === colors[ci];
+            ctx.fillStyle = colors[ci];
+            ctx.beginPath();
+            ctx.arc(ix + 5, iy + iconSize / 2, isSelected ? 6 : 5, 0, Math.PI * 2);
+            ctx.fill();
+            if (isSelected) {
+              ctx.strokeStyle = this.theme.textBright;
+              ctx.lineWidth = 1.5;
+              ctx.beginPath();
+              ctx.arc(ix + 5, iy + iconSize / 2, 7, 0, Math.PI * 2);
+              ctx.stroke();
+            }
+            this._drawPanelHits.push({ action: 'color', value: colors[ci], x: ix - 1, y: iy - 1, w: SWATCH_STEP, h: iconSize + 2 });
+            ix += SWATCH_STEP;
+          }
+          break;
+        case 'width':
+          for (let wi = 0; wi < widths.length; wi++) {
+            const isSelected = (d.lineWidth || 1.5) === widths[wi];
+            ctx.strokeStyle = isSelected ? this.theme.accent : iconColor;
+            ctx.lineWidth = widths[wi];
+            ctx.beginPath();
+            ctx.moveTo(ix + 2, iy + iconSize / 2);
+            ctx.lineTo(ix + 10, iy + iconSize / 2);
+            ctx.stroke();
+            ctx.lineWidth = 1;
+            this._drawPanelHits.push({ action: 'width', value: widths[wi], x: ix - 1, y: iy - 1, w: WIDTH_STEP, h: iconSize + 2 });
+            ix += WIDTH_STEP;
+          }
+          break;
+        case 'delete':
+        case 'lock':
+        case 'duplicate':
+        case 'settings':
+          drawIconBtn(ICONS[a], a, a.charAt(0).toUpperCase() + a.slice(1));
+          break;
+        default: {
+          // v2.24.0: user-registered button (addDrawingPanelAction)
+          const cu = this._drawPanelCustomActions[a];
+          if (!cu) break;   // unknown id → skip silently (config typo must not crash render)
+          const self = this;
+          let iconFn;
+          if (typeof cu.icon === 'function') {
+            iconFn = function (cx, cy) { cu.icon(ctx, cx, cy, d); };
+          } else {
+            iconFn = function (cx, cy) {
+              ctx.save();
+              ctx.font = 'bold 11px -apple-system, Segoe UI, Roboto, sans-serif';
+              ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+              ctx.fillText(String(cu.icon).slice(0, 3), cx, cy);
+              ctx.restore();
+            };
+          }
+          drawIconBtn(iconFn, a, cu.title || a);
+          break;
+        }
+      }
     }
-
-    // 5. Divider
-    ctx.strokeStyle = this.theme.toolbarBorder;
-    ctx.beginPath(); ctx.moveTo(ix, iy + 2); ctx.lineTo(ix, iy + iconSize - 4); ctx.stroke();
-    ix += 4;
-
-    // 6. Stroke width buttons
-    for (let wi = 0; wi < widths.length; wi++) {
-      const isSelected = (d.lineWidth || 1.5) === widths[wi];
-      ctx.strokeStyle = isSelected ? this.theme.accent : this.theme.textDim;
-      ctx.lineWidth = widths[wi];
-      ctx.beginPath();
-      ctx.moveTo(ix + 2, iy + iconSize / 2);
-      ctx.lineTo(ix + 10, iy + iconSize / 2);
-      ctx.stroke();
-      ctx.lineWidth = 1;
-      this._drawPanelHits.push({ action: 'width', value: widths[wi], x: ix - 1, y: iy - 1, w: 13, h: iconSize + 2 });
-      ix += 13;
-    }
-
-    // 7. Divider
-    ctx.strokeStyle = this.theme.toolbarBorder;
-    ctx.beginPath(); ctx.moveTo(ix, iy + 2); ctx.lineTo(ix, iy + iconSize - 4); ctx.stroke();
-    ix += 4;
-
-    // 8. Duplicate icon
-    drawIconBtn(function (cx, cy) {
-      ctx.beginPath();
-      ctx.rect(cx - 4, cy - 4, 6, 6);
-      ctx.rect(cx - 2, cy - 2, 6, 6);
-      ctx.stroke();
-    }, 'duplicate', 'Duplicate');
-
-    // 9. Settings (gear) icon — v2.6.0: opens the deep drawing settings card
-    drawIconBtn(function (cx, cy) {
-      // Gear: circle + 8 teeth
-      ctx.beginPath();
-      ctx.arc(cx, cy, 3.2, 0, Math.PI * 2);
-      ctx.stroke();
-      ctx.beginPath();
-      ctx.arc(cx, cy, 1.2, 0, Math.PI * 2);
-      ctx.stroke();
-      for (let a = 0; a < 8; a++) {
-        const ang = (a / 8) * Math.PI * 2;
-        ctx.beginPath();
-        ctx.moveTo(cx + Math.cos(ang) * 3.2, cy + Math.sin(ang) * 3.2);
-        ctx.lineTo(cx + Math.cos(ang) * 5, cy + Math.sin(ang) * 5);
-        ctx.stroke();
-      }
-    }, 'settings', 'Deep settings');
 
     ctx.lineCap = 'butt'; ctx.lineJoin = 'miter';
   }
 
-  // Handle click on drawing properties panel
+  // Handle press on drawing properties strip (buttons + drag surface).
+  // v2.24.0: respects the user config (enabled), starts a strip drag when
+  // draggable and the press lands on the background, and dispatches
+  // user-registered custom actions via their onClick callback.
   _handleDrawPanelClick(x, y) {
+    const cfg = this._drawPanelCfg;
+    if (!cfg || cfg.enabled === false) return false;
+    // v2.24.0: draggable strip — a press on the BACKGROUND (not on a button)
+    // starts dragging the whole strip anywhere on the chart.
+    const r = this._drawPanelRect;
+    if (cfg.draggable && r &&
+        x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) {
+      let onBtn = false;
+      for (const h of this._drawPanelHits) {
+        if (x >= h.x && x <= h.x + h.w && y >= h.y && y <= h.y + h.h) { onBtn = true; break; }
+      }
+      if (!onBtn) {
+        this._drawPanelDrag = { dx: x - r.x, dy: y - r.y };
+        try { this.canvas.style.cursor = 'grabbing'; } catch (_) {}
+        return true;
+      }
+    }
     for (const h of this._drawPanelHits) {
       if (x >= h.x && x <= h.x + h.w && y >= h.y && y <= h.y + h.h) {
         const d = this.selectedDrawing;
@@ -9632,6 +9865,17 @@ class TradingChart {
             // v2.6.0: Open the deep drawing settings card
             this._openDrawingSettingsCard(d);
             break;
+          default: {
+            // v2.24.0: user-registered action (addDrawingPanelAction)
+            const cu = this._drawPanelCustomActions[h.action];
+            if (cu && typeof cu.onClick === 'function') {
+              try { cu.onClick(d, this); } catch (e) {
+                console.error('[BadiCharts] Drawing-panel action "' + h.action + '" error:', e);
+              }
+              this.invalidate();
+            }
+            break;
+          }
         }
         return true;
       }
