@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.19.0 — Pixel-Perfect Pure JavaScript Trading Chart Library
+ * BADI-CHARTS-V2 v2.19.1 — Pixel-Perfect Pure JavaScript Trading Chart Library
  *
  * A lightweight, dependency-free candlestick charting library built entirely
  * with the HTML5 Canvas API. Inspired by TradingView Lightweight Charts.
@@ -378,7 +378,7 @@ var Path2D = (typeof window !== 'undefined' && window.Path2D)
     })();
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.19.0';
+const VERSION = '2.19.1';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 // v2.14.0 (audit #12): tracks the chart the user last hovered/touched, so
 // window-level keyboard shortcuts only apply to ONE chart on multi-chart pages.
@@ -2512,6 +2512,13 @@ class TradingChart {
   _applyHandleDrag(x, y) {
     const h = this._dragHandle;
     if (!h || !h.d) return;
+    // v2.22.1 (TradingView-style threshold): a click that jitters a couple
+    // of pixels must NOT nudge the handle — a click (no real movement)
+    // selects, only a real drag moves.
+    if (h.startX !== undefined && !h.moved) {
+      if (Math.abs(x - h.startX) <= 3 && Math.abs(y - h.startY) <= 3) return;
+      h.moved = true;
+    }
     const d = h.d;
     const idx = this.xToIndex(x);
     const price = this.yToPrice(y);
@@ -2542,6 +2549,13 @@ class TradingChart {
   _applyWholeDrag(x, y) {
     const dw = this._dragWhole;
     if (!dw || !dw.d) return;
+    // v2.22.1 (TradingView-style threshold): a click that jitters a couple
+    // of pixels must NOT move the whole drawing a whole candle — a click
+    // (no real movement) selects, only a real drag moves.
+    if (dw.startX !== undefined && !dw.moved) {
+      if (Math.abs(x - dw.startX) <= 3 && Math.abs(y - dw.startY) <= 3) return;
+      dw.moved = true;
+    }
     const dIdx = this.xToIndex(x) - dw.startIdx;
     const dPrice = this.yToPrice(y) - dw.startPrice;
     const d = dw.d, s = dw.snapshot;
@@ -3194,7 +3208,10 @@ class TradingChart {
         if (this.selectedDrawing) {
           const handle = this._hitDrawingHandle(this.touchStartX, this.touchStartY);
           if (handle) {
-            this._dragHandle = { d: this.selectedDrawing, key: handle.key, ptIndex: handle.ptIndex };
+            this._dragHandle = {
+              d: this.selectedDrawing, key: handle.key, ptIndex: handle.ptIndex,
+              startX: this.touchStartX, startY: this.touchStartY, moved: false   // v2.22.1: threshold
+            };
             this.isDragging = false;
             return;
           }
@@ -3206,7 +3223,8 @@ class TradingChart {
             d: clickedDrawing,
             startIdx: this.xToIndex(this.touchStartX),
             startPrice: this.yToPrice(this.touchStartY),
-            snapshot: this._snapshotDrawing(clickedDrawing)
+            snapshot: this._snapshotDrawing(clickedDrawing),
+            startX: this.touchStartX, startY: this.touchStartY, moved: false   // v2.22.1: threshold
           };
           this.isDragging = false;
           return;
@@ -3419,7 +3437,16 @@ class TradingChart {
     if (this._paneResize || this._paneSepHoverId != null) {
       try { this.canvas.style.cursor = 'ns-resize'; } catch (_) {}
     } else if (this.activeTool === 'cursor') {
-      try { this.canvas.style.cursor = ''; } catch (_) {}
+      // v2.22.1 (TradingView affordance): a 'move' cursor over a selectable
+      // drawing tells the user it can be grabbed and dragged. Cheap
+      // hit-test: O(drawings), cursor mode only, chart area only.
+      let cur = '';
+      if (this.drawings.length && !this._dragHandle && !this._dragWhole &&
+          !this._paneResize && this.inChartArea(x, y)) {
+        const hd = this.findDrawingAt(x, y);
+        if (hd && !hd.locked) cur = 'move';
+      }
+      try { this.canvas.style.cursor = cur; } catch (_) {}
     }
 
     // v2.13.0: Per-pane separator drag — handle BEFORE everything else so the
@@ -3811,7 +3838,10 @@ class TradingChart {
         if (this.selectedDrawing) {
           const handle = this._hitDrawingHandle(x, y);
           if (handle) {
-            this._dragHandle = { d: this.selectedDrawing, key: handle.key, ptIndex: handle.ptIndex };
+            this._dragHandle = {
+              d: this.selectedDrawing, key: handle.key, ptIndex: handle.ptIndex,
+              startX: x, startY: y, moved: false   // v2.22.1: drag threshold
+            };
             return;
           }
         }
@@ -3820,11 +3850,14 @@ class TradingChart {
         if (clickedDrawing && !clickedDrawing.locked) {
           this.selectDrawing(clickedDrawing);
           // v2.7.0: set up whole-drawing drag (drag the tool to another candle area)
+          // v2.22.1: startX/startY/moved implement the TradingView-style
+          // click-to-select vs drag-to-move threshold (3px).
           this._dragWhole = {
             d: clickedDrawing,
             startIdx: this.xToIndex(x),
             startPrice: this.yToPrice(y),
-            snapshot: this._snapshotDrawing(clickedDrawing)
+            snapshot: this._snapshotDrawing(clickedDrawing),
+            startX: x, startY: y, moved: false
           };
           return;
         }
@@ -3861,6 +3894,19 @@ class TradingChart {
   }
 
   onMouseUp() {
+    // v2.22.1 FIX (stuck drawing drag — the reported bug): _dragHandle and
+    // _dragWhole were only ever cleared on the TOUCH path (onTouchEnd) and
+    // on the mouse path NEVER — releasing the button did not let go. Once
+    // you clicked a drawing to move it, it kept following the mouse forever
+    // (and panning became impossible because onMouseMove checks
+    // _dragWhole BEFORE isDragging). TradingView semantics: press → drag →
+    // release DROPS the object at that spot, definitively.
+    if (this._dragHandle || this._dragWhole) {
+      this._dragHandle = null;
+      this._dragWhole = null;
+      try { this.canvas.style.cursor = ''; } catch (_) {}
+      this.invalidate();
+    }
     // v2.12.0: Pane separator drag end — finalize the user height and let the
     // cursor style revert on the next mousemove.
     if (this._paneResize) {
@@ -4153,6 +4199,10 @@ class TradingChart {
       if (this.currentDrawing) this.showToast('Drawing cancelled');
       this.currentDrawing = null;
       this._drawAnchor = null;
+      // v2.22.1: also drop any in-progress drawing drag (safety net — e.g.
+      // the user presses Esc while a whole/handle drag is in flight).
+      this._dragHandle = null;
+      this._dragWhole = null;
       // v2.14.0 FIX (audit #44): go through setTool() so onToolChange fires
       // (a direct activeTool assignment silently bypassed the callback and
       // desynced external UIs).
@@ -6041,6 +6091,11 @@ class TradingChart {
     this.currentDrawing = null;
     this._drawAnchor = null;
     this._mouseDown = false;
+    // v2.22.1 (TradingView behavior): the just-placed drawing stays
+    // SELECTED — its handles + properties panel are immediately available,
+    // so the user can grab and move/adjust it right away without having to
+    // click it first.
+    this.selectDrawing(d);
     // v2.14.0 FIX (audit #44): setTool() so onToolChange fires.
     this.setTool('cursor');
     this.showToast('Drawing placed');
