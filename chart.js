@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.19.2 — Pixel-Perfect Pure JavaScript Trading Chart Library
+ * BADI-CHARTS-V2 v2.20.0 — Pixel-Perfect Pure JavaScript Trading Chart Library
  *
  * A lightweight, dependency-free candlestick charting library built entirely
  * with the HTML5 Canvas API. Inspired by TradingView Lightweight Charts.
@@ -378,7 +378,7 @@ var Path2D = (typeof window !== 'undefined' && window.Path2D)
     })();
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.19.2';
+const VERSION = '2.20.0';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 // v2.14.0 (audit #12): tracks the chart the user last hovered/touched, so
 // window-level keyboard shortcuts only apply to ONE chart on multi-chart pages.
@@ -2508,6 +2508,30 @@ class TradingChart {
     }
     return null;
   }
+  // v2.23.0 (TradingView semantics — the user's report): the CONTROL POINTS
+  // of a drawing are hot even when the drawing is NOT selected. Pressing
+  // within the grab radius of any endpoint/vertex selects that drawing and
+  // starts a POINT drag (reshape), never a whole-drag. Moving the whole tool
+  // is done by grabbing its line/body. (Previously an endpoint press landed
+  // on the body hit-test → the whole tool translated, so the two points
+  // "moved the drawing elsewhere" instead of resizing it.)
+  _hitAnyEndpoint(x, y) {
+    const r = 12;   // same generous grab radius as _hitDrawingHandle
+    for (let i = this.drawings.length - 1; i >= 0; i--) {
+      const d = this.drawings[i];
+      if (d.locked) continue;
+      // 'text' has a single anchor that IS its position — its body hit
+      // already moves it; there is no separate reshape gesture.
+      if (d.type === 'text') continue;
+      const handles = this._getDrawingHandles(d);
+      for (let k = 0; k < handles.length; k++) {
+        if (Math.hypot(x - handles[k].x, y - handles[k].y) <= r) {
+          return { d: d, key: handles[k].key, ptIndex: handles[k].ptIndex };
+        }
+      }
+    }
+    return null;
+  }
   // Apply a handle drag: move the drawing's point to the given position.
   _applyHandleDrag(x, y) {
     const h = this._dragHandle;
@@ -2522,16 +2546,29 @@ class TradingChart {
     const d = h.d;
     const idx = this.xToIndex(x);
     const price = this.yToPrice(y);
+    // v2.23.0 (the "points must resize, not move" bug — user report): a moved
+    // point must DROP its stale anchor time before re-stamping. The whole
+    // pipeline (render, hit-test, handle positions) reads _drawingIdxAt()
+    // which re-derives the index from the TIME field, and _stampDrawingTimes
+    // only fills NULL times. Without this clear, d.i2 changed but t2 kept
+    // pointing at the OLD candle — the point followed the mouse vertically
+    // only and horizontal reshape was completely dead.
     switch (h.key) {
-      case 'p1': d.i1 = idx; d.p1 = price; break;
-      case 'p2': d.i2 = idx; d.p2 = price; break;
-      case 'pt': if (d.points && d.points[h.ptIndex]) d.points[h.ptIndex] = { i: idx, p: price, x: x, y: y }; break;
+      case 'p1': d.i1 = idx; d.p1 = price; d.t1 = null; break;
+      case 'p2': d.i2 = idx; d.p2 = price; d.t2 = null; break;
+      case 'pt':
+        if (d.points && d.points[h.ptIndex]) {
+          d.points[h.ptIndex] = { i: idx, p: price, x: x, y: y };
+          if (d.tPoints) d.tPoints[h.ptIndex] = null;
+        }
+        break;
       case 'price': d.price = price; break;
-      case 'index': d.index = idx; break;
-      case 'anchor': d.i = idx; d.p = price; break;
+      case 'index': d.index = idx; d.tIdx = null; break;
+      case 'anchor': d.i = idx; d.p = price; d.tIdx = null; break;
     }
-    // v2.16.0 (#19): re-stamp anchor times so the moved point keeps following
-    // its new candle after future 50k trims.
+    // v2.16.0 (#19): re-stamp anchor times (now really re-stamps after the
+    // clear above) so the moved point keeps following its new candle after
+    // future 50k trims.
     this._stampDrawingTimes(d);
     if (typeof d.recalc === 'function') d.recalc();
     this.autoScale();
@@ -3216,6 +3253,19 @@ class TradingChart {
             return;
           }
         }
+        // v2.23.0 (TradingView semantics): endpoint hot-zones on UNSELECTED
+        // drawings (touch) — a press on a control point reshapes that point;
+        // it never translates the whole tool. Whole-move stays on the body.
+        const ep = this._hitAnyEndpoint(this.touchStartX, this.touchStartY);
+        if (ep) {
+          this.selectDrawing(ep.d);
+          this._dragHandle = {
+            d: ep.d, key: ep.key, ptIndex: ep.ptIndex,
+            startX: this.touchStartX, startY: this.touchStartY, moved: false   // v2.22.1: threshold
+          };
+          this.isDragging = false;
+          return;
+        }
         const clickedDrawing = this.findDrawingAt(this.touchStartX, this.touchStartY);
         if (clickedDrawing && !clickedDrawing.locked) {
           this.selectDrawing(clickedDrawing);
@@ -3440,11 +3490,19 @@ class TradingChart {
       // v2.22.1 (TradingView affordance): a 'move' cursor over a selectable
       // drawing tells the user it can be grabbed and dragged. Cheap
       // hit-test: O(drawings), cursor mode only, chart area only.
+      // v2.23.0: a control point (endpoint/vertex) wins over the body —
+      // 'pointer' there says "this dot reshapes the tool", while the line
+      // body stays 'move' ("this drags the whole tool").
       let cur = '';
       if (this.drawings.length && !this._dragHandle && !this._dragWhole &&
           !this._paneResize && this.inChartArea(x, y)) {
-        const hd = this.findDrawingAt(x, y);
-        if (hd && !hd.locked) cur = 'move';
+        const ep = this._hitAnyEndpoint(x, y);
+        if (ep) {
+          cur = 'pointer';
+        } else {
+          const hd = this.findDrawingAt(x, y);
+          if (hd && !hd.locked) cur = 'move';
+        }
       }
       try { this.canvas.style.cursor = cur; } catch (_) {}
     }
@@ -3844,6 +3902,19 @@ class TradingChart {
             };
             return;
           }
+        }
+        // v2.23.0 (TradingView semantics): endpoint hot-zones work on
+        // UNSELECTED drawings too — a press on a tool's control point always
+        // RESHAPES that point, it never translates the whole tool. Moving the
+        // whole tool is done by grabbing its line/body (the branch below).
+        const ep = this._hitAnyEndpoint(x, y);
+        if (ep) {
+          this.selectDrawing(ep.d);   // handles appear immediately (TV behavior)
+          this._dragHandle = {
+            d: ep.d, key: ep.key, ptIndex: ep.ptIndex,
+            startX: x, startY: y, moved: false   // v2.22.1: drag threshold
+          };
+          return;
         }
         // Check if clicking on a drawing (select + start whole-drag)
         const clickedDrawing = this.findDrawingAt(x, y);
