@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.22.0 — Pixel-Perfect Pure JavaScript Trading Chart Library
+ * BADI-CHARTS-V2 v2.23.0 — Pixel-Perfect Pure JavaScript Trading Chart Library
  *
  * A lightweight, dependency-free candlestick charting library built entirely
  * with the HTML5 Canvas API. Inspired by TradingView Lightweight Charts.
@@ -378,7 +378,7 @@ var Path2D = (typeof window !== 'undefined' && window.Path2D)
     })();
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.22.0';
+const VERSION = '2.23.0';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 // v2.14.0 (audit #12): tracks the chart the user last hovered/touched, so
 // window-level keyboard shortcuts only apply to ONE chart on multi-chart pages.
@@ -8111,13 +8111,14 @@ class TradingChart {
     const y = this.priceToY(last.close);
     // Only draw if the price line is within the visible price area
     if (y < this.priceTop - 2 || y > this.priceBottom + 2) return;
-    // v2.20.6: skip the LABEL (but still draw the dashed line) when the
-    // crosshair is active and its Y is within ~22px of the last close.
-    // Before, the current-price label and the crosshair price label both
-    // sat at chartRight+1 and overlapped each other when the cursor was
-    // near the last close. Now the crosshair label takes precedence.
+    // v2.20.6 → v2.23.0: skip the LABEL (but still draw the dashed line)
+    // only when the crosshair tag PHYSICALLY overlaps it (|dy| < 18 — the
+    // tags are 18px tall). The old ±22px radius hid the last-price tag even
+    // when the two tags did NOT overlap (18–22px apart) — TradingView shows
+    // BOTH tags whenever they don't overlap; the crosshair (drawn after,
+    // opaque, on top) wins only when they do.
     const crosshairNear = this.mouseInside && this.crosshairIndex !== null &&
-                          Math.abs(this.mouseY - y) < 22;
+                          Math.abs(this.mouseY - y) < 18;
     const isBull = last.close >= last.open;
     const color = isBull ? this.theme.currentPriceBull : this.theme.currentPriceBear;
     // Dashed line across the chart (stops at chartRight)
@@ -8130,23 +8131,29 @@ class TradingChart {
     ctx.lineTo(this.chartRight, ys);
     ctx.stroke();
     ctx.setLineDash([]);
-    if (crosshairNear) return;   // v2.20.6: let the crosshair label show alone
-    // v2.3.1: Price label ON the price axis (chartRight + 1) — this is where it
-    // belongs: the axis is "connected to the chart" and the price label sits on it.
+    if (crosshairNear) return;   // v2.23.0: tags overlap (|dy| < 18) — crosshair wins
+    // v2.23.0 (TradingView/LWC PriceAxisViewRenderer): the last-price tag
+    // is a FULL SLOT INSIDE the axis strip — it spans chartRight..W with an
+    // opaque background and the price text right-aligned at the SAME x the
+    // axis numbers use. Before, it was a narrow floating card (textW+10 at
+    // chartRight+1) drawn OVER the numbers — the axis digits stayed visible
+    // around it and the tag looked pasted on top of the axis instead of
+    // being part of it (user report: "why are the cards ON TOP of the axis
+    // numbers, why aren't they INSIDE it?"). A full-strip slot replaces the
+    // number row it covers, exactly like TradingView's current-price tag.
     const txt = this.priceScale.formatLogical(last.close);
     ctx.font = 'bold 11px -apple-system, Segoe UI, Roboto, sans-serif';
-    const tw = ctx.measureText(txt).width + 10;
-    const labelX = this.chartRight + 1;
+    const stripW = this.W - this.chartRight;
     const labelY = Math.floor(y) - 9;
     // Clamp label Y so it stays within the price axis area
     const minY = this.chartTop;
     const maxY = (this.layout.paneBottom || this.chartBottom) - 18;
     const clampedY = clamp(labelY, minY, maxY);
     ctx.fillStyle = color;
-    ctx.fillRect(labelX, clampedY, tw, 18);
+    ctx.fillRect(this.chartRight, clampedY, stripW, 18);
     ctx.fillStyle = this.theme.textBright;
-    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-    ctx.fillText(txt, labelX + tw / 2, clampedY + 9);
+    ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+    ctx.fillText(txt, this.W - 6, clampedY + 9);
     ctx.textAlign = 'left';
   }
 
@@ -8270,10 +8277,18 @@ class TradingChart {
     ctx.font = '11px -apple-system, Segoe UI, Roboto, sans-serif';
     ctx.fillStyle = this.theme.axisText;
     ctx.textBaseline = 'middle';
-    ctx.textAlign = 'left';
-    // v2.20.7: when the crosshair is active and over the price area, SKIP
-    // marks that fall within the crosshair price label's Y range — only
-    // ONE number (the crosshair label, drawn later) shows at the cursor's Y.
+    // v2.23.0 (TradingView): axis numbers are RIGHT-ALIGNED with a fixed
+    // right padding (W - 6) — flush right edge like TradingView's price
+    // scale, instead of the old left-aligned-at-chartRight+6 ragged layout.
+    // The crosshair/last-price tags right-align their text at the SAME x,
+    // so a tag covering a number replaces it in-place (no positional jump).
+    ctx.textAlign = 'right';
+    // v2.20.7 → v2.23.0: when the crosshair is active and over the price
+    // area, skip ONLY marks the crosshair tag PHYSICALLY covers (tag is 18px
+    // tall → ±9px, +1px guard). The old ±14px radius blanked numbers up to
+    // 5px OUTSIDE the tag — the same "labels vanish near the cursor" defect
+    // the user reported on the time axis. Cover-only: the tag is drawn later,
+    // on top, opaque, full axis strip (TradingView semantics).
     const chActive = this.mouseInside && this.crosshairIndex !== null;
     const chY = (chActive && this.mouseY >= this.priceTop - 2 && this.mouseY <= this.priceBottom + 2)
       ? this.mouseY : null;
@@ -8286,8 +8301,8 @@ class TradingChart {
       const y = this.priceTop + m.coord;
       if (y < this.priceTop - 1 || y > this.priceBottom + 1) continue;
       if (y - prevDrawnY < 12) continue;   // v2.20.6: collision detection
-      if (chY !== null && Math.abs(y - chY) < 14) continue;   // v2.20.7: crosshair label takes this slot
-      ctx.fillText(m.label, this.chartRight + 6, Math.floor(y));
+      if (chY !== null && Math.abs(y - chY) < 10) continue;   // v2.23.0: cover-only (tag covers ±9px)
+      ctx.fillText(m.label, this.W - 6, Math.floor(y));
       prevDrawnY = y;
     }
 
@@ -8307,8 +8322,8 @@ class TradingChart {
         const y = pane.top + m.coord;
         if (y < pane.top + 7 || y > pane.bottom - 5) continue;
         if (y - prevPaneY < 12) continue;   // v2.20.6: collision detection
-        if (paneChY !== null && Math.abs(y - paneChY) < 14) continue;   // v2.20.7
-        ctx.fillText(m.label, this.chartRight + 6, Math.floor(y));
+        if (paneChY !== null && Math.abs(y - paneChY) < 10) continue;   // v2.23.0: cover-only
+        ctx.fillText(m.label, this.W - 6, Math.floor(y));
         prevPaneY = y;
       }
     }
@@ -8357,26 +8372,89 @@ class TradingChart {
     // — every label assumed 6px per char and either overlapped or wasted
     // space. Collision detection now uses the real measured width.
     const tzOpts = {locale: this._locale, timezone: this._timezone, hour12: this._hour12};
-    // v2.20.7: when the crosshair is active, SKIP time marks whose X is
-    // within ~45px of the crosshair's X — only ONE time number (the
-    // crosshair label, drawn later) shows at the cursor's X.
+    // v2.20.7 → v2.23.0 (TradingView cover-only): v2.20.7 blanked every mark
+    // within ±45px of the crosshair X — labels visibly VANISHED as the
+    // cursor approached them, before the crosshair tag even reached them
+    // (user report: "why does the time label disappear when the crosshair
+    // card gets near it?"). TradingView only ever hides the label the
+    // crosshair tag PHYSICALLY covers: the tag is drawn later in
+    // drawCrosshair (opaque, on top) at a CLAMPED x with its measured
+    // width — we compute that exact rect here (same formatter via
+    // _formatHoverTimeLabel, same clamp, same +14 padding) and skip ONLY
+    // marks whose own label rect intersects it. Everything else stays.
     const chActiveT = this.mouseInside && this.crosshairIndex !== null;
     const chX = chActiveT ? this.indexToX(Math.round(this.crosshairIndex)) : null;
+    let tagRect = null;   // {x, w} of the crosshair time tag (clamped)
+    if (chX !== null) {
+      const tagStr = this._formatHoverTimeLabel(this._timeAtIndex(Math.round(this.crosshairIndex)));
+      const tagW = ctx.measureText(tagStr).width + 14;   // same padding as drawCrosshair's tag
+      tagRect = { x: clamp(chX, this.chartLeft + tagW / 2 + 2, this.chartRight - tagW / 2 - 2), w: tagW };
+    }
     let prevRightEdge = -Infinity;
     for (const m of marks) {
       const x = this.indexToX(m.index);
       if (x < this.chartLeft || x > this.chartRight) continue;
-      if (chX !== null && Math.abs(x - chX) < 45) continue;   // v2.20.7: crosshair label takes this slot
       // Use the time stored in the mark (works for past, present, and future)
       const label = formatTickMark(m.time, m.weight, this.timeframe.label, tzOpts);
       const labelW = ctx.measureText(label).width + 8;
       const leftEdge = x - labelW / 2;
       const rightEdge = x + labelW / 2;
+      // v2.23.0: skip ONLY marks the crosshair tag physically covers
+      // (rect intersection: centered rects overlap ⟺ |x - tagX| < (tagW+labelW)/2)
+      if (tagRect && leftEdge < tagRect.x + tagRect.w / 2 && rightEdge > tagRect.x - tagRect.w / 2) continue;
       if (leftEdge < prevRightEdge + 4) continue;
       if (leftEdge < this.chartLeft + 4 || rightEdge > this.chartRight - 4) continue;
       ctx.fillText(label, Math.floor(x), axisTop + this.layout.timeAxisH / 2);
       prevRightEdge = rightEdge;
     }
+  }
+
+  // v2.23.0: shared formatter for the crosshair TIME label — extracted from
+  // drawCrosshair so drawTimeAxis can compute the EXACT rect the crosshair
+  // tag covers (cover-only mark skipping, TradingView semantics).
+  // v2.22.0 (webgl 2.25.0) semantics preserved: single-field — time only for
+  // intraday ("HH:MM", "HH:MM:SS" below one minute), date only for daily+;
+  // the date context lives on the axis's day-boundary tick labels. Fallback
+  // locale pinned to 'en-US' unless opts.locale is set (was: picked up the
+  // visitor's browser language when only a timezone was configured).
+  _formatHoverTimeLabel(t) {
+    const date = new Date(t * 1000);
+    const tfSec = (this.timeframe.ms || 60000) / 1000;
+    let timeStr;
+    if (tfSec >= 86400) {
+      // Daily and above → date only
+      if (this._locale || this._timezone) {
+        try {
+          const opts = { year: 'numeric', month: 'short', day: '2-digit' };
+          if (this._timezone) opts.timeZone = this._timezone;
+          if (this._hour12 != null) opts.hour12 = this._hour12;
+          timeStr = new Intl.DateTimeFormat(this._locale || 'en-US', opts).format(date);
+        } catch (_) { timeStr = String(t); }
+      } else {
+        const pad2 = (n) => n < 10 ? '0' + n : '' + n;
+        timeStr = date.getUTCFullYear() + '-' + pad2(date.getUTCMonth() + 1) + '-' + pad2(date.getUTCDate());
+      }
+    } else {
+      // Intraday → time only (seconds for sub-minute timeframes)
+      if (this._locale || this._timezone) {
+        try {
+          const opts = (tfSec < 60)
+            ? { hour: '2-digit', minute: '2-digit', second: '2-digit' }
+            : { hour: '2-digit', minute: '2-digit' };
+          if (this._timezone) opts.timeZone = this._timezone;
+          if (this._hour12 != null) opts.hour12 = this._hour12;
+          timeStr = new Intl.DateTimeFormat(this._locale || 'en-US', opts).format(date);
+        } catch (_) { timeStr = String(t); }
+      } else {
+        const pad2 = (n) => n < 10 ? '0' + n : '' + n;
+        if (tfSec < 60) {
+          timeStr = pad2(date.getUTCHours()) + ':' + pad2(date.getUTCMinutes()) + ':' + pad2(date.getUTCSeconds());
+        } else {
+          timeStr = pad2(date.getUTCHours()) + ':' + pad2(date.getUTCMinutes());
+        }
+      }
+    }
+    return timeStr;
   }
 
   /* --------------------------- Crosshair --------------------------------- */
@@ -8429,55 +8507,10 @@ class TradingChart {
     // data stays in Unix seconds; only the DISPLAYED string changes. Default
     // (no tz/locale) keeps the previous UTC + English short-month behavior.
     const t = this._timeAtIndex(idx);
-    const date = new Date(t * 1000);
-    const tfSec = (this.timeframe.ms || 60000) / 1000;
-    // v2.25.0 FIX (TradingView semantics): the crosshair axis label is now
-    // SINGLE-FIELD — time only for intraday ("HH:MM", "HH:MM:SS" below one
-    // minute), date only for daily+. The old intraday format mixed a
-    // localized MONTH word with digits ("21 Nov, 21:21" — or with a locale:
-    // "21 نوفمبر، 21:21"), a bidi-fragile string that canvas fillText
-    // reorders under an RTL page direction into scrambled text like
-    // "21 21:50, نوفمبر". The date context lives on the axis's day-boundary
-    // tick labels instead (getTimeMarks weights) — exactly how TradingView
-    // does it.
-    // Also: when only a timezone was configured, Intl.DateTimeFormat
-    // received `undefined` as locale and picked up the VISITOR's browser
-    // language (Arabic month names on an English UI). The fallback locale is
-    // now pinned to 'en-US' unless the integrator passes opts.locale.
-    let timeStr;
-    if (tfSec >= 86400) {
-      // Daily and above → date only
-      if (this._locale || this._timezone) {
-        try {
-          const opts = { year: 'numeric', month: 'short', day: '2-digit' };
-          if (this._timezone) opts.timeZone = this._timezone;
-          if (this._hour12 != null) opts.hour12 = this._hour12;
-          timeStr = new Intl.DateTimeFormat(this._locale || 'en-US', opts).format(date);
-        } catch (_) { timeStr = String(t); }
-      } else {
-        const pad2 = (n) => n < 10 ? '0' + n : '' + n;
-        timeStr = date.getUTCFullYear() + '-' + pad2(date.getUTCMonth() + 1) + '-' + pad2(date.getUTCDate());
-      }
-    } else {
-      // Intraday → time only (seconds for sub-minute timeframes)
-      if (this._locale || this._timezone) {
-        try {
-          const opts = (tfSec < 60)
-            ? { hour: '2-digit', minute: '2-digit', second: '2-digit' }
-            : { hour: '2-digit', minute: '2-digit' };
-          if (this._timezone) opts.timeZone = this._timezone;
-          if (this._hour12 != null) opts.hour12 = this._hour12;
-          timeStr = new Intl.DateTimeFormat(this._locale || 'en-US', opts).format(date);
-        } catch (_) { timeStr = String(t); }
-      } else {
-        const pad2 = (n) => n < 10 ? '0' + n : '' + n;
-        if (tfSec < 60) {
-          timeStr = pad2(date.getUTCHours()) + ':' + pad2(date.getUTCMinutes()) + ':' + pad2(date.getUTCSeconds());
-        } else {
-          timeStr = pad2(date.getUTCHours()) + ':' + pad2(date.getUTCMinutes());
-        }
-      }
-    }
+    // v2.23.0: formatting extracted to _formatHoverTimeLabel (shared with
+    // drawTimeAxis's cover-only skip logic). Single-field TradingView
+    // semantics — see the helper.
+    const timeStr = this._formatHoverTimeLabel(t);
     ctx.font = '11px -apple-system, Segoe UI, Roboto, sans-serif';
     const tw = ctx.measureText(timeStr).width + 14;
     // v2.16.0 FIX (#4): CLAMP the time label so it stays inside the chart's
@@ -8510,12 +8543,18 @@ class TradingChart {
         valueStr = this.priceScale.formatLogical(price);
       }
       if (valueStr != null) {
-        const pw = ctx.measureText(valueStr).width + 14;
+        // v2.23.0 (TradingView/LWC): the crosshair price tag is a FULL SLOT
+        // INSIDE the axis strip — spans chartRight..W, opaque, with the value
+        // right-aligned at the SAME x the axis numbers use, so it replaces
+        // the number row in-place. Before, it was a narrow floating card
+        // (textW+14 at chartRight+1) drawn OVER the numbers — digits stayed
+        // visible around it (user report: "the cards are ON TOP of the axis
+        // numbers, why aren't they INSIDE it?").
         ctx.fillStyle = this.theme.crosshairLabel;
-        ctx.fillRect(this.chartRight + 1, Math.floor(y) - 9, pw, 18);
+        ctx.fillRect(this.chartRight, Math.floor(y) - 9, this.W - this.chartRight, 18);
         ctx.fillStyle = this.theme.textBright;
-        ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-        ctx.fillText(valueStr, this.chartRight + 1 + pw / 2, Math.floor(y));
+        ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+        ctx.fillText(valueStr, this.W - 6, Math.floor(y));
         ctx.textAlign = 'left';
       }
     }
