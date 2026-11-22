@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.26.0 — WEBGL EDITION (chart-webgl.js)
+ * BADI-CHARTS-V2 v2.27.0 — WEBGL EDITION (chart-webgl.js)
  * The complete standalone trading chart library, rendered with real WebGL.
  *
  * THIS FILE IS A FULL LIBRARY, NOT A LAYER. Load it INSTEAD of chart.js —
@@ -385,7 +385,7 @@
 'use strict';
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.26.0';
+const VERSION = '2.27.0';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 // v2.14.0 (audit #12): tracks the chart the user last hovered/touched, so
 // window-level keyboard shortcuts only apply to ONE chart on multi-chart pages.
@@ -8386,6 +8386,8 @@ class TradingChart {
       case 'tool': this.openDropdown('tool', DRAW_TOOLS.map(t => ({label: t.label, value: t.id})), btn); break;
       case 'reset': this.resetView(); this.showToast('Reset view'); break;
       case 'settings': this.showToast('R reset · +/- zoom · Esc cancel · Del delete'); break;
+      case 'zoomIn':  this.zoomAtCenter(1.2); break;    // v2.27.0: +/− zoom buttons
+      case 'zoomOut': this.zoomAtCenter(1 / 1.2); break; // v2.27.0
     }
   }
   openDropdown(type, items, anchorBtn) {
@@ -8465,6 +8467,7 @@ class TradingChart {
       this.drawCountdown(now);     // v2.13.0: 2-digit countdown near forming candle
       this.drawReplayLine();       // v2.22.0: blue replay anchor line (over data, under UI)
       this.drawCrosshair();
+      this.drawZoomButtons();      // v2.27.0: +/− zoom controls (after crosshair, on top)
       this.drawLegend();
       this.drawReplayOverlay();     // v2.22.0: REPLAY badge + playback bar
       this.drawSettingsCard();      // Settings popup (drawn last so it overlays everything)
@@ -10109,6 +10112,75 @@ class TradingChart {
     return Math.hypot(px - (x1 + t * dx), py - (y1 + t * dy));
   }
 
+  /* --------------------------- Zoom Buttons (v2.27.0) -------------------- */
+  // TradingView-style +/− zoom controls at the bottom-right of the chart
+  // area. They APPEAR when the mouse approaches the bottom of the chart and
+  // DISAPPEAR when it moves away (fade animation). Click + to widen candles
+  // (zoom in), − to narrow them (zoom out). The zoom is centered on the
+  // chart via zoomAtCenter(), so it works consistently whether the view is
+  // scrolled left or right — the candles above the buttons (whatever is in
+  // view) grow/shrink around the chart center.
+  drawZoomButtons() {
+    // Proximity detection: show when the mouse is within 90px of the chart's
+    // bottom edge (or already over the buttons). Hide otherwise.
+    const proximityY = 90;
+    const btnHalfW = 15, btnH = 26, gap = 4, padRight = 10, padBottom = 10;
+    const bx = this.chartRight - btnHalfW - padRight;
+    const byMinus = this.chartBottom - padBottom - btnH / 2;
+    const byPlus  = byMinus - btnH - gap;
+    // Keep visible if the mouse is over either button (so clicking doesn't
+    // make them vanish mid-press when the cursor drifts above the proximity
+    // band).
+    const overPlus  = this.mouseInside && this.mouseX >= bx - btnHalfW && this.mouseX <= bx + btnHalfW &&
+                      this.mouseY >= byPlus - btnH/2 && this.mouseY <= byPlus + btnH/2;
+    const overMinus = this.mouseInside && this.mouseX >= bx - btnHalfW && this.mouseX <= bx + btnHalfW &&
+                      this.mouseY >= byMinus - btnH/2 && this.mouseY <= byMinus + btnH/2;
+    const nearBottom = this.mouseInside &&
+                       (this.mouseY > this.chartBottom - proximityY || overPlus || overMinus);
+    // Fade alpha — eases toward 0 or 1 each frame (~150ms to full).
+    if (this._zoomAlpha === undefined) this._zoomAlpha = 0;
+    const target = nearBottom ? 1 : 0;
+    this._zoomAlpha += (target - this._zoomAlpha) * 0.18;
+    if (this._zoomAlpha < 0.02) return;
+    const a = this._zoomAlpha;
+    const ctx = this.ctx;
+    // Draw a single button (rounded rect + +/− glyph).
+    const drawOne = (cx, cy, isPlus, hovered) => {
+      ctx.save();
+      ctx.globalAlpha = a;
+      // Background — slightly brighter on hover for affordance.
+      ctx.fillStyle = hovered ? '#363a45' : 'rgba(42, 46, 57, 0.92)';
+      this._roundRect(cx - btnHalfW, cy - btnH / 2, btnHalfW * 2, btnH, 5);
+      ctx.fill();
+      // Subtle border.
+      ctx.strokeStyle = this.theme.axisBorder;
+      ctx.lineWidth = 1;
+      ctx.stroke();
+      // + or − glyph — white, rounded caps for a softer look.
+      ctx.strokeStyle = this.theme.textBright;
+      ctx.lineWidth = 1.7;
+      ctx.lineCap = 'round';
+      const arm = 5;
+      ctx.beginPath();
+      ctx.moveTo(cx - arm, cy);
+      ctx.lineTo(cx + arm, cy);
+      if (isPlus) {
+        ctx.moveTo(cx, cy - arm);
+        ctx.lineTo(cx, cy + arm);
+      }
+      ctx.stroke();
+      ctx.restore();
+    };
+    drawOne(bx, byPlus,  true,  overPlus);
+    drawOne(bx, byMinus, false, overMinus);
+    // Register for hit-testing ONLY when sufficiently visible (otherwise an
+    // invisible button would still catch clicks).
+    if (a > 0.5) {
+      this.buttons.push({x: bx - btnHalfW, y: byPlus - btnH/2,  w: btnHalfW*2, h: btnH, action: 'zoomIn'});
+      this.buttons.push({x: bx - btnHalfW, y: byMinus - btnH/2, w: btnHalfW*2, h: btnH, action: 'zoomOut'});
+    }
+  }
+
   /* --------------------------- Current Price Line ------------------------ */
   drawCurrentPriceLine() {
     const ctx = this.ctx;
@@ -10290,9 +10362,21 @@ class TradingChart {
   // (the chart bg extends seamlessly), but KEEP the subtle border line
   // between the chart and the price axis (the user wants the frame to stay).
   // v2.20.9: restored the border line that v2.20.8 removed.
+  // v2.27.0: RESTORED the axis panel background (axisBg). Without a distinct
+  // panel, the colored price cards (last-price teal/red + crosshair gray)
+  // sat on the SAME #0e1015 bg as the chart — they looked "pasted on top"
+  // rather than "merged inside" the axis (user report: "the colored price
+  // card is STILL not merged inside"). A subtle #131722 panel gives the
+  // axis a defined surface the cards sit ON, so they read as part of the
+  // axis the way TradingView's current-price tag does.
   drawPriceAxis() {
     const ctx = this.ctx;
     const dpr = this.dpr;
+    // v2.27.0: axis panel background — full strip from chartTop to the pane
+    // stack bottom (includes all panes so the strip is one continuous panel).
+    const panelBottom = this.layout.paneBottom || this.chartBottom;
+    ctx.fillStyle = this.theme.axisBg;
+    ctx.fillRect(this.chartRight, this.chartTop, this.W - this.chartRight, panelBottom - this.chartTop);
     // Subtle vertical border line between chart and price axis.
     ctx.strokeStyle = this.theme.axisBorder;
     ctx.lineWidth = 1;
@@ -10380,10 +10464,16 @@ class TradingChart {
   // v2.20.8: Lightweight-Charts-style time axis — no separate background
   // fill, but KEEP the subtle top border line between chart and time axis.
   // v2.20.9: restored the border line that v2.20.8 removed.
+  // v2.27.0: RESTORED the time-axis panel background (axisBg) — same reason
+  // as drawPriceAxis: a defined panel surface makes the crosshair TIME tag
+  // sit "inside" the axis instead of floating on the chart bg.
   drawTimeAxis() {
     const ctx = this.ctx;
     const dpr = this.dpr;
     const axisTop = this.layout.paneBottom || this.chartBottom;
+    // v2.27.0: time-axis panel background — full strip across the bottom.
+    ctx.fillStyle = this.theme.axisBg;
+    ctx.fillRect(0, axisTop, this.W, this.H - axisTop);
     // Subtle horizontal border line between chart and time axis.
     ctx.strokeStyle = this.theme.axisBorder;
     ctx.lineWidth = 1;
@@ -11519,7 +11609,13 @@ class TradingChart {
       // nothing moving) and silently defeated render-on-demand.
       const continuous = !!this._momentum || !!this.toast ||
                          this._hasAnimatedIndicator();
-      if (!continuous && !this._needsRender) return;   // idle — zero work
+      // v2.27.0: keep the loop alive while the zoom buttons are fading in
+      // or out — otherwise the fade stalls after the first post-event frame
+      // (the rAF loop idles when nothing is dirty, and _zoomAlpha only
+      // advances inside drawZoomButtons, which only runs during render).
+      const zoomFading = this._zoomAlpha !== undefined &&
+                         this._zoomAlpha > 0.02 && this._zoomAlpha < 0.98;
+      if (!continuous && !zoomFading && !this._needsRender) return;   // idle — zero work
       // Throttle on mobile
       if (this._renderThrottleMs > 0) {
         if (now - this._lastRenderTime < this._renderThrottleMs) return;
