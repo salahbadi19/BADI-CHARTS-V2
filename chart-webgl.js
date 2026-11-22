@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.29.0 — WEBGL EDITION (chart-webgl.js)
+ * BADI-CHARTS-V2 v2.30.0 — WEBGL EDITION (chart-webgl.js)
  * The complete standalone trading chart library, rendered with real WebGL.
  *
  * THIS FILE IS A FULL LIBRARY, NOT A LAYER. Load it INSTEAD of chart.js —
@@ -385,7 +385,7 @@
 'use strict';
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.29.0';
+const VERSION = '2.30.0';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 // v2.14.0 (audit #12): tracks the chart the user last hovered/touched, so
 // window-level keyboard shortcuts only apply to ONE chart on multi-chart pages.
@@ -9059,7 +9059,7 @@ class TradingChart {
       const state = this.indicatorStates.get(id);
       const val = this._getIndicatorValueAt(id, volIdx);
       this._drawIndicatorLine(this.chartLeft + 6, labelY, id, state.def, state, val);
-      labelY += 22;
+      labelY += 30;   // v2.30.0: 26px bar + 4px gap
     }
   }
   _fmtVol(n) {
@@ -9208,9 +9208,9 @@ class TradingChart {
       ctx.restore();
 
       // Indicator label inside the pane (top-left). v2.17.1: skipped on
-      // panes shorter than 22px — the 18px-tall label card would overflow a
-      // micro-pane (16px) and bleed into the pane below.
-      if (bot - top >= 22) {
+      // panes shorter than 32px — the 26px-tall bar (v2.30.0) would
+      // overflow a micro-pane and bleed into the pane below.
+      if (bot - top >= 32) {
         ctx.font = '11px -apple-system, Segoe UI, Roboto, sans-serif';
         ctx.textBaseline = 'top';
         const val = this._getIndicatorValueAt(pane.id, paneIdx);
@@ -10817,8 +10817,8 @@ class TradingChart {
     });
     if (overlayIds.length === 0) return;
     // If collapsed, draw only the expand arrow (downward) and return
-    let lineY = y + 20;
-    const lineH = 22;  // matches cardH in _drawIndicatorLine
+    let lineY = y + 22;
+    const lineH = 30;  // v2.30.0: 26px bar + 4px gap
     if (this.indicatorsCollapsed) {
       // Draw a small downward arrow to expand
       this._drawCollapseArrow(this.chartLeft + 8, lineY, false);
@@ -10838,142 +10838,175 @@ class TradingChart {
 
   // Draw a single indicator line (label + value + icons when active)
   // Stacked vertically like TradingView.
-  // v2.21.3: FIXED-VALUE-WIDTH — the icons used to be positioned AFTER the
-  // value text (valW = measureText(value).width). When the value changed
-  // (price ticks every second), valW changed and the icons SHIFTED — the
-  // user couldn't click delete/settings because the icons kept moving.
-  // Now the value area has a FIXED width (VAL_FIXED_W): long values are
-  // truncated with "…", short ones leave blank space, and the icons (and
-  // their hit-test boxes) stay at the SAME position every frame.
+  // History: v2.21.3 fixed-width value area (icons never shift with the
+  // value), v2.21.4 binary-search truncation + cached label width.
+  // v2.29.0 -> v2.30.0: INDICATOR BAR / ICONS UPGRADE —
+  //   - bar 22px -> 26px, text 11px -> 12px: name in 600 weight, value
+  //     colored with the indicator color (like TradingView);
+  //   - colored accent bar instead of the tiny 3.5px dot;
+  //   - always-on soft pill background (readable over candles) + border and
+  //     a stronger background while hovered;
+  //   - icons appear on HOVER (no click needed); a click still pins them
+  //     (needed for touch screens — no hover there);
+  //   - icon buttons 16px -> 22px (bigger hit area), glyphs scaled with
+  //     rounded strokes, hover background, red tint for "delete";
+  //   - divider between the value and the icons;
+  //   - value column grows to the widest value seen (max 120px) instead of a
+  //     fixed 72px — no big blank gap, icons stay at stable positions.
   _drawIndicatorLine(x, y, id, meta, state, val) {
     const ctx = this.ctx;
+    const T = this.theme;
+    const FONT = '-apple-system, Segoe UI, Roboto, sans-serif';
     const isActive = this.activeIndicatorCard === id;
     const isVisible = state.visible !== false;
-    const color = meta.color;
-    ctx.font = '11px -apple-system, Segoe UI, Roboto, sans-serif';
+    const color = meta.color || T.accent;
+
+    // ---- metrics -------------------------------------------------------
+    const CARD_H = 26, LEFT = 16, GAP = 8, RIGHT = 8;
+    const BTN = 22, BTN_GAP = 2, VAL_MIN = 56, VAL_CAP = 120;
+    const rx = x - 2;
+
     ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
-    const labelTxt = meta.label + ':';
-    // v2.21.4 PERF: cache the label width per indicator. The label string
-    // never changes at runtime (it's set at definition time), but we were
-    // calling measureText(labelTxt) every frame for every indicator. With
-    // 5 indicators at 60fps that's 300 measureText/sec just for labels —
-    // now 0 after the first frame. Cache lives on state._labelW and is
-    // keyed by the label string (so a label change invalidates it).
+
+    // name (width cached; key is versioned so old cache entries are ignored)
+    ctx.font = '600 12px ' + FONT;
+    const labelTxt = String(meta.label || id);
+    const labelKey = 'v3|' + labelTxt;
     let labelW;
-    if (state._labelW && state._labelWKey === labelTxt) {
+    if (state._labelW && state._labelWKey === labelKey) {
       labelW = state._labelW;
     } else {
       labelW = ctx.measureText(labelTxt).width;
       state._labelW = labelW;
-      state._labelWKey = labelTxt;
+      state._labelWKey = labelKey;
     }
-    // v2.21.3: fixed-width value area — truncate long values with "…"
-    // v2.21.4 PERF: binary search instead of chopping one char at a time.
-    // The while-loop called measureText per char (up to N calls for an
-    // N-char value). Binary search finds the cutoff in log2(N) calls.
-    const VAL_FIXED_W = 72;
-    const VAL_MAX_W = VAL_FIXED_W - 4;
+
+    // value (truncate with "…" using a binary search, grow-only column width)
+    ctx.font = '12px ' + FONT;
     let valTxt = String(val || '');
-    if (ctx.measureText(valTxt).width > VAL_MAX_W) {
-      // Binary search for the largest prefix that fits with "…".
+    let rawW = ctx.measureText(valTxt).width;
+    if (rawW > VAL_CAP) {
       let lo = 1, hi = valTxt.length, best = 1;
       while (lo <= hi) {
         const mid = (lo + hi) >> 1;
-        if (ctx.measureText(valTxt.slice(0, mid) + '…').width <= VAL_MAX_W) {
-          best = mid;
-          lo = mid + 1;
-        } else {
-          hi = mid - 1;
-        }
+        if (ctx.measureText(valTxt.slice(0, mid) + '…').width <= VAL_CAP) { best = mid; lo = mid + 1; }
+        else hi = mid - 1;
       }
       valTxt = valTxt.slice(0, best) + '…';
+      rawW = VAL_CAP;
     }
-    const valW = VAL_FIXED_W;   // always the SAME width — icons never shift
-    const errW = state._errFlag ? 14 : 0;
-    // Background when active (subtle highlight)
-    const allIcons = state.icons.concat(state.customIcons.map(c => c.id));
-    const iconSize = 16;   // bigger icons for easier clicking
-    const iconGap = 4;
-    const padX = 6;
-    const cardH = 22;      // taller card for better readability
-    const centerY = y + cardH / 2;
-    let iconsW = 0;
-    if (isActive) iconsW = allIcons.length * (iconSize + iconGap);
-    const lineW = padX + labelW + 6 + valW + errW + (isActive ? iconsW + 8 : 0) + padX;
-    // Highlight background when active
-    if (isActive) {
-      ctx.fillStyle = 'rgba(42,46,57,0.85)';
-      this._roundRect(x - 2, y, lineW, cardH, 3);
-      ctx.fill();
-    }
-    // Label (colored dot + name)
-    ctx.fillStyle = isVisible ? color : this.theme.textDim;
-    // Small colored dot before the label
-    ctx.beginPath();
-    ctx.arc(x + padX + 3, centerY, 3.5, 0, Math.PI * 2);
+    state._valW = Math.min(VAL_CAP, Math.max(state._valW || VAL_MIN, rawW));
+    const valW = state._valW;
+
+    const errW = state._errFlag ? 18 : 0;
+    const allIcons = state.icons.concat(state.customIcons.map(function (c) { return c.id; }));
+    const nIcons = allIcons.length;
+    const iconsW = nIcons * BTN + Math.max(0, nIcons - 1) * BTN_GAP;
+    const valEnd = rx + LEFT + labelW + GAP + valW + errW;
+    const collapsedW = valEnd + RIGHT - rx;
+    const expandedW = (valEnd + 12 + iconsW + 4) - rx;
+
+    // ---- hover / active state -----------------------------------------
+    // The probe uses the expanded width once the bar is expanded, so the bar
+    // does not flicker when the pointer moves over the icons.
+    const probeW = (isActive || state._hov) ? expandedW : collapsedW;
+    const over = this.mouseInside && !this.isDragging && !this.settingsCard &&
+      this.mouseX >= rx && this.mouseX <= rx + probeW &&
+      this.mouseY >= y && this.mouseY <= y + CARD_H;
+    state._hov = over;
+    const showIcons = nIcons > 0 && (isActive || over);
+    const lineW = showIcons ? expandedW : collapsedW;
+
+    // ---- background pill ----------------------------------------------
+    ctx.fillStyle = showIcons ? 'rgba(30,34,45,0.94)' : 'rgba(19,23,34,0.50)';
+    this._roundRect(rx, y, lineW, CARD_H, 6);
     ctx.fill();
-    ctx.fillText(labelTxt, x + padX + 10, centerY);
-    // Value (clipped to the fixed-width area so it never touches the icons)
-    ctx.fillStyle = isVisible ? this.theme.text : this.theme.textDim;
-    ctx.fillText(valTxt, x + padX + 10 + labelW + 6, centerY);
-    // v2.8.0: red "!" badge — this indicator's calculate()/render() threw
+    if (showIcons) {
+      ctx.strokeStyle = 'rgba(255,255,255,0.09)';
+      ctx.lineWidth = 1;
+      this._roundRect(rx + 0.5, y + 0.5, lineW - 1, CARD_H - 1, 6);
+      ctx.stroke();
+    }
+
+    // ---- accent bar ----------------------------------------------------
+    ctx.fillStyle = isVisible ? color : T.textDim;
+    this._roundRect(rx + 6, y + 6, 3, CARD_H - 12, 1.5);
+    ctx.fill();
+
+    // ---- name + value --------------------------------------------------
+    const centerY = y + CARD_H / 2;
+    const tx = rx + LEFT;
+    ctx.font = '600 12px ' + FONT;
+    ctx.fillStyle = isVisible ? T.textBright : T.textDim;
+    ctx.fillText(labelTxt, tx, centerY);
+    ctx.font = '12px ' + FONT;
+    ctx.fillStyle = isVisible ? color : T.textDim;
+    ctx.fillText(valTxt, tx + labelW + GAP, centerY);
+
+    // ---- error badge (calculate()/render() threw) ---------------------
     if (state._errFlag) {
-      const bx = x + padX + 10 + labelW + 6 + valW + 9;
+      const bx = valEnd - errW + 9;
       ctx.fillStyle = '#ef5350';
       ctx.beginPath();
-      ctx.arc(bx, centerY, 5, 0, Math.PI * 2);
+      ctx.arc(bx, centerY, 6, 0, Math.PI * 2);
       ctx.fill();
       ctx.fillStyle = '#ffffff';
-      ctx.font = 'bold 9px -apple-system, Segoe UI, Roboto, sans-serif';
+      ctx.font = 'bold 10px ' + FONT;
       ctx.textAlign = 'center';
       ctx.fillText('!', bx, centerY + 0.5);
       ctx.textAlign = 'left';
     }
-    // Icons (only when active) — FIXED positions (never shift with the value)
-    if (isActive) {
-      let ix = x + padX + 10 + labelW + 6 + valW + 8 + errW;
-      for (const iconId of allIcons) {
-        const isCustom = state.customIcons.find(c => c.id === iconId);
-        this._drawIndicatorIcon(ix, y + (cardH - iconSize) / 2, iconId, iconSize, id, isCustom);
-        ix += iconSize + iconGap;
+
+    // ---- icons ---------------------------------------------------------
+    if (showIcons) {
+      const sepX = Math.floor(valEnd + 6) + 0.5;
+      ctx.strokeStyle = 'rgba(255,255,255,0.10)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(sepX, y + 6);
+      ctx.lineTo(sepX, y + CARD_H - 6);
+      ctx.stroke();
+      let ix = valEnd + 12;
+      for (let i = 0; i < nIcons; i++) {
+        const iconId = allIcons[i];
+        const custom = state.customIcons.find(function (c) { return c.id === iconId; });
+        this._drawIndicatorIcon(ix, y + (CARD_H - BTN) / 2, iconId, BTN, id, custom);
+        ix += BTN + BTN_GAP;
       }
-    } else {
-      // Register the line area for hit-test (click to activate)
-      this._iconHits.push({type: 'card', id: id, x: x - 2, y: y, w: lineW, h: cardH});
+    }
+
+    // Click-to-pin hit area (only while not pinned, same contract as before:
+    // icon hits are tested BEFORE card hits in onMouseDown/onTouchStart).
+    if (!isActive) {
+      this._iconHits.push({ type: 'card', id: id, x: rx, y: y, w: lineW, h: CARD_H });
     }
   }
 
-  // Draw the collapse/expand arrow for the indicator list.
-  // v2.27.1 → v2.28.0: SOFTENED the chevron. The v2.27.1 chevron was too
-  // SHARP (apex angle ≈ 53° — half-width sz=3.6 vs full height 2*sz=7.2,
-  // a narrow pointed arrowhead; user: "it's sharp — make it like the
-  // professional platforms"). Professional chevrons (TradingView, Bootstrap,
-  // Material) use a WIDE apex angle ≈ 80–90°. New geometry: half-width 4.5,
-  // half-height 2.6 → apex ≈ 82° — a soft, open, clearly-readable ∧/∨.
-  // Still two strokes only, hollow, no base line, rounded caps/joins.
+  // Collapse / expand control of the indicator list: a 22px round-corner
+  // button with a soft chevron (hover background).
   _drawCollapseArrow(x, y, isUp) {
     const ctx = this.ctx;
-    const isHover = this.hoverIcon && this.hoverIcon.iconId === 'collapse';
-    const color = isHover ? this.theme.textBright : this.theme.textDim;
-    ctx.strokeStyle = color;
-    ctx.lineWidth = 1.4;
+    const T = this.theme;
+    const size = 22;
+    const bx = x - 4, by = y + 1;
+    const isHover = !!(this.hoverIcon && this.hoverIcon.iconId === 'collapse');
+    if (isHover) {
+      ctx.fillStyle = 'rgba(255,255,255,0.10)';
+      this._roundRect(bx, by, size, size, 5);
+      ctx.fill();
+    }
+    ctx.strokeStyle = isHover ? T.textBright : T.textDim;
+    ctx.lineWidth = 1.6;
     ctx.lineCap = 'round'; ctx.lineJoin = 'round';
-    // Soft hollow chevron: ∧ (up = collapse) or ∨ (down = expand).
-    // Two line segments — moveTo → lineTo → lineTo. No closePath, no fill.
-    const cx = x + 5, cy = y + 6, w = 4.5, h = 2.6;
+    const cx = bx + size / 2, cy = by + size / 2, w = 5, h = 3;
     ctx.beginPath();
     if (isUp) {
-      ctx.moveTo(cx - w, cy + h);   // bottom-left
-      ctx.lineTo(cx, cy - h);        // apex
-      ctx.lineTo(cx + w, cy + h);   // bottom-right
+      ctx.moveTo(cx - w, cy + h); ctx.lineTo(cx, cy - h); ctx.lineTo(cx + w, cy + h);
     } else {
-      ctx.moveTo(cx - w, cy - h);   // top-left
-      ctx.lineTo(cx, cy + h);        // apex (bottom)
-      ctx.lineTo(cx + w, cy - h);   // top-right
+      ctx.moveTo(cx - w, cy - h); ctx.lineTo(cx, cy + h); ctx.lineTo(cx + w, cy - h);
     }
-    ctx.stroke();   // stroke only — hollow, no fill, no base line
-    // Register for hit-test
-    this._iconHits.push({type: 'icon', indId: '__legend__', iconId: 'collapse', x: x - 3, y: y - 3, w: 16, h: 16});
+    ctx.stroke();
+    this._iconHits.push({ type: 'icon', indId: '__legend__', iconId: 'collapse', x: bx, y: by, w: size, h: size });
   }
 
   // Get formatted value for an indicator at a given candle index
@@ -11126,128 +11159,123 @@ class TradingChart {
     return cardW;
   }
 
-  // Draw a single icon (default icons: hide/edit/settings/delete, or custom)
+  // One icon button: hide(eye) / edit(pencil) / settings(gear) / delete(trash)
+  // or a custom text/emoji icon. `size` is the button box (22px in the
+  // v2.30.0 indicator bar).
   _drawIndicatorIcon(x, y, iconId, size, indId, custom) {
     const ctx = this.ctx;
+    const T = this.theme;
     const cx = x + size / 2;
-    const cy = y + size / 2 - 1;
+    const cy = y + size / 2;
     const state = this.indicatorStates.get(indId);
-    const isHover = this.hoverIcon && this.hoverIcon.indId === indId && this.hoverIcon.iconId === iconId;
-    // Hover background
+    const isHover = !!(this.hoverIcon && this.hoverIcon.indId === indId && this.hoverIcon.iconId === iconId);
+    const danger = iconId === 'delete';
+
     if (isHover) {
-      ctx.fillStyle = 'rgba(255,255,255,0.1)';
-      this._roundRect(x, y - 1, size, size, 2);
+      ctx.fillStyle = danger ? 'rgba(239,83,80,0.20)' : 'rgba(255,255,255,0.10)';
+      this._roundRect(x, y, size, size, 5);
       ctx.fill();
     }
-    ctx.strokeStyle = isHover ? this.theme.textBright : this.theme.textDim;
-    ctx.fillStyle = isHover ? this.theme.textBright : this.theme.textDim;
-    ctx.lineWidth = 1.2;
+    const col = isHover ? (danger ? '#ef5350' : T.textBright) : T.textDim;
+    ctx.strokeStyle = col;
+    ctx.fillStyle = col;
+    ctx.lineWidth = 1.15;
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
+
     if (custom && custom.icon) {
-      // Custom icon: draw as emoji/text
-      ctx.font = '10px -apple-system, Segoe UI, Roboto, sans-serif';
+      ctx.font = Math.round(size * 0.55) + 'px -apple-system, Segoe UI, Roboto, sans-serif';
       ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
       ctx.fillText(custom.icon, cx, cy);
-      ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+      ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
     } else {
-      // v2.6.0: Beautiful TradingView-style icons
+      // Glyphs were authored on a 16px box; scale them up to the new button.
+      ctx.save();
+      ctx.translate(cx, cy);
+      const k = size / 16;
+      ctx.scale(k, k);
       switch (iconId) {
         case 'hide': {
-          // TradingView-style eye: almond (lens) shape + pupil
+          ctx.beginPath();
+          ctx.moveTo(-5.5, 0);
+          ctx.quadraticCurveTo(0, -5, 5.5, 0);
+          ctx.quadraticCurveTo(0, 5, -5.5, 0);
+          ctx.closePath();
+          ctx.stroke();
           if (state && state.visible !== false) {
-            // Open eye — almond outline
             ctx.beginPath();
-            ctx.moveTo(cx - 5, cy);
-            ctx.quadraticCurveTo(cx, cy - 4.5, cx + 5, cy);
-            ctx.quadraticCurveTo(cx, cy + 4.5, cx - 5, cy);
-            ctx.closePath();
-            ctx.stroke();
-            // Pupil (filled dot)
-            ctx.beginPath();
-            ctx.arc(cx, cy, 1.8, 0, Math.PI * 2);
+            ctx.arc(0, 0, 1.9, 0, Math.PI * 2);
             ctx.fill();
           } else {
-            // Hidden — almond outline + diagonal slash
             ctx.beginPath();
-            ctx.moveTo(cx - 5, cy);
-            ctx.quadraticCurveTo(cx, cy - 4.5, cx + 5, cy);
-            ctx.quadraticCurveTo(cx, cy + 4.5, cx - 5, cy);
-            ctx.closePath();
-            ctx.stroke();
-            ctx.beginPath();
-            ctx.moveTo(cx - 4.5, cy - 3.5);
-            ctx.lineTo(cx + 4.5, cy + 3.5);
+            ctx.moveTo(-5, -4.5);
+            ctx.lineTo(5, 4.5);
             ctx.stroke();
           }
           break;
         }
         case 'edit': {
-          // Pencil: diagonal body + filled tip (TradingView-style)
           ctx.beginPath();
-          ctx.moveTo(cx - 2.2, cy + 2.8);   // bottom-left of body
-          ctx.lineTo(cx + 2.2, cy - 2.8);   // top-right of body
-          ctx.lineTo(cx + 3.6, cy - 1.4);   // body width
-          ctx.lineTo(cx - 0.8, cy + 4.2);   // near the tip
+          ctx.moveTo(-2.2, 2.8);
+          ctx.lineTo(2.2, -2.8);
+          ctx.lineTo(3.6, -1.4);
+          ctx.lineTo(-0.8, 4.2);
           ctx.closePath();
           ctx.stroke();
-          // Tip (filled triangle)
           ctx.beginPath();
-          ctx.moveTo(cx - 2.2, cy + 2.8);
-          ctx.lineTo(cx - 3.4, cy + 4.6);
-          ctx.lineTo(cx - 0.8, cy + 4.2);
+          ctx.moveTo(-2.2, 2.8);
+          ctx.lineTo(-3.4, 4.6);
+          ctx.lineTo(-0.8, 4.2);
           ctx.closePath();
           ctx.fill();
           break;
         }
         case 'settings': {
-          // Gear: ring + inner hole + 8 teeth (TradingView-style)
           ctx.beginPath();
-          ctx.arc(cx, cy, 3, 0, Math.PI * 2);
+          ctx.arc(0, 0, 3, 0, Math.PI * 2);
           ctx.stroke();
           ctx.beginPath();
-          ctx.arc(cx, cy, 1.1, 0, Math.PI * 2);
+          ctx.arc(0, 0, 1.1, 0, Math.PI * 2);
           ctx.stroke();
           for (let a = 0; a < 8; a++) {
             const ang = (a / 8) * Math.PI * 2;
             ctx.beginPath();
-            ctx.moveTo(cx + Math.cos(ang) * 3, cy + Math.sin(ang) * 3);
-            ctx.lineTo(cx + Math.cos(ang) * 4.6, cy + Math.sin(ang) * 4.6);
+            ctx.moveTo(Math.cos(ang) * 3, Math.sin(ang) * 3);
+            ctx.lineTo(Math.cos(ang) * 4.6, Math.sin(ang) * 4.6);
             ctx.stroke();
           }
           break;
         }
         case 'delete': {
-          // Trash can: lid + handle + tapered body + ribs (TradingView-style)
           ctx.beginPath();
-          ctx.moveTo(cx - 4, cy - 2.5);
-          ctx.lineTo(cx + 4, cy - 2.5);   // lid
+          ctx.moveTo(-4, -2.5);
+          ctx.lineTo(4, -2.5);
           ctx.stroke();
           ctx.beginPath();
-          ctx.moveTo(cx - 1.8, cy - 2.5);
-          ctx.lineTo(cx - 1.8, cy - 4);   // handle
-          ctx.lineTo(cx + 1.8, cy - 4);
-          ctx.lineTo(cx + 1.8, cy - 2.5);
+          ctx.moveTo(-1.8, -2.5);
+          ctx.lineTo(-1.8, -4);
+          ctx.lineTo(1.8, -4);
+          ctx.lineTo(1.8, -2.5);
           ctx.stroke();
           ctx.beginPath();
-          ctx.moveTo(cx - 3, cy - 2.5);
-          ctx.lineTo(cx - 2.4, cy + 4.2); // left side (tapered)
-          ctx.lineTo(cx + 2.4, cy + 4.2);
-          ctx.lineTo(cx + 3, cy - 2.5);
+          ctx.moveTo(-3, -2.5);
+          ctx.lineTo(-2.4, 4.2);
+          ctx.lineTo(2.4, 4.2);
+          ctx.lineTo(3, -2.5);
           ctx.closePath();
           ctx.stroke();
           ctx.beginPath();
-          ctx.moveTo(cx - 1.2, cy - 0.8);
-          ctx.lineTo(cx - 1.2, cy + 2.2); // left rib
-          ctx.moveTo(cx + 1.2, cy - 0.8);
-          ctx.lineTo(cx + 1.2, cy + 2.2); // right rib
+          ctx.moveTo(-1.2, -0.8);
+          ctx.lineTo(-1.2, 2.2);
+          ctx.moveTo(1.2, -0.8);
+          ctx.lineTo(1.2, 2.2);
           ctx.stroke();
           break;
         }
       }
+      ctx.restore();
     }
-    // Register icon for hit-test
-    this._iconHits.push({type: 'icon', indId: indId, iconId: iconId, x: x, y: y - 1, w: size, h: size});
+    this._iconHits.push({ type: 'icon', indId: indId, iconId: iconId, x: x, y: y, w: size, h: size });
   }
 
   // Open a settings card popup for an indicator
