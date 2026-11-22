@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.27.1 — WEBGL EDITION (chart-webgl.js)
+ * BADI-CHARTS-V2 v2.28.0 — WEBGL EDITION (chart-webgl.js)
  * The complete standalone trading chart library, rendered with real WebGL.
  *
  * THIS FILE IS A FULL LIBRARY, NOT A LAYER. Load it INSTEAD of chart.js —
@@ -385,7 +385,7 @@
 'use strict';
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.27.1';
+const VERSION = '2.28.0';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 // v2.14.0 (audit #12): tracks the chart the user last hovered/touched, so
 // window-level keyboard shortcuts only apply to ONE chart on multi-chart pages.
@@ -10112,29 +10112,31 @@ class TradingChart {
     return Math.hypot(px - (x1 + t * dx), py - (y1 + t * dy));
   }
 
-  /* --------------------------- Zoom Buttons (v2.27.0) -------------------- */
-  // TradingView-style +/− zoom controls at the bottom-right of the chart
-  // area. They APPEAR when the mouse approaches the bottom of the chart and
-  // DISAPPEAR when it moves away (fade animation). Click + to widen candles
-  // (zoom in), − to narrow them (zoom out). The zoom is centered on the
-  // chart via zoomAtCenter(), so it works consistently whether the view is
-  // scrolled left or right — the candles above the buttons (whatever is in
-  // view) grow/shrink around the chart center.
+  /* --------------------------- Zoom Buttons (v2.27.0 → v2.28.0) ---------- */
+  // TradingView-style +/− zoom controls, positioned BOTTOM-CENTER of the
+  // chart: the pair sits side by side (+ on the left, − on the right),
+  // horizontally centered on the chart's mid line, just above the time axis
+  // (user: "put them BELOW the chart, not beside it — in the MIDDLE, not in
+  // the corner"). They fade in when the mouse approaches the bottom (within
+  // 90px) and fade out when it moves away. Click + to widen candles (zoom
+  // in), − to narrow them (zoom out). The zoom is centered on the chart via
+  // zoomAtCenter(), so it works whether the view is scrolled left or right —
+  // the candles above the buttons grow/shrink around the chart center.
   drawZoomButtons() {
-    // Proximity detection: show when the mouse is within 90px of the chart's
-    // bottom edge (or already over the buttons). Hide otherwise.
     const proximityY = 90;
-    const btnHalfW = 15, btnH = 26, gap = 4, padRight = 10, padBottom = 10;
-    const bx = this.chartRight - btnHalfW - padRight;
-    const byMinus = this.chartBottom - padBottom - btnH / 2;
-    const byPlus  = byMinus - btnH - gap;
+    const btnW = 32, btnH = 26, gap = 8, padBottom = 10;
+    // v2.28.0: centered pair — the middle of the chart, at the bottom.
+    const mid = (this.chartLeft + this.chartRight) / 2;
+    const plusX = mid - btnW - gap / 2;    // + button on the LEFT
+    const minusX = mid + gap / 2;         // − button on the RIGHT
+    const by = this.chartBottom - padBottom - btnH;   // shared top Y
     // Keep visible if the mouse is over either button (so clicking doesn't
     // make them vanish mid-press when the cursor drifts above the proximity
     // band).
-    const overPlus  = this.mouseInside && this.mouseX >= bx - btnHalfW && this.mouseX <= bx + btnHalfW &&
-                      this.mouseY >= byPlus - btnH/2 && this.mouseY <= byPlus + btnH/2;
-    const overMinus = this.mouseInside && this.mouseX >= bx - btnHalfW && this.mouseX <= bx + btnHalfW &&
-                      this.mouseY >= byMinus - btnH/2 && this.mouseY <= byMinus + btnH/2;
+    const overPlus  = this.mouseInside && this.mouseX >= plusX && this.mouseX <= plusX + btnW &&
+                      this.mouseY >= by && this.mouseY <= by + btnH;
+    const overMinus = this.mouseInside && this.mouseX >= minusX && this.mouseX <= minusX + btnW &&
+                      this.mouseY >= by && this.mouseY <= by + btnH;
     const nearBottom = this.mouseInside &&
                        (this.mouseY > this.chartBottom - proximityY || overPlus || overMinus);
     // Fade alpha — eases toward 0 or 1 each frame (~150ms to full).
@@ -10150,7 +10152,7 @@ class TradingChart {
       ctx.globalAlpha = a;
       // Background — slightly brighter on hover for affordance.
       ctx.fillStyle = hovered ? '#363a45' : 'rgba(42, 46, 57, 0.92)';
-      this._roundRect(cx - btnHalfW, cy - btnH / 2, btnHalfW * 2, btnH, 5);
+      this._roundRect(cx - btnW / 2, cy - btnH / 2, btnW, btnH, 5);
       ctx.fill();
       // Subtle border.
       ctx.strokeStyle = this.theme.axisBorder;
@@ -10171,13 +10173,13 @@ class TradingChart {
       ctx.stroke();
       ctx.restore();
     };
-    drawOne(bx, byPlus,  true,  overPlus);
-    drawOne(bx, byMinus, false, overMinus);
+    drawOne(plusX + btnW / 2,  by + btnH / 2, true,  overPlus);
+    drawOne(minusX + btnW / 2, by + btnH / 2, false, overMinus);
     // Register for hit-testing ONLY when sufficiently visible (otherwise an
     // invisible button would still catch clicks).
     if (a > 0.5) {
-      this.buttons.push({x: bx - btnHalfW, y: byPlus - btnH/2,  w: btnHalfW*2, h: btnH, action: 'zoomIn'});
-      this.buttons.push({x: bx - btnHalfW, y: byMinus - btnH/2, w: btnHalfW*2, h: btnH, action: 'zoomOut'});
+      this.buttons.push({x: plusX,  y: by, w: btnW, h: btnH, action: 'zoomIn'});
+      this.buttons.push({x: minusX, y: by, w: btnW, h: btnH, action: 'zoomOut'});
     }
   }
 
@@ -10220,7 +10222,12 @@ class TradingChart {
     // numbers, why aren't they INSIDE it?"). A full-strip slot replaces the
     // number row it covers, exactly like TradingView's current-price tag.
     const txt = this.priceScale.formatLogical(last.close);
-    ctx.font = 'bold 11px -apple-system, Segoe UI, Roboto, sans-serif';
+    // v2.28.0: REGULAR 11px — the SAME font/size the axis numbers use (user:
+    // "its size should be like the size of the price-axis numbers"). The old
+    // bold text rendered larger/heavier than the axis digits, so the tag
+    // looked bigger than a number row. Now the tag is visually identical to
+    // the row it replaces — same font, same right-aligned x (W-6).
+    ctx.font = '11px -apple-system, Segoe UI, Roboto, sans-serif';
     const stripW = this.W - this.chartRight;
     const labelY = Math.floor(y) - 9;
     // Clamp label Y so it stays within the price axis area
@@ -10894,12 +10901,13 @@ class TradingChart {
   }
 
   // Draw the collapse/expand arrow for the indicator list.
-  // v2.27.1: redesigned as a HOLLOW CHEVRON — two strokes only (the two arms
-  // of ∧ or ∨), no base line, no fill. The old solid filled triangle had a
-  // "tail" (the closed base) and looked heavy/ugly (user report: "it's an
-  // ugly triangle — put a beautiful small hollow one with just two lines,
-  // no tail"). The chevron is the modern UI standard (Bootstrap accordions,
-  // TradingView pane toggles): clean, light, recognizable.
+  // v2.27.1 → v2.28.0: SOFTENED the chevron. The v2.27.1 chevron was too
+  // SHARP (apex angle ≈ 53° — half-width sz=3.6 vs full height 2*sz=7.2,
+  // a narrow pointed arrowhead; user: "it's sharp — make it like the
+  // professional platforms"). Professional chevrons (TradingView, Bootstrap,
+  // Material) use a WIDE apex angle ≈ 80–90°. New geometry: half-width 4.5,
+  // half-height 2.6 → apex ≈ 82° — a soft, open, clearly-readable ∧/∨.
+  // Still two strokes only, hollow, no base line, rounded caps/joins.
   _drawCollapseArrow(x, y, isUp) {
     const ctx = this.ctx;
     const isHover = this.hoverIcon && this.hoverIcon.iconId === 'collapse';
@@ -10907,18 +10915,18 @@ class TradingChart {
     ctx.strokeStyle = color;
     ctx.lineWidth = 1.4;
     ctx.lineCap = 'round'; ctx.lineJoin = 'round';
-    // Small hollow chevron: ∧ (up = collapse) or ∨ (down = expand).
+    // Soft hollow chevron: ∧ (up = collapse) or ∨ (down = expand).
     // Two line segments — moveTo → lineTo → lineTo. No closePath, no fill.
-    const cx = x + 5, cy = y + 6, sz = 3.6;
+    const cx = x + 5, cy = y + 6, w = 4.5, h = 2.6;
     ctx.beginPath();
     if (isUp) {
-      ctx.moveTo(cx - sz, cy + sz);   // bottom-left
-      ctx.lineTo(cx, cy - sz);        // apex
-      ctx.lineTo(cx + sz, cy + sz);   // bottom-right
+      ctx.moveTo(cx - w, cy + h);   // bottom-left
+      ctx.lineTo(cx, cy - h);        // apex
+      ctx.lineTo(cx + w, cy + h);   // bottom-right
     } else {
-      ctx.moveTo(cx - sz, cy - sz);   // top-left
-      ctx.lineTo(cx, cy + sz);        // apex (bottom)
-      ctx.lineTo(cx + sz, cy - sz);   // top-right
+      ctx.moveTo(cx - w, cy - h);   // top-left
+      ctx.lineTo(cx, cy + h);        // apex (bottom)
+      ctx.lineTo(cx + w, cy - h);   // top-right
     }
     ctx.stroke();   // stroke only — hollow, no fill, no base line
     // Register for hit-test
