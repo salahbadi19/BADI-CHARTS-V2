@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.28.0 — WEBGL EDITION (chart-webgl.js)
+ * BADI-CHARTS-V2 v2.29.0 — WEBGL EDITION (chart-webgl.js)
  * The complete standalone trading chart library, rendered with real WebGL.
  *
  * THIS FILE IS A FULL LIBRARY, NOT A LAYER. Load it INSTEAD of chart.js —
@@ -385,7 +385,7 @@
 'use strict';
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.28.0';
+const VERSION = '2.29.0';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 // v2.14.0 (audit #12): tracks the chart the user last hovered/touched, so
 // window-level keyboard shortcuts only apply to ONE chart on multi-chart pages.
@@ -2033,6 +2033,28 @@ class GLCtx {
       alpha: this._alpha, color: col, stroke: true, lw: this._lw
     });
   }
+  /* --------------------- UI-layer rect (v2.29.0) ------------------------ */
+  // A colored rect that must paint ON the TEXT overlay layer, not the GPU
+  // layer. The GL canvas sits BEHIND the text overlay, so a normal fillRect
+  // (a GPU pass) ends up UNDER every fillText of the same frame — which is
+  // why the price-axis digits drew ON TOP of the current-price card as it
+  // slid over them (user report: "when the card moves, the other numbers
+  // should go UNDER it, not on top of it"). Queueing the rect into the same
+  // ORDERED text replay restores the 2D edition's exact paint order: axis
+  // digits first, the card rect above them (covering them), and the card's
+  // own text on top of the rect. Used by the current-price tag and the
+  // crosshair price/time tag cards — the colored cards that slide over
+  // axis numbers. Background panels (axisBg etc.) stay on the GPU layer.
+  uiFillRect(x, y, w, h) {
+    if (!this.backend) { this._nc.fillRect(x, y, w, h); return; }
+    const col = this._fillGrad ? this._fillGrad.cssColor() : _cssColor(this._fillCol);
+    this._textQ.push({
+      uiRect: [x, y, w, h],
+      m: this._m.slice(),
+      clip: this._clip ? { x: this._clip.x, y: this._clip.y, w: this._clip.w, h: this._clip.h } : null,
+      alpha: this._alpha, color: col
+    });
+  }
   measureText(str) {
     try {
       if (this._nc && this._nc.measureText) {
@@ -2121,6 +2143,14 @@ class GLCtx {
           nc.clip();
         }
         nc.globalAlpha = op.alpha;
+        if (op.uiRect) {
+          // v2.29.0: UI-layer rect — paints in the ordered text stream so it
+          // covers earlier axis digits (cards) and sits under later text.
+          nc.fillStyle = op.color;
+          nc.fillRect(op.uiRect[0], op.uiRect[1], op.uiRect[2], op.uiRect[3]);
+          nc.restore();
+          continue;
+        }
         nc.font = op.font;
         nc.textAlign = op.align;
         nc.textBaseline = op.base;
@@ -10235,7 +10265,14 @@ class TradingChart {
     const maxY = (this.layout.paneBottom || this.chartBottom) - 18;
     const clampedY = clamp(labelY, minY, maxY);
     ctx.fillStyle = color;
-    ctx.fillRect(this.chartRight, clampedY, stripW, 18);
+    // v2.29.0: the card background goes to the UI (text) LAYER, not the GPU
+    // layer. fillRect here is a GPU pass — the GL canvas sits BEHIND the text
+    // overlay, so the price-axis digits drew ON TOP of the colored card as
+    // it slid over their rows (user: "the numbers should go UNDER the card").
+    // uiFillRect queues the opaque rect into the SAME ordered text replay:
+    // digits first, card rect above them (covering them), card text on top.
+    if (ctx.uiFillRect) ctx.uiFillRect(this.chartRight, clampedY, stripW, 18);
+    else ctx.fillRect(this.chartRight, clampedY, stripW, 18);
     ctx.fillStyle = this.theme.textBright;
     ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
     ctx.fillText(txt, this.W - 6, clampedY + 9);
@@ -10648,7 +10685,10 @@ class TradingChart {
     const axisBottom = (this.layout.paneBottom || this.chartBottom);
     const labelX = clamp(x, this.chartLeft + tw / 2 + 2, this.chartRight - tw / 2 - 2);
     ctx.fillStyle = this.theme.crosshairLabel;
-    ctx.fillRect(labelX - tw / 2, axisBottom + 2, tw, this.layout.timeAxisH - 4);
+    // v2.29.0: UI-layer rect (see drawCurrentPriceLine) — the time-tag card
+    // must cover the time-axis digits it slides over, not sit under them.
+    if (ctx.uiFillRect) ctx.uiFillRect(labelX - tw / 2, axisBottom + 2, tw, this.layout.timeAxisH - 4);
+    else ctx.fillRect(labelX - tw / 2, axisBottom + 2, tw, this.layout.timeAxisH - 4);
     ctx.fillStyle = this.theme.textBright;
     ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
     ctx.fillText(timeStr, labelX, axisBottom + this.layout.timeAxisH / 2);
@@ -10680,7 +10720,10 @@ class TradingChart {
         // visible around it (user report: "the cards are ON TOP of the axis
         // numbers, why aren't they INSIDE it?").
         ctx.fillStyle = this.theme.crosshairLabel;
-        ctx.fillRect(this.chartRight, Math.floor(y) - 9, this.W - this.chartRight, 18);
+        // v2.29.0: UI-layer rect (see drawCurrentPriceLine) — the crosshair
+        // price-tag card must cover the axis digits it slides over.
+        if (ctx.uiFillRect) ctx.uiFillRect(this.chartRight, Math.floor(y) - 9, this.W - this.chartRight, 18);
+        else ctx.fillRect(this.chartRight, Math.floor(y) - 9, this.W - this.chartRight, 18);
         ctx.fillStyle = this.theme.textBright;
         ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
         ctx.fillText(valueStr, this.W - 6, Math.floor(y));
