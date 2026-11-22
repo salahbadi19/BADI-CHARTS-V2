@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.24.0 — Pixel-Perfect Pure JavaScript Trading Chart Library
+ * BADI-CHARTS-V2 v2.24.1 — Pixel-Perfect Pure JavaScript Trading Chart Library
  *
  * A lightweight, dependency-free candlestick charting library built entirely
  * with the HTML5 Canvas API. Inspired by TradingView Lightweight Charts.
@@ -378,7 +378,7 @@ var Path2D = (typeof window !== 'undefined' && window.Path2D)
     })();
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.24.0';
+const VERSION = '2.24.1';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 // v2.14.0 (audit #12): tracks the chart the user last hovered/touched, so
 // window-level keyboard shortcuts only apply to ONE chart on multi-chart pages.
@@ -8826,31 +8826,31 @@ class TradingChart {
     }
   }
 
-  // Draw the collapse/expand arrow for the indicator list
+  // Draw the collapse/expand arrow for the indicator list.
+  // v2.24.1: redesigned as a HOLLOW CHEVRON — two strokes only (the two arms
+  // of ∧ or ∨), no base line, no fill. The old solid filled triangle had a
+  // "tail" (the closed base) and looked heavy/ugly.
   _drawCollapseArrow(x, y, isUp) {
     const ctx = this.ctx;
     const isHover = this.hoverIcon && this.hoverIcon.iconId === 'collapse';
     const color = isHover ? this.theme.textBright : this.theme.textDim;
     ctx.strokeStyle = color;
-    ctx.fillStyle = color;
-    ctx.lineWidth = 1.2;
+    ctx.lineWidth = 1.4;
     ctx.lineCap = 'round'; ctx.lineJoin = 'round';
-    // Draw a small triangle (up or down)
-    const cx = x + 5, cy = y + 6, sz = 4;
+    // Small hollow chevron: ∧ (up = collapse) or ∨ (down = expand).
+    // Two line segments — moveTo → lineTo → lineTo. No closePath, no fill.
+    const cx = x + 5, cy = y + 6, sz = 3.6;
     ctx.beginPath();
     if (isUp) {
-      // Up arrow (collapse) — triangle pointing up
-      ctx.moveTo(cx, cy - sz);
-      ctx.lineTo(cx - sz, cy + sz);
+      ctx.moveTo(cx - sz, cy + sz);
+      ctx.lineTo(cx, cy - sz);
       ctx.lineTo(cx + sz, cy + sz);
     } else {
-      // Down arrow (expand) — triangle pointing down
-      ctx.moveTo(cx, cy + sz);
-      ctx.lineTo(cx - sz, cy - sz);
+      ctx.moveTo(cx - sz, cy - sz);
+      ctx.lineTo(cx, cy + sz);
       ctx.lineTo(cx + sz, cy - sz);
     }
-    ctx.closePath();
-    ctx.fill();
+    ctx.stroke();
     // Register for hit-test
     this._iconHits.push({type: 'icon', indId: '__legend__', iconId: 'collapse', x: x - 3, y: y - 3, w: 16, h: 16});
   }
