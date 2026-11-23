@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.33.1 — Pixel-Perfect Pure JavaScript Trading Chart Library
+ * BADI-CHARTS-V2 v2.33.2 — Pixel-Perfect Pure JavaScript Trading Chart Library
  *
  * A lightweight, dependency-free candlestick charting library built entirely
  * with the HTML5 Canvas API. Inspired by TradingView Lightweight Charts.
@@ -378,7 +378,7 @@ var Path2D = (typeof window !== 'undefined' && window.Path2D)
     })();
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.33.1';
+const VERSION = '2.33.2';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 
 // v2.31.0/v2.32.0: the supported chart types (ids + display labels) — 20
@@ -9703,31 +9703,42 @@ class TradingChart {
     }
   }
 
-  // Collapse / expand control of the indicator list: a 20px round-corner
-  // button with a soft chevron (hover background).
+  // Collapse / expand control of the indicator list.
+  // v2.33.2: REDESIGNED to match TradingView's legend chevron button (user
+  // request: "TradingView's arrow shape is better than ours"). The old control
+  // was a bare floating chevron with a hover-only background; TradingView
+  // draws a small ALWAYS-VISIBLE bordered pill (wider than tall) with a dark
+  // fill, a thin subtle border and a crisp centered caret. Hover brightens
+  // fill/border/caret. Same signature and click zone as before.
   _drawCollapseArrow(x, y, isUp) {
     const ctx = this.ctx;
     const T = this.theme;
-    const size = 20;
-    const bx = x - 4, by = y + 1;
+    // TradingView-like pill: 24x16, 4px corners, wider than tall.
+    const w = 24, h = 16;
+    const bx = x - 6, by = y;
     const isHover = !!(this.hoverIcon && this.hoverIcon.iconId === 'collapse');
-    if (isHover) {
-      ctx.fillStyle = 'rgba(255,255,255,0.10)';
-      this._roundRect(bx, by, size, size, 5);
-      ctx.fill();
-    }
-    ctx.strokeStyle = isHover ? T.textBright : T.textDim;
-    ctx.lineWidth = 1.6;
+    // Background pill (always drawn, like TradingView — not hover-only)
+    ctx.fillStyle = isHover ? 'rgba(42,46,57,0.95)' : 'rgba(19,23,34,0.82)';
+    this._roundRect(bx, by, w, h, 4);
+    ctx.fill();
+    // Thin border (brightens on hover)
+    ctx.strokeStyle = isHover ? 'rgba(255,255,255,0.35)' : 'rgba(255,255,255,0.14)';
+    ctx.lineWidth = 1;
+    this._roundRect(bx + 0.5, by + 0.5, w - 1, h - 1, 4);
+    ctx.stroke();
+    // Crisp centered caret (~10x5), rounded caps — up collapses, down expands
+    const cx = bx + w / 2, cy = by + h / 2, aw = 5, ah = 2.5;
+    ctx.strokeStyle = isHover ? T.textBright : '#B2B5BE';
+    ctx.lineWidth = 1.4;
     ctx.lineCap = 'round'; ctx.lineJoin = 'round';
-    const cx = bx + size / 2, cy = by + size / 2, w = 5, h = 3;
     ctx.beginPath();
     if (isUp) {
-      ctx.moveTo(cx - w, cy + h); ctx.lineTo(cx, cy - h); ctx.lineTo(cx + w, cy + h);
+      ctx.moveTo(cx - aw, cy + ah); ctx.lineTo(cx, cy - ah); ctx.lineTo(cx + aw, cy + ah);
     } else {
-      ctx.moveTo(cx - w, cy - h); ctx.lineTo(cx, cy + h); ctx.lineTo(cx + w, cy - h);
+      ctx.moveTo(cx - aw, cy - ah); ctx.lineTo(cx, cy + ah); ctx.lineTo(cx + aw, cy - ah);
     }
     ctx.stroke();
-    this._iconHits.push({ type: 'icon', indId: '__legend__', iconId: 'collapse', x: bx, y: by, w: size, h: size });
+    this._iconHits.push({ type: 'icon', indId: '__legend__', iconId: 'collapse', x: bx, y: by, w: w, h: h });
   }
 
   // Get formatted value for an indicator at a given candle index
