@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.32.0 — Pixel-Perfect Pure JavaScript Trading Chart Library
+ * BADI-CHARTS-V2 v2.32.1 — Pixel-Perfect Pure JavaScript Trading Chart Library
  *
  * A lightweight, dependency-free candlestick charting library built entirely
  * with the HTML5 Canvas API. Inspired by TradingView Lightweight Charts.
@@ -378,7 +378,7 @@ var Path2D = (typeof window !== 'undefined' && window.Path2D)
     })();
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.32.0';
+const VERSION = '2.32.1';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 
 // v2.31.0/v2.32.0: the supported chart types (ids + display labels) — 20
@@ -6663,7 +6663,6 @@ class TradingChart {
       case 'settings': this.showToast('R reset · +/- zoom · Esc cancel · Del delete'); break;
       case 'zoomIn':  this.zoomAtCenter(1.2); break;    // v2.24.0: +/− zoom buttons
       case 'zoomOut': this.zoomAtCenter(1 / 1.2); break; // v2.24.0
-      case 'chartSettings': this.openChartSettingsCard(); break;   // v2.31.0
     }
   }
   openDropdown(type, items, anchorBtn) {
@@ -9046,7 +9045,7 @@ class TradingChart {
     const overMinus = this.mouseInside && this.mouseX >= minusX && this.mouseX <= minusX + btnW &&
                       this.mouseY >= by && this.mouseY <= by + btnH;
     const nearBottom = this.mouseInside &&
-                       (this.mouseY > this.chartBottom - proximityY || overPlus || overMinus || this._overGearBtn());
+                       (this.mouseY > this.chartBottom - proximityY || overPlus || overMinus);
     if (this._zoomAlpha === undefined) this._zoomAlpha = 0;
     const target = nearBottom ? 1 : 0;
     this._zoomAlpha += (target - this._zoomAlpha) * 0.18;
@@ -9078,67 +9077,10 @@ class TradingChart {
     };
     drawOne(plusX + btnW / 2,  by + btnH / 2, true,  overPlus);
     drawOne(minusX + btnW / 2, by + btnH / 2, false, overMinus);
-    this._drawChartSettingsGear(minusX + btnW + gap, by, btnW, btnH, a);
     if (a > 0.5) {
       this.buttons.push({x: plusX,  y: by, w: btnW, h: btnH, action: 'zoomIn'});
       this.buttons.push({x: minusX, y: by, w: btnW, h: btnH, action: 'zoomOut'});
     }
-  }
-
-  // v2.31.0: persistent gear button (right of the −/− zoom buttons) that
-  // opens the chart settings card (chart type, grid, price line, wick
-  // color, countdown, and the type-specific options).
-  _gearBtnRect() {
-    const btnW = 32, btnH = 26, gap = 8, padBottom = 10;
-    const mid = (this.chartLeft + this.chartRight) / 2;
-    const minusX = mid + gap / 2;
-    const by = this.chartBottom - padBottom - btnH;
-    return { x: minusX + btnW + gap, y: by, w: btnW, h: btnH };
-  }
-  _overGearBtn() {
-    const r = this._gearBtnRect();
-    return this.mouseInside && this.mouseX >= r.x && this.mouseX <= r.x + r.w &&
-           this.mouseY >= r.y && this.mouseY <= r.y + r.h;
-  }
-  _drawChartSettingsGear(gx, by, btnW, btnH, alpha) {
-    const ctx = this.ctx;
-    const r = { x: gx - 0, y: by, w: btnW, h: btnH };
-    const cx = r.x + btnW / 2, cy = r.y + btnH / 2;
-    const hovered = this._overGearBtn();
-    ctx.save();
-    ctx.globalAlpha = alpha;
-    ctx.fillStyle = hovered ? '#363a45' : 'rgba(42, 46, 57, 0.92)';
-    this._roundRect(r.x, r.y, btnW, btnH, 5);
-    ctx.fill();
-    ctx.strokeStyle = this.theme.axisBorder;
-    ctx.lineWidth = 1;
-    this._roundRect(r.x + 0.5, r.y + 0.5, btnW - 1, btnH - 1, 5);
-    ctx.stroke();
-    // cog glyph (same geometry as the indicator settings icon, 16px grid)
-    ctx.save();
-    ctx.translate(cx, cy);
-    const k = 13 / 16;
-    ctx.scale(k, k);
-    ctx.strokeStyle = hovered ? this.theme.textBright : this.theme.text;
-    ctx.lineWidth = 1.4;
-    ctx.beginPath();
-    ctx.arc(0, 0, 3.1, 0, Math.PI * 2);
-    ctx.stroke();
-    ctx.lineWidth = 2.0;
-    for (let a2 = 0; a2 < 8; a2++) {
-      const ang = (a2 / 8) * Math.PI * 2;
-      ctx.beginPath();
-      ctx.moveTo(Math.cos(ang) * 3.3, Math.sin(ang) * 3.3);
-      ctx.lineTo(Math.cos(ang) * 5.2, Math.sin(ang) * 5.2);
-      ctx.stroke();
-    }
-    ctx.lineWidth = 1.1;
-    ctx.beginPath();
-    ctx.arc(0, 0, 1.15, 0, Math.PI * 2);
-    ctx.stroke();
-    ctx.restore();
-    ctx.restore();
-    this.buttons.push({ x: r.x, y: r.y, w: btnW, h: btnH, action: 'chartSettings' });
   }
 
   /* --------------------------- Current Price Line ------------------------ */
