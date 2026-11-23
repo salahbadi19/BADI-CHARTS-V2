@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.32.1 — WEBGL EDITION (chart-webgl.js)
+ * BADI-CHARTS-V2 v2.33.0 — WEBGL EDITION (chart-webgl.js)
  * The complete standalone trading chart library, rendered with real WebGL.
  *
  * THIS FILE IS A FULL LIBRARY, NOT A LAYER. Load it INSTEAD of chart.js —
@@ -385,7 +385,7 @@
 'use strict';
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.32.1';
+const VERSION = '2.33.0';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 
 // v2.31.0/v2.32.0: the supported chart types (ids + display labels) — 20
@@ -405,10 +405,6 @@ const CHART_TYPES = [
   { id: 'hlc_area',       label: 'HLC Area' },
   { id: 'baseline',       label: 'Baseline' },
   { id: 'columns',        label: 'Columns' },
-  { id: 'renko',          label: 'Renko' },
-  { id: 'kagi',           label: 'Kagi' },
-  { id: 'line_break',     label: 'Line Break' },
-  { id: 'pnf',            label: 'Point & Figure' },
   { id: 'range_bars',     label: 'Range Bars' },
   { id: 'volume_candles', label: 'Volume Candles' },
   { id: 'footprint',       label: 'Footprint' }
@@ -3469,19 +3465,6 @@ class TradingChart {
       priceLineFollowCandle: true, // true = color follows last candle direction
       priceLineColor: '#2962ff', // used when priceLineFollowCandle = false
       baselinePrice: null,       // baseline type: null = first visible close
-      renkoMode: 'atr',          // 'atr' | 'fixed'
-      renkoSize: 10,             // fixed brick size (price units)
-      renkoAtrPeriod: 14,
-      renkoAtrMult: 1,
-      kagiMode: 'atr',
-      kagiReversal: 2,           // fixed reversal (price units)
-      kagiAtrPeriod: 14,
-      kagiAtrMult: 1,
-      lineBreakLines: 3,         // Three-Line Break: lines to break (1..6)
-      pnfBoxMode: 'atr',
-      pnfBoxSize: 5,
-      pnfAtrMult: 0.25,          // box = ATR * mult in 'atr' mode
-      pnfReversal: 3,            // boxes to reverse
       rangeMode: 'atr',
       rangeSize: 10,
       rangeAtrPeriod: 14,
@@ -7488,10 +7471,13 @@ class TradingChart {
     return this;
   }
   /* --------------------- Chart Types public API (v2.31.0) ---------------- */
-  // Switch the series style. 'type' must be one of CHART_TYPES ids:
+  // v2.33.0: Renko / Kagi / Line Break / Point&Figure were REMOVED as built-in
+  // chart types (they misbehaved under zoom — v2.32.x). Draw such series now
+  // with a custom-candles OVERLAY INDICATOR instead: build the bars in
+  // calculate() and rasterize them with helpers.drawCandles(). Supported:
   // candles | heikin_ashi | hollow_candles | bars | hlc_bars | high_low |
   // line | line_markers | step_line | area | hlc_area | baseline | columns |
-  // renko | kagi | line_break | pnf | range_bars | volume_candles | footprint
+  // range_bars | volume_candles | footprint
   setChartType(type) {
     if (!CHART_TYPES.some(t => t.id === type)) {
       if (BADI_DEBUG) console.warn('[BadiCharts] unknown chart type:', type);
@@ -8255,6 +8241,97 @@ class TradingChart {
         for (let i = 1; i < segs.length; i++) ctx.lineTo(segs[i].x, segs[i].y);
         ctx.stroke();
       },
+      // v2.33.0: drawCandles(ctx, bars, opts) — CUSTOM CANDLE SERIES.
+      // The built-in Renko / Kagi / Line-Break / P&F chart types were removed
+      // (they misbehaved under zoom); this helper is the replacement: ANY
+      // transformed series (Renko bricks, Kagi steps, range bars, Heikin Ashi
+      // variants, synthetic candles…) can be drawn as an OVERLAY INDICATOR.
+      //
+      //   chart.addIndicator({
+      //     id: 'myRenko', label: 'Renko', type: 'overlay',
+      //     calculate: function (candles) {
+      //       // return an array of bar objects (same length or not):
+      //       // { open, high, low, close }  (extra keys are ignored)
+      //       return bricks;
+      //     },
+      //     render: function (ctx, values, h) {
+      //       h.drawCandles(ctx, values, { width: 10 });  // width optional
+      //     }
+      //   });
+      //
+      // bars: array of {open, high, low, close} (nulls skipped). Position of
+      // bar k defaults to index (startIdx + k) — pass startIdx in opts to
+      // shift the series (e.g. 0 = align the first brick to the first
+      // candle). Each bar may instead carry an explicit `x` (pixel) or `idx`
+      // (candle index) to place it exactly.
+      // opts: { startIdx, width, bullColor, bearColor, wickColor, hollow,
+      //         borderColor, dprSharp }  — width defaults to a width that
+      // fits the current bar spacing; hollow=true outlines bull bodies.
+      // Series shorter than the candles are fine: drawCandles never indexes
+      // the source candles, it only walks the bars YOU return.
+      drawCandles: function (ctx, bars, opts) {
+        opts = opts || {};
+        if (!ctx || !bars || !bars.length) return;
+        if (kind !== 'overlay') {
+          if (BADI_DEBUG) console.warn('[BadiCharts] drawCandles() is a price-area helper — use type:"overlay"');
+          return;
+        }
+        const T = self.theme;
+        const bull = opts.bullColor || T.bull;
+        const bear = opts.bearColor || T.bear;
+        const wickCol = opts.wickColor || null;
+        const hollow = !!opts.hollow;
+        const startIdx = (opts.startIdx != null) ? opts.startIdx : firstIdx;
+        const dpr = self.dpr || 1;
+        // Body width: explicit, or the optimal candle width for the zoom
+        let w = opts.width;
+        if (w == null) w = candlestickWidth(self.barSpacing || 6, dpr) / dpr;
+        w = Math.max(1.2, Math.min(w, Math.max(4, (self.barSpacing || 6) - 2)));
+        const half = w / 2;
+        // Collect min/max FIRST — the caller's series may live OUTSIDE the
+        // current price scale (Renko bricks aggregate over many candles);
+        // drawing without checking would send rects to NaN/Infinity.
+        const yMapFn = function (p) { return self.priceToY(p); };
+        ctx.save();
+        ctx.lineCap = 'butt';
+        for (let k = 0; k < bars.length; k++) {
+          const b = bars[k];
+          if (!b || b.open == null || b.close == null) continue;
+          let x;
+          if (typeof b.x === 'number') x = b.x;
+          else if (typeof b.idx === 'number') x = self.indexToX(b.idx);
+          else x = self.indexToX(startIdx + k);
+          if (!isFinite(x)) continue;
+          // Clip horizontally: skip bars entirely outside the viewport
+          if (x + half < self.chartLeft - 2 || x - half > self.chartRight + 2) continue;
+          const yO = yMapFn(b.open), yC = yMapFn(b.close);
+          if (!isFinite(yO) || !isFinite(yC)) continue;
+          const up = b.close >= b.open;
+          const yTop = Math.min(yO, yC), yBot = Math.max(yO, yC);
+          const bodyH = Math.max(1, yBot - yTop);
+          // Wick (high/low optional — omit them for brick-like series)
+          if (b.high != null && b.low != null) {
+            const yH = yMapFn(b.high), yL = yMapFn(b.low);
+            if (isFinite(yH) && isFinite(yL) && (yH < yTop - 0.25 || yL > yBot + 0.25)) {
+              ctx.strokeStyle = wickCol || (up ? bull : bear);
+              ctx.lineWidth = 1;
+              ctx.beginPath();
+              ctx.moveTo(x, Math.min(yH, yTop));
+              ctx.lineTo(x, Math.max(yL, yBot));
+              ctx.stroke();
+            }
+          }
+          if (up && hollow) {
+            ctx.strokeStyle = bull;
+            ctx.lineWidth = 1;
+            ctx.strokeRect(x - half + 0.5, yTop + 0.5, w - 1, bodyH - 1);
+          } else {
+            ctx.fillStyle = up ? bull : bear;
+            ctx.fillRect(x - half, yTop, w, bodyH);
+          }
+        }
+        ctx.restore();
+      },
       // v2.18.0: drawOnMain(fn) — register a callback that draws on the MAIN
       // chart layer (the candlestick price area) using priceToY / indexToX of
       // the candle chart, NOT clipped to this pane. This is the official
@@ -8877,10 +8954,7 @@ class TradingChart {
   _viewCacheKey() {
     const vs = this.viewSettings;
     return [this.chartType, this._contentVersion, this.sim.candles.length,
-            vs.wickColor, vs.baselinePrice, vs.renkoMode, vs.renkoSize,
-            vs.renkoAtrPeriod, vs.renkoAtrMult, vs.kagiMode, vs.kagiReversal,
-            vs.kagiAtrPeriod, vs.kagiAtrMult, vs.lineBreakLines,
-            vs.pnfBoxMode, vs.pnfBoxSize, vs.pnfAtrMult, vs.pnfReversal,
+            vs.wickColor, vs.baselinePrice,
             vs.rangeMode, vs.rangeSize, vs.rangeAtrPeriod, vs.rangeAtrMult
            ].join('|');
   }
@@ -8888,11 +8962,7 @@ class TradingChart {
     const c = this.sim.candles;
     switch (this.chartType) {
       case 'heikin_ashi': return this._haBars(c);
-      case 'renko':       return this._renkoBars(c);
       case 'range_bars':  return this._rangeBars(c);
-      case 'line_break':  return this._lineBreakBars(c);
-      case 'pnf':         return this._pnfBars(c);
-      case 'kagi':        return this._kagiBars(c);
       default:            return c;   // candle/bar/line styles render raw
     }
   }
@@ -8923,43 +8993,6 @@ class TradingChart {
         high: Math.max(c[i].high, haOpen, haClose),
         low:  Math.min(c[i].low, haOpen, haClose)
       };
-    }
-    return out;
-  }
-  // Renko: one brick-state bar per candle (brick = fixed or ATR × mult)
-  // v2.32.0 FIX: a DOWN brick now stores open at the TOP of the brick and
-  // close at the BOTTOM (open > close → bear color). v2.31.0 always stored
-  // open=bottom / close=top, so falling bricks were painted green too.
-  _renkoBars(c) {
-    const vs = this.viewSettings;
-    let brick = vs.renkoMode === 'fixed' ? vs.renkoSize : this._viewAtr(vs.renkoAtrPeriod) * vs.renkoAtrMult;
-    if (!isFinite(brick) || brick <= 0) brick = Math.max(1e-9, Math.abs(c.length ? c[0].close : 1) * 0.001);
-    const out = new Array(c.length);
-    let top = null, bottom = null;
-    for (let i = 0; i < c.length; i++) {
-      const cl = c[i].close;
-      if (top === null) {
-        const base = Math.floor(cl / brick) * brick;
-        top = base + brick; bottom = base;
-        out[i] = { time: c[i].time, volume: c[i].volume,
-                   open: bottom, close: top, high: top, low: bottom };
-      } else {
-        let guard = 0, moved = 0;
-        while (cl >= top + brick && guard++ < 100000) { bottom = top; top += brick; moved = 1; }
-        guard = 0;
-        while (cl <= bottom - brick && guard++ < 100000) { top = bottom; bottom -= brick; moved = -1; }
-        if (moved === 1) {
-          out[i] = { time: c[i].time, volume: c[i].volume,
-                     open: bottom, close: top, high: top, low: bottom };
-        } else if (moved === -1) {
-          out[i] = { time: c[i].time, volume: c[i].volume,
-                     open: top, close: bottom, high: top, low: bottom };
-        } else {
-          const p = out[i - 1];   // no new brick — keep the last brick's look
-          out[i] = { time: c[i].time, volume: c[i].volume,
-                     open: p.open, close: p.close, high: top, low: bottom };
-        }
-      }
     }
     return out;
   }
@@ -9007,97 +9040,6 @@ class TradingChart {
     }
     return out;
   }
-  // Three-Line Break (N configurable): one line-state bar per candle
-  _lineBreakBars(c) {
-    const N = Math.max(1, Math.min(6, this.viewSettings.lineBreakLines | 0));
-    const lines = [];   // {open, close, dir}
-    const out = new Array(c.length);
-    for (let i = 0; i < c.length; i++) {
-      const cl = c[i].close;
-      if (lines.length === 0) {
-        lines.push({ open: c[i].open, close: cl, dir: cl >= c[i].open ? 1 : -1 });
-      } else {
-        const last = lines[lines.length - 1];
-        let hi = -Infinity, lo = Infinity;
-        for (let j = Math.max(0, lines.length - N); j < lines.length; j++) {
-          hi = Math.max(hi, lines[j].close); lo = Math.min(lo, lines[j].close);
-        }
-        if (last.dir === 1) {
-          if (cl > last.close) lines.push({ open: last.close, close: cl, dir: 1 });
-          else if (cl < lo) lines.push({ open: last.open, close: cl, dir: -1 });
-        } else {
-          if (cl < last.close) lines.push({ open: last.close, close: cl, dir: -1 });
-          else if (cl > hi) lines.push({ open: last.open, close: cl, dir: 1 });
-        }
-        if (lines.length > 4000) lines.splice(0, 1000);   // keep memory bounded
-      }
-      const L = lines[lines.length - 1];
-      out[i] = { time: c[i].time, volume: c[i].volume,
-                 open: L.open, close: L.close,
-                 high: Math.max(L.open, L.close), low: Math.min(L.open, L.close) };
-    }
-    return out;
-  }
-  // Point & Figure (index-preserving columns; box fixed or ATR × mult)
-  _pnfBars(c) {
-    const vs = this.viewSettings;
-    let b = vs.pnfBoxMode === 'fixed' ? vs.pnfBoxSize : this._viewAtr(14) * vs.pnfAtrMult;
-    if (!isFinite(b) || b <= 0) b = 1e-9;
-    const R = Math.max(1, vs.pnfReversal | 0);
-    const out = new Array(c.length);
-    let col = null;   // {dir, top, bottom}
-    for (let i = 0; i < c.length; i++) {
-      const k = c[i];
-      if (!col) {
-        const base = Math.floor(k.close / b) * b;
-        col = { dir: 1, top: base + b, bottom: base };
-      } else if (col.dir === 1) {
-        let guard = 0;
-        while (k.high >= col.top + b && guard++ < 100000) col.top += b;
-        if (k.low <= col.top - R * b) {
-          col = { dir: -1, top: col.top - b, bottom: col.top - b };
-          guard = 0;
-          while (k.low <= col.bottom - b && guard++ < 100000) col.bottom -= b;
-        }
-      } else {
-        let guard = 0;
-        while (k.low <= col.bottom - b && guard++ < 100000) col.bottom -= b;
-        if (k.high >= col.bottom + R * b) {
-          col = { dir: 1, top: col.bottom + b, bottom: col.bottom + b };
-          guard = 0;
-          while (k.high >= col.top + b && guard++ < 100000) col.top += b;
-        }
-      }
-      out[i] = { time: k.time, volume: k.volume, open: col.bottom, close: col.top,
-                 high: col.top, low: col.bottom, dir: col.dir };
-    }
-    return out;
-  }
-  // Kagi (index-preserving): per-bar level + yang flag; the renderer draws
-  // the stepped thick/thin path.
-  _kagiBars(c) {
-    const vs = this.viewSettings;
-    let rev = vs.kagiMode === 'fixed' ? vs.kagiReversal : this._viewAtr(vs.kagiAtrPeriod) * vs.kagiAtrMult;
-    if (!isFinite(rev) || rev <= 0) rev = 1e-9;
-    const out = new Array(c.length);
-    let level = null, yang = false, swingHi = -Infinity, swingLo = Infinity, dir = 1;
-    for (let i = 0; i < c.length; i++) {
-      const cl = c[i].close;
-      if (level === null) level = cl;
-      if (dir === 1) {
-        if (cl - level >= rev) { level = cl; yang = cl > swingHi ? true : yang; }
-        else if (level - cl >= rev) { swingHi = Math.max(swingHi, level); dir = -1; level = cl; yang = false; }
-      } else {
-        if (level - cl >= rev) { level = cl; yang = cl < swingLo ? false : yang; }
-        else if (cl - level >= rev) { swingLo = Math.min(swingLo, level); dir = 1; level = cl; yang = true; }
-      }
-      swingHi = Math.max(swingHi, cl); swingLo = Math.min(swingLo, cl);
-      out[i] = { time: c[i].time, volume: c[i].volume,
-                 open: level - dir * rev * 0.001, close: level, high: level, low: level,
-                 level: level, yang: yang, dir: dir };
-    }
-    return out;
-  }
 
 
   /* --------------------------- Candles (LWC-correct widths) -------------- */
@@ -9133,11 +9075,6 @@ class TradingChart {
       this._renderCandleStyle(firstIdx, lastIdx, bodyWidth, wickWidth, drawAsLine, fastY, bars, {});
     } else if (type === 'hollow_candles') {
       this._renderCandleStyle(firstIdx, lastIdx, bodyWidth, wickWidth, drawAsLine, fastY, bars, { hollow: true });
-    } else if (type === 'renko' || type === 'line_break') {
-      this._renderCandleStyle(firstIdx, lastIdx, bodyWidth, wickWidth, drawAsLine, fastY, bars, { noWick: true });
-    } else if (type === 'pnf') {
-      // v2.32.0: soft column bodies + classic X/O letters per box level
-      this._renderPnfStyle(firstIdx, lastIdx, bodyWidth, wickWidth, drawAsLine, fastY, bars);
     } else if (type === 'range_bars') {
       this._renderCandleStyle(firstIdx, lastIdx, bodyWidth, wickWidth, drawAsLine, fastY, bars, {});
     } else if (type === 'volume_candles') {
@@ -9147,8 +9084,6 @@ class TradingChart {
       this._renderFootprintStyle(firstIdx, lastIdx, bodyWidth, wickWidth, drawAsLine, fastY, bars);
     } else if (type === 'bars' || type === 'hlc_bars' || type === 'high_low') {
       this._renderBarStyle(firstIdx, lastIdx, bodyWidth, drawAsLine, fastY, bars, type);
-    } else if (type === 'kagi') {
-      this._renderKagiStyle(firstIdx, lastIdx, bodyWidth, fastY, bars, dpr);
     } else {
       // line / line_markers / step_line / area / hlc_area / baseline / columns
       this._renderLineStyle(firstIdx, lastIdx, bodyWidth, fastY, bars, type, dpr);
@@ -9434,72 +9369,6 @@ class TradingChart {
     ctx.restore();
   }
 
-  // Point & Figure — v2.32.0: soft column bodies + the classic X/O letters at
-  // every box level, grid-aligned across all columns (box = fixed value or
-  // ATR(14) × pnfAtrMult — the SAME formula as _pnfBars, so letters and bodies
-  // always agree). X = demand column (green), O = supply column (red).
-  // Letters need a readable slot: below barSpacing 12 the columns fall back
-  // to solid no-wick bodies (the v2.31.0 look).
-  _renderPnfStyle(firstIdx, lastIdx, bodyWidth, wickWidth, drawAsLine, fastPriceToY, bars) {
-    const spacing = this.barSpacing || (bodyWidth + 2);
-    if (spacing < 12 || drawAsLine) {
-      this._renderCandleStyle(firstIdx, lastIdx, bodyWidth, wickWidth, drawAsLine, fastPriceToY, bars, { noWick: true });
-      return;
-    }
-    const ctx = this.ctx;
-    const dpr = this.dpr;
-    const vs = this.viewSettings;
-    const T = this.theme;
-    let box = vs.pnfBoxMode === 'fixed' ? vs.pnfBoxSize : this._viewAtr(14) * vs.pnfAtrMult;
-    if (!isFinite(box) || box <= 0) box = Math.max(1e-9, Math.abs(this.sim.candles.length ? this.sim.candles[0].close : 1) * 0.001);
-    const fs = Math.min(12, Math.max(7, Math.floor(spacing * 0.55)));
-    const FP_FONT = '-apple-system, Segoe UI, Roboto, sans-serif';
-
-    ctx.save();
-    ctx.beginPath();
-    ctx.rect(this.chartLeft, this.priceTop, this.chartRight - this.chartLeft, this.priceBottom - this.priceTop);
-    ctx.clip();
-
-    const bullBody = new Path2D(), bearBody = new Path2D();
-    const xBull = [], xBear = [];      // letter positions {x, y}
-    const chartLeft = this.chartLeft, chartRight = this.chartRight;
-    for (let i = firstIdx; i <= lastIdx; i++) {
-      const b = bars[i];
-      if (!b) continue;
-      const x = this.indexToX(i);
-      if (x < chartLeft - spacing || x > chartRight + spacing) continue;
-      const isBull = (b.dir != null ? b.dir : (b.close >= b.open ? 1 : -1)) === 1;
-      const yTop = Math.round(fastPriceToY(b.high) * dpr) / dpr;
-      const yBot = Math.round(fastPriceToY(b.low) * dpr) / dpr;
-      const cxBmp = Math.round(x * dpr);
-      const cx = cxBmp / dpr;
-      (isBull ? bullBody : bearBody).rect(cx + wickWidth / 2 - bodyWidth / 2, yTop, bodyWidth, Math.max(1 / dpr, yBot - yTop));
-      // one letter per box level — grid indices are shared by every column,
-      // so letters at the same price land on the same pixel row everywhere
-      const g0 = Math.floor(b.low / box), g1 = Math.floor(b.high / box);
-      let guard = 0;
-      for (let g = g0; g <= g1 && guard++ < 80; g++) {
-        const price = (g + 0.5) * box;
-        const y = fastPriceToY(price);
-        if (y < yTop || y > yBot) continue;
-        (isBull ? xBull : xBear).push({ x: cx, y: y });
-      }
-    }
-    // soft bodies so the letters read clearly
-    ctx.fillStyle = _withAlpha(T.bull, 0.22); ctx.fill(bullBody);
-    ctx.fillStyle = _withAlpha(T.bear, 0.22); ctx.fill(bearBody);
-    ctx.font = '700 ' + fs + 'px ' + FP_FONT;
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillStyle = T.bull;
-    for (const p of xBull) ctx.fillText('X', p.x, p.y);
-    ctx.fillStyle = T.bear;
-    for (const p of xBear) ctx.fillText('O', p.x, p.y);
-    ctx.textAlign = 'left';
-    ctx.textBaseline = 'top';
-    ctx.restore();
-  }
-
   // OHLC bars / HLC bars / High-Low bars
   _renderBarStyle(firstIdx, lastIdx, bodyWidth, drawAsLine, fastPriceToY, bars, type) {
     const ctx = this.ctx;
@@ -9545,51 +9414,6 @@ class TradingChart {
     ctx.stroke(bullPath);
     ctx.strokeStyle = this.theme.bear;
     ctx.stroke(bearPath);
-    ctx.restore();
-  }
-
-  // Kagi: stepped path — thin connector at the previous level, then a
-  // VERTICAL move at each bar; the move is THICK (yang) while the line is
-  // rising beyond its previous swing, thin (yin) while falling. TV colors:
-  // bull/bear per direction, thickness per yang/yin.
-  _renderKagiStyle(firstIdx, lastIdx, bodyWidth, fastPriceToY, bars, dpr) {
-    const ctx = this.ctx;
-    const T = this.theme;
-    ctx.save();
-    ctx.beginPath();
-    ctx.rect(this.chartLeft, this.priceTop, this.chartRight - this.chartLeft, this.priceBottom - this.priceTop);
-    ctx.clip();
-    // four batched paths: (bull|bear) × (yang|yin)
-    const paths = {
-      '1|1': new Path2D(), '1|0': new Path2D(),
-      '-1|1': new Path2D(), '-1|0': new Path2D()
-    };
-    let prev = null;
-    for (let i = firstIdx; i <= lastIdx; i++) {
-      const b = bars[i];
-      if (!b || b.level == null) continue;
-      const x = this.indexToX(i);
-      if (x < this.chartLeft - bodyWidth || x > this.chartRight + bodyWidth) continue;
-      const y = fastPriceToY(b.level);
-      if (prev) {
-        const p = paths[b.dir + '|' + (b.yang ? 1 : 0)];
-        // horizontal connector at the previous level (yin-thin always)
-        paths[b.dir + '|0'].moveTo(prev.x, prev.y);
-        paths[b.dir + '|0'].lineTo(x, prev.y);
-        // vertical move at the new bar (thick when yang)
-        p.moveTo(x, prev.y);
-        p.lineTo(x, y);
-      }
-      prev = { x: x, y: y };
-    }
-    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
-    for (const key of Object.keys(paths)) {
-      const dir = key.split('|')[0];
-      const yang = key.split('|')[1] === '1';
-      ctx.strokeStyle = dir === '1' ? T.bull : T.bear;
-      ctx.lineWidth = yang ? Math.max(2.5, bodyWidth * 0.45) : 1.2;
-      ctx.stroke(paths[key]);
-    }
     ctx.restore();
   }
 
@@ -12424,32 +12248,6 @@ class TradingChart {
       F.push({ key: 'baselinePrice', label: 'Baseline price', type: 'number',
                value: vs.baselinePrice == null ? '' : vs.baselinePrice });
     }
-    if (t === 'renko') {
-      F.push({ key: 'renkoMode', label: 'Brick size', type: 'select', value: vs.renkoMode,
-               options: [{ v: 'atr', label: 'ATR (auto)' }, { v: 'fixed', label: 'Fixed' }] });
-      if (vs.renkoMode === 'fixed') F.push({ key: 'renkoSize', label: 'Brick value', type: 'number', value: vs.renkoSize });
-      else F.push({ key: 'renkoAtrMult', label: 'ATR multiplier', type: 'number', value: vs.renkoAtrMult });
-    }
-    if (t === 'kagi') {
-      F.push({ key: 'kagiMode', label: 'Reversal size', type: 'select', value: vs.kagiMode,
-               options: [{ v: 'atr', label: 'ATR (auto)' }, { v: 'fixed', label: 'Fixed' }] });
-      if (vs.kagiMode === 'fixed') F.push({ key: 'kagiReversal', label: 'Reversal value', type: 'number', value: vs.kagiReversal });
-      else F.push({ key: 'kagiAtrMult', label: 'ATR multiplier', type: 'number', value: vs.kagiAtrMult });
-    }
-    if (t === 'line_break') {
-      F.push({ key: 'lineBreakLines', label: 'Lines to break', type: 'select',
-               value: String(Math.max(1, Math.min(6, vs.lineBreakLines | 0))),
-               options: [1, 2, 3, 4, 5, 6].map(n => ({ v: String(n), label: n + ' line' + (n > 1 ? 's' : '') })) });
-    }
-    if (t === 'pnf') {
-      F.push({ key: 'pnfBoxMode', label: 'Box size', type: 'select', value: vs.pnfBoxMode,
-               options: [{ v: 'atr', label: 'ATR (auto)' }, { v: 'fixed', label: 'Fixed' }] });
-      if (vs.pnfBoxMode === 'fixed') F.push({ key: 'pnfBoxSize', label: 'Box value', type: 'number', value: vs.pnfBoxSize });
-      else F.push({ key: 'pnfAtrMult', label: 'ATR multiplier', type: 'number', value: vs.pnfAtrMult });
-      F.push({ key: 'pnfReversal', label: 'Reversal boxes', type: 'select',
-               value: String(Math.max(1, vs.pnfReversal | 0)),
-               options: [1, 2, 3, 4, 5].map(n => ({ v: String(n), label: String(n) })) });
-    }
     if (t === 'range_bars') {
       F.push({ key: 'rangeMode', label: 'Range size', type: 'select', value: vs.rangeMode,
                options: [{ v: 'atr', label: 'ATR (auto)' }, { v: 'fixed', label: 'Fixed' }] });
@@ -12618,7 +12416,7 @@ class TradingChart {
         vs[f.key] = isFinite(n) ? n : vs[f.key];
       } else if (f.key !== 'priceLineColor') {
         vs[f.key] = (f.type === 'checkbox') ? !!v : v;
-        if (f.type === 'select') vs[f.key] = (f.key === 'lineBreakLines' || f.key === 'pnfReversal' || f.key === 'footprintRows') ? (parseInt(v, 10) || vs[f.key]) : v;
+        if (f.type === 'select') vs[f.key] = (f.key === 'footprintRows') ? (parseInt(v, 10) || vs[f.key]) : v;
       }
     }
     this.chartSettingsCard = null;
