@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.31.0 — Pixel-Perfect Pure JavaScript Trading Chart Library
+ * BADI-CHARTS-V2 v2.32.0 — Pixel-Perfect Pure JavaScript Trading Chart Library
  *
  * A lightweight, dependency-free candlestick charting library built entirely
  * with the HTML5 Canvas API. Inspired by TradingView Lightweight Charts.
