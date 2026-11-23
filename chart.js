@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.33.0 — Pixel-Perfect Pure JavaScript Trading Chart Library
+ * BADI-CHARTS-V2 v2.33.1 — Pixel-Perfect Pure JavaScript Trading Chart Library
  *
  * A lightweight, dependency-free candlestick charting library built entirely
  * with the HTML5 Canvas API. Inspired by TradingView Lightweight Charts.
@@ -378,7 +378,7 @@ var Path2D = (typeof window !== 'undefined' && window.Path2D)
     })();
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.33.0';
+const VERSION = '2.33.1';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 
 // v2.31.0/v2.32.0: the supported chart types (ids + display labels) — 20
@@ -5197,6 +5197,10 @@ class TradingChart {
     const regionChanged = !entry.region ||
       entry.region.x !== region.x || entry.region.y !== region.y ||
       entry.region.w !== region.w || entry.region.h !== region.h;
+    // v2.33.1: position fingerprint diff — null stamp (fresh entry or a
+    // failed render awaiting retry) counts as changed → rebuild now.
+    const posStamp = this._indicatorPosStamp(id, state);
+    const posChanged = entry.stamp === null ? true : entry.posStamp !== posStamp;
     const needsRebuild = entry.stamp !== stamp || entry.canvas.width !== pxW || entry.canvas.height !== pxH || regionChanged;
     // v2.15.0 FIX (regression): "interacting" covered only mouse/touch DRAG
     // states — wheel zoom, pinch zoom and momentum changed barSpacing every
@@ -5209,7 +5213,11 @@ class TradingChart {
     // is computed once per indicator; the deferred path is unchanged.
     const screenArea = Math.max(1, this.W * this.H * this.dpr * this.dpr);
     const bitmapArea = pxW * pxH;
-    const budgetExhausted = !interacting && (
+    // v2.33.1: `!posChanged` — a viewport-driven rebuild may NEVER defer.
+    // Deferring it blits a bitmap built for the previous viewport = the
+    // visible one-frame indicator slip. Content-only rebuilds (stable
+    // viewport) keep the budget as before.
+    const budgetExhausted = !interacting && !posChanged && (
       (this._frameRebuildArea + bitmapArea) > screenArea * this._REBUILD_AREA_FACTOR ||
       this._frameRebuilds >= this._MAX_FRAME_REBUILDS);
     // v2.14.0 FIX (audit #14d): a persistently FAILING render retried every
@@ -5223,7 +5231,9 @@ class TradingChart {
       // v2.17.0 FIX: only blit when the stored region still matches — a stale
       // bitmap built for an OLD pane rect, blitted into the NEW rect, renders
       // scaled/ghosted content while cooling.
-      if (entry.ok && !regionChanged) ctx.drawImage(entry.canvas, region.x, region.y, region.w, region.h);
+      // v2.33.1: also skip when the POSITION changed — a stale-position
+      // bitmap is shifted, never blit it.
+      if (entry.ok && !regionChanged && !posChanged) ctx.drawImage(entry.canvas, region.x, region.y, region.w, region.h);
       return;
     }
     if (needsRebuild && !budgetExhausted) {
@@ -5273,6 +5283,7 @@ class TradingChart {
       entry.ok = ok;
       // Failed renders are NOT cached — they retry (with backoff, see above).
       entry.stamp = ok ? stamp : null;
+      if (ok) entry.posStamp = posStamp;   // v2.33.1: remember the viewport the bitmap was built for
       if (ok) {
         entry.failCount = 0;
         entry.cooldownUntil = 0;
@@ -5292,7 +5303,9 @@ class TradingChart {
     // for a DIFFERENT rect — blitting it into the new rect scales and ghosts
     // the old content. Skip the stale blit; the deferred rebuild lands on
     // the very next frame (invalidate() above already scheduled it).
-    const staleRegionBlit = needsRebuild && budgetExhausted && regionChanged;
+    // v2.33.1: with the position bypass, budgetExhausted implies !posChanged
+    // and regionChanged ⊂ posChanged — kept as a belt-and-braces guard.
+    const staleRegionBlit = needsRebuild && budgetExhausted && (regionChanged || posChanged);
     if (entry.ok && !staleRegionBlit) {
       ctx.drawImage(entry.canvas, region.x, region.y, region.w, region.h);
     }
@@ -5382,6 +5395,37 @@ class TradingChart {
       range, ppr,
       state.visible !== false ? 1 : 0,
       settingsKey
+    ].join('|');
+  }
+  // v2.33.1 FIX (indicator slippage): POSITION fingerprint — the subset of
+  // the stamp that moves rendered pixels. When it changes, a cached bitmap
+  // was built for an OLDER viewport; blitting it (even once, even for one
+  // frame) shows the indicator SHIFTED relative to the candles — the
+  // 'indicators slip while zooming/panning/live ticks' report. Position
+  // changes therefore BYPASS the per-frame rebuild budget entirely:
+  // correctness first, the budget only ever defers content-only rebuilds
+  // (forming-candle tick with a stable viewport) where the old bitmap is
+  // still positionally correct and the deferral is invisible.
+  _indicatorPosStamp(id, state) {
+    const pr = this.priceScale && this.priceScale.priceRange();
+    const range = pr ? (pr.min + '~' + pr.max) : 'x';
+    const type = state.def && state.def.type;
+    const pane = type === 'pane' ? this._panes.find(p => p.id === id) : null;
+    const ps = pane ? pane.scale : null;
+    const ppr = ps && ps.priceRange() ? (ps.priceRange().min + '~' + ps.priceRange().max) : 'x';
+    const paneTop = pane ? pane.top : (this.paneTop || 0);
+    const paneBottom = pane ? pane.bottom : (this.paneBottom || 0);
+    return [
+      this._sceneVersion,
+      this._contentVersion,
+      this.sim.candles.length,
+      Math.round(this.barSpacing * 100) / 100,
+      Math.round(this.rightOffset * 100) / 100,
+      Math.round(this.W), Math.round(this.H), Math.round(this.dpr * 100) / 100,
+      Math.round(this.priceTop), Math.round(this.priceBottom),
+      Math.round(paneTop), Math.round(paneBottom),
+      Math.round(this.chartLeft), Math.round(this.chartRight),
+      range, ppr
     ].join('|');
   }
   // v2.14.0: safe settings serialization used by getRange caching. Extracted
@@ -6335,10 +6379,10 @@ class TradingChart {
       //   });
       //
       // bars: array of {open, high, low, close} (nulls skipped). Position of
-      // bar k defaults to index (startIdx + k) — pass startIdx in opts to
-      // shift the series (e.g. 0 = align the first brick to the first
-      // candle). Each bar may instead carry an explicit `x` (pixel) or `idx`
-      // (candle index) to place it exactly.
+      // bar k defaults to candle index k (same anchor as the built-in
+      // series — it does NOT move while panning). Pass opts.startIdx to
+      // shift the whole series, or give each bar an explicit `idx`
+      // (candle index) / `x` (pixel) to place it exactly.
       // opts: { startIdx, width, bullColor, bearColor, wickColor, hollow,
       //         borderColor, dprSharp }  — width defaults to a width that
       // fits the current bar spacing; hollow=true outlines bull bodies.
@@ -6356,7 +6400,13 @@ class TradingChart {
         const bear = opts.bearColor || T.bear;
         const wickCol = opts.wickColor || null;
         const hollow = !!opts.hollow;
-        const startIdx = (opts.startIdx != null) ? opts.startIdx : firstIdx;
+        // v2.33.1 FIX (indicator slippage): the default anchor was the
+        // FIRST VISIBLE index (firstIdx) — which MOVES while panning, so
+        // any series positioned by array order slipped horizontally under
+        // the candles. Anchor to index 0 instead: bar k sits at candle k,
+        // exactly like every built-in series. (opts.startIdx still shifts
+        // it; explicit bar.idx / bar.x override entirely.)
+        const startIdx = (opts.startIdx != null) ? opts.startIdx : 0;
         const dpr = self.dpr || 1;
         // Body width: explicit, or the optimal candle width for the zoom
         let w = opts.width;
