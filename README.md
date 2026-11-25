@@ -4,14 +4,14 @@
 >
 > Pixel-perfect rendering, 14 drawing tools, fully custom indicators via API — you bring the data, the UI, and the indicators. BADI-CHARTS-V2 renders the chart.
 
-[![Version](https://img.shields.io/badge/version-2.34.0-2962ff.svg)](#)
+[![Version](https://img.shields.io/badge/version-2.34.1-2962ff.svg)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-26a69a.svg)](LICENSE)
 [![No Dependencies](https://img.shields.io/badge/dependencies-zero-ff9800.svg)](#)
 [![Headless](https://img.shields.io/badge/UI-headless-9c27b0.svg)](#)
 
 ---
 
-## 🎨 v2.34.0 — Free-Design Settings Cards (indicator + drawing tool)
+## 🎨 v2.34.1 — Free-Design Settings Cards (indicator + drawing tool)
 
 The settings card is no longer a fixed shape. If your indicator definition or custom drawing tool provides a `renderCard` hook, the library draws NOTHING and you own every pixel of the card (background, controls, title, close button — everything).
 

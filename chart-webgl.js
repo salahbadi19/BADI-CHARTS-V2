@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.34.0 — WEBGL EDITION (chart-webgl.js)
+ * BADI-CHARTS-V2 v2.34.1 — WEBGL EDITION (chart-webgl.js)
  * The complete standalone trading chart library, rendered with real WebGL.
  *
  * THIS FILE IS A FULL LIBRARY, NOT A LAYER. Load it INSTEAD of chart.js —
@@ -385,7 +385,7 @@
 'use strict';
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.34.0';
+const VERSION = '2.34.1';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 
 // v2.31.0/v2.32.0: the supported chart types (ids + display labels) — 20
@@ -3655,6 +3655,11 @@ class TradingChart {
     this._settingsCardDrag = null;  // v2.21.2: drag state for settings card
     // Icon hit-test registry (rebuilt each frame in drawLegend)
     this._iconHits = [];
+    // v2.34.1: true while the pointer is over an interactive overlay (zoom
+    // buttons, legend cards/icons, settings cards, drawing strip, replay
+    // bar, dropdown) — the chart then treats the mouse as OUTSIDE: no
+    // crosshair, no OHLC-legend follow. Updated in onMouseMove.
+    this._overUIFlag = false;
 
     // UI
     this.buttons = [];
@@ -5517,6 +5522,47 @@ class TradingChart {
     this.invalidate();
   }
 
+  // v2.34.1: is the pointer over an interactive UI overlay? While it is,
+  // the chart treats the mouse as OUTSIDE — no crosshair lines/tags, no
+  // OHLC-legend follow (user report: "the buttons and cards — the mouse
+  // keeps tracking over them in the chart, it's as if it's still inside
+  // the candles"). Covers: the +/− zoom buttons (and status-bar buttons),
+  // indicator legend cards + icon buttons (active card body included),
+  // the open settings card, the chart settings card, the drawing settings
+  // strip, the replay bar and any open dropdown.
+  _overUI(x, y) {
+    if (this.buttons && this.buttons.length && this.hitButton(x, y)) return true;
+    if (this._iconHits && this._iconHits.length) {
+      for (let i = 0; i < this._iconHits.length; i++) {
+        const h = this._iconHits[i];
+        if (x >= h.x && x <= h.x + h.w && y >= h.y && y <= h.y + h.h) return true;
+      }
+    }
+    if (this.settingsCard && this._hitSettingsCard(x, y)) return true;
+    if (this.chartSettingsCard && this._hitChartSettingsCard(x, y)) return true;
+    if (this._drawPanelHits && this._drawPanelHits.length) {
+      for (let i = 0; i < this._drawPanelHits.length; i++) {
+        const h = this._drawPanelHits[i];
+        if (x >= h.x && x <= h.x + h.w && y >= h.y && y <= h.y + h.h) return true;
+      }
+    }
+    if (this.replay.active && this.replay.showBar && this._replayHits && this._replayHits.length) {
+      for (let i = 0; i < this._replayHits.length; i++) {
+        const h = this._replayHits[i];
+        if (x >= h.x && x <= h.x + h.w && y >= h.y && y <= h.y + h.h) return true;
+      }
+    }
+    if (this._overDropdownRect(x, y)) return true;
+    return false;
+  }
+  // v2.34.1: tiny rect probe for the open dropdown (used by _overUI and the
+  // cursor-style logic — a pointer cursor over its items).
+  _overDropdownRect(x, y) {
+    if (!this.dropdown) return false;
+    const d = this.dropdown;
+    return x >= d.x && x <= d.x + d.w && y >= d.y - 2 && y <= d.y + d.h + 2;
+  }
+
   onMouseMove(e) {
     // v2.16.0 (#16): drop synthetic mouse moves fired after touchend. They
     // would set mouseInside=true and keep the crosshair + OHLC legend stuck
@@ -5571,6 +5617,15 @@ class TradingChart {
       }
     }
 
+    // v2.34.1: pointer over an interactive overlay (zoom buttons, legend
+    // cards/icons, settings cards, drawing strip, replay bar, dropdown)?
+    // While it is, the chart must behave as if the pointer LEFT the chart —
+    // no crosshair, no OHLC-legend follow. Mid-gesture drags (pan, handle,
+    // whole-drawing) keep the old behavior; the flag only gates hover
+    // tracking.
+    this._overUIFlag = !this.isDragging && !this._dragHandle && !this._dragWhole &&
+                       this._overUI(x, y);
+
     // v2.13.0: Pane separator hover state — drives the cursor style and the
     // grip handle highlight for whichever pane's divider the cursor is over.
     this._paneSepHoverId = (this.activeTool === 'cursor' && !this._paneResize) ?
@@ -5581,6 +5636,14 @@ class TradingChart {
                this._hitSettingsCard(x, y).action === 'drag') {
       // v2.21.2: grab cursor over the settings card's title bar
       try { this.canvas.style.cursor = 'grab'; } catch (_) {}
+    } else if (this._overUIFlag) {
+      // v2.34.1: the overlay is UI, not chart — pointer cursor over
+      // clickable controls, plain arrow over card bodies (before, the
+      // buttons/cards shared the chart's crosshair cursor and felt "inside
+      // the candles").
+      const onCtl = this.hoverButton || this.hoverIcon || this._hoverDrawPanelIcon ||
+                    this._replayHover || this._overDropdownRect(x, y);
+      try { this.canvas.style.cursor = onCtl ? 'pointer' : 'default'; } catch (_) {}
     } else if (this.activeTool === 'cursor') {
       // v2.22.1 (TradingView affordance): a 'move' cursor over a selectable
       // drawing tells the user it can be grabbed and dragged. Cheap
@@ -5668,7 +5731,7 @@ class TradingChart {
 
     // v2.31.0: hovering the TIME AXIS also sets the index (TradingView:
     // the vertical crosshair + time tag follow the cursor there).
-    if (this.mouseInside && (this.inChartArea(x, y) || this.inTimeAxis(x, y))) {
+    if (!this._overUIFlag && this.mouseInside && (this.inChartArea(x, y) || this.inTimeAxis(x, y))) {
       const idx = this.xToIndex(x);
       const prevIdx = this.crosshairIndex;
       // v2.14.0 FIX (audit #27): the crosshair no longer stops at the last
@@ -5679,7 +5742,7 @@ class TradingChart {
       if (this.crosshairIndex !== prevIdx) {
         this._fireCrosshair(this.crosshairIndex);   // v2.14.0: fire onCrosshair listeners
       }
-    } else if (this.mouseInside && this.inPriceAxis(x, y)) {
+    } else if (!this._overUIFlag && this.mouseInside && this.inPriceAxis(x, y)) {
       // v2.31.0: hovering the PRICE AXIS keeps a clamped index so the
       // horizontal aiming line + price tag work there (TradingView behavior).
       this.crosshairIndex = Math.min(this.sim.candles.length - 1, Math.max(0, Math.round(this.xToIndex(x))));
@@ -10833,6 +10896,7 @@ class TradingChart {
       };
       if (isFinite(size.x)) sc.x = size.x;
       if (isFinite(size.y)) sc.y = size.y;
+      this.crosshairIndex = null;   // v2.34.1: the card is UI — stop the crosshair/OHLC follow under it
       this.settingsCard = sc;
       this._attachSettingsCardHelpers(sc);
       this.invalidate();   // v2.34.0: repaint immediately (programmatic opens rely on this)
@@ -10853,6 +10917,7 @@ class TradingChart {
     }
     const w = 220;
     const h = 36 + fields.length * 30 + 40;
+    this.crosshairIndex = null;   // v2.34.1: the card is UI — stop the crosshair/OHLC follow under it
     this.settingsCard = {
       id: '__drawing__' + d.id,
       isDrawingCard: true,      // marker: save applies to the drawing
@@ -11019,7 +11084,9 @@ class TradingChart {
   // the candles above the buttons grow/shrink around the chart center.
   drawZoomButtons() {
     const proximityY = 90;
-    const btnW = 32, btnH = 26, gap = 8, padBottom = 10;
+    // v2.34.1: slightly smaller pair (user: "make the +/− buttons a little
+    // smaller") — 26x21 with a 4.2px arm (was 32x26 / 5px).
+    const btnW = 26, btnH = 21, gap = 7, padBottom = 10;
     // v2.28.0: centered pair — the middle of the chart, at the bottom.
     const mid = (this.chartLeft + this.chartRight) / 2;
     const plusX = mid - btnW - gap / 2;    // + button on the LEFT
@@ -11047,7 +11114,7 @@ class TradingChart {
       ctx.globalAlpha = a;
       // Background — slightly brighter on hover for affordance.
       ctx.fillStyle = hovered ? '#363a45' : 'rgba(42, 46, 57, 0.92)';
-      this._roundRect(cx - btnW / 2, cy - btnH / 2, btnW, btnH, 5);
+      this._roundRect(cx - btnW / 2, cy - btnH / 2, btnW, btnH, 4);
       ctx.fill();
       // Subtle border.
       ctx.strokeStyle = this.theme.axisBorder;
@@ -11055,9 +11122,9 @@ class TradingChart {
       ctx.stroke();
       // + or − glyph — white, rounded caps for a softer look.
       ctx.strokeStyle = this.theme.textBright;
-      ctx.lineWidth = 1.7;
+      ctx.lineWidth = 1.5;
       ctx.lineCap = 'round';
-      const arm = 5;
+      const arm = 4.2;
       ctx.beginPath();
       ctx.moveTo(cx - arm, cy);
       ctx.lineTo(cx + arm, cy);
@@ -11503,6 +11570,12 @@ class TradingChart {
     // missing one. Now drawn on touch too, with a thinner dash so it doesn't
     // dominate the small screen.
     if (!this.mouseInside || this.crosshairIndex === null) return;
+    // v2.34.1: never draw the crosshair under an interactive overlay. The
+    // flag comes from onMouseMove (zoom buttons are hit-registered AFTER
+    // drawCrosshair in the frame, so the between-frames flag is the
+    // reliable source); the live _overUI() probe also catches cards that
+    // just OPENED under a still pointer (settings card, drawing strip).
+    if (this._overUIFlag || this._overUI(this.mouseX, this.mouseY)) return;
     // v2.10.0: crosshair stays visible while a drawing tool is active too —
     // the user needs it to aim; hiding it made the chart look frozen.
     // v2.31.0: the time-axis strip is a valid crosshair region too.
@@ -11859,11 +11932,14 @@ class TradingChart {
       }
     }
 
-    // Click-to-pin hit area (only while not pinned, same contract as before:
-    // icon hits are tested BEFORE card hits in onMouseDown/onTouchStart).
-    if (!isActive) {
-      this._iconHits.push({ type: 'card', id: id, x: rx, y: y, w: lineW, h: CARD_H });
-    }
+    // Click-to-pin hit area. v2.34.1: registered for the ACTIVE card too —
+    // before, an active card registered only its icons, so (a) hovering the
+    // gaps between its icons kept the crosshair tracking "through" the
+    // card and (b) clicking its body fell through to the outside-click
+    // handler and then started a PAN. Icons are still tested BEFORE card
+    // hits in onMouseDown/onTouchStart, so icon clicks are unaffected; a
+    // body click now toggles the card off cleanly (same result, no pan).
+    this._iconHits.push({ type: 'card', id: id, x: rx, y: y, w: lineW, h: CARD_H });
   }
 
   // Collapse / expand control of the indicator list.
@@ -12047,10 +12123,11 @@ class TradingChart {
         this._drawIndicatorIcon(ix, y, iconId, iconSize, id, isCustom);
         ix += iconSize + iconGap;
       }
-    } else {
-      // Register the card area for hit-test (click to activate)
-      this._iconHits.push({type: 'card', id: id, x: x, y: y - 2, w: cardW, h: cardH + 2});
     }
+    // Register the card area for hit-test. v2.34.1: also while ACTIVE — a
+    // body click toggles the card off instead of falling through to pan;
+    // icons are hit-tested first, so icon clicks are unaffected.
+    this._iconHits.push({type: 'card', id: id, x: x, y: y - 2, w: cardW, h: cardH + 2});
     return cardW;
   }
 
@@ -12223,6 +12300,7 @@ class TradingChart {
         x: cx, y: cy, w: w, h: h,
         title: (def.label || id) + ' Settings'
       };
+      this.crosshairIndex = null;   // v2.34.1: the card is UI — stop the crosshair/OHLC follow under it
       this.settingsCard = sc;
       this._attachSettingsCardHelpers(sc);
       this.invalidate();   // v2.34.0: repaint immediately (programmatic opens rely on this)
@@ -12283,6 +12361,7 @@ class TradingChart {
     }
     cx = clamp(cx, this.chartLeft + 4, Math.max(this.chartLeft + 4, this.W - this.layout.priceAxisW - w - 8));
     cy = clamp(cy, this.chartTop + 4, Math.max(this.chartTop + 4, this.H - this.layout.timeAxisH - h - 8));
+    this.crosshairIndex = null;   // v2.34.1: the card is UI — stop the crosshair/OHLC follow under it
     this.settingsCard = {
       id: id,
       x: cx,
@@ -12419,6 +12498,7 @@ class TradingChart {
     this.settingsCard = null;   // only one popup at a time
     const fields = this._chartSettingsFields();
     const h = 36 + fields.length * 30 + 40;
+    this.crosshairIndex = null;   // v2.34.1: the card is UI — stop the crosshair/OHLC follow under it
     this.chartSettingsCard = {
       fields: fields,
       draft: fields.reduce((o, f) => { o[f.key] = f.value; return o; }, {}),
