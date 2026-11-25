@@ -4,10 +4,58 @@
 >
 > Pixel-perfect rendering, 14 drawing tools, fully custom indicators via API — you bring the data, the UI, and the indicators. BADI-CHARTS-V2 renders the chart.
 
-[![Version](https://img.shields.io/badge/version-2.34.1-2962ff.svg)](#)
+[![Version](https://img.shields.io/badge/version-2.35.0-2962ff.svg)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-26a69a.svg)](LICENSE)
 [![No Dependencies](https://img.shields.io/badge/dependencies-zero-ff9800.svg)](#)
 [![Headless](https://img.shields.io/badge/UI-headless-9c27b0.svg)](#)
+
+---
+
+## 🎨 v2.35.0 — Free-Design Replay UI (بطاقة إعادة التشغيل + الشريط)
+
+The REPLAY **badge** (top-right pill) and the **playback bar** (bottom controls) are no longer fixed shapes either. Provide `renderBadge` / `renderBar` hooks and the library draws NOTHING — you own every pixel (same philosophy as the v2.34.0 free-design settings cards).
+
+```js
+chart.setReplayUI({
+  // ── بطاقة إعادة التشغيل (REPLAY badge) ──
+  badgeSize(replay, chart) {
+    return { w: 120, h: 26, x: 20, y: 20 };   // x/y optional = pinned position
+  },
+  renderBadge(ctx, badge, replay, chart) {
+    // badge = { x, y, w, h, hovered, mx, my }
+    ctx.fillStyle = badge.hovered ? '#e100f7' : '#111';
+    chart._roundRect(badge.x, badge.y, badge.w, badge.h, 13);
+    ctx.fill();
+    // ... any design you want ...
+  },
+  badgeClick(rx, ry, badge, replay, chart) {
+    chart.stopReplay();          // your own action
+    return true;                 // consume (false = pass through to chart)
+  },
+
+  // ── شريط إعادة التشغيل (playback bar) ──
+  barSize(replay, chart) { return { w: 420, h: 44 }; },
+  renderBar(ctx, bar, replay, chart) {
+    // bar = { x, y, w, h, hovered, mx, my, progress: { frac, shown, total, startIdx } }
+    // Draw ANYTHING: custom buttons, neon progress bar, RTL layout, ...
+    // Store button rects (bar-relative) for your own hit-testing:
+    bar._play = { x: 10, y: 7, w: 30, h: 30 };
+  },
+  barClick(rx, ry, bar, replay, chart) {
+    if (/* inside bar._play */) replay.playing ? chart.replayPause() : chart.replayPlay();
+    chart.replaySeekFrac(rx / bar.w);   // public seek helper (0..1)
+    return true;
+  }
+});
+// also available: new BadiCharts(el, { replayUI: {...} }) — chart.getReplayUI() — setReplayUI(null) restores the default UI
+```
+
+- All hooks optional — providing only `renderBar` keeps the default badge, and vice versa.
+- Clicks inside the custom badge/bar are CONSUMED (the chart under them never pans/draws); return `false` from `badgeClick`/`barClick` to pass a click through.
+- `hovered` + `mx`/`my` are computed for you each frame — hover styling needs no extra code.
+- The custom rects are wired into the v2.34.1 hover fix: the crosshair/OHLC legend do NOT track while the pointer is over them; cursor becomes `pointer`.
+- `chart.replaySeekFrac(frac)` — new public helper: jump to any 0..1 fraction of the replay history.
+- Works in both engines (`chart.js` + `chart-webgl.js`). Demo: `replay-custom-ui-demo.html`.
 
 ---
 

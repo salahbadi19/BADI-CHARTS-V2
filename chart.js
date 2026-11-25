@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.34.1 — Pixel-Perfect Pure JavaScript Trading Chart Library
+ * BADI-CHARTS-V2 v2.35.0 — Pixel-Perfect Pure JavaScript Trading Chart Library
  *
  * A lightweight, dependency-free candlestick charting library built entirely
  * with the HTML5 Canvas API. Inspired by TradingView Lightweight Charts.
@@ -378,7 +378,7 @@ var Path2D = (typeof window !== 'undefined' && window.Path2D)
     })();
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.34.1';
+const VERSION = '2.35.0';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 
 // v2.31.0/v2.32.0: the supported chart types (ids + display labels) — 20
@@ -1636,6 +1636,16 @@ class TradingChart {
     }, (opts && opts.viewSettings) || {});
     this.chartSettingsCard = null;            // the view/settings popup
     this._viewCache = { key: null, bars: null };  // transformed series cache
+
+    // v2.35.0: FREE-DESIGN REPLAY UI — the REPLAY badge (بطاقة إعادة
+    // التشغيل) and the playback bar (شريط إعادة التشغيل) can be fully
+    // redesigned by the user: { renderBadge, badgeSize, badgeClick,
+    // renderBar, barSize, barClick }. Set here (opts.replayUI) or at
+    // runtime with setReplayUI(). null = the built-in default UI.
+    this.replayUI = (opts && opts.replayUI && typeof opts.replayUI === 'object')
+      ? opts.replayUI : null;
+    this._replayBadgeRect = null;   // live geometry of the badge (custom UI)
+    this._replayBarRect = null;     // live geometry of the bar (custom UI)
 
     // Layout — HEADLESS MODE (v2.0.0+)
     // The built-in toolbar has been REMOVED entirely. The library is now fully
@@ -3698,6 +3708,10 @@ class TradingChart {
         if (x >= h.x && x <= h.x + h.w && y >= h.y && y <= h.y + h.h) return true;
       }
     }
+    // v2.35.0: free-design replay badge/bar rects — the custom UI is an
+    // interactive overlay, so the chart must treat the pointer as OUTSIDE
+    // (no crosshair / OHLC follow under it, same rule as v2.34.1).
+    if (this._overCustomReplayRect(x, y)) return true;
     if (this._overDropdownRect(x, y)) return true;
     return false;
   }
@@ -3769,7 +3783,8 @@ class TradingChart {
       // buttons/cards shared the chart's crosshair cursor and felt "inside
       // the candles").
       const onCtl = this.hoverButton || this.hoverIcon || this._hoverDrawPanelIcon ||
-                    this._replayHover || this._overDropdownRect(x, y);
+                    this._replayHover || this._overDropdownRect(x, y) ||
+                    this._overCustomReplayRect(x, y);   // v2.35.0: custom replay UI = controls
       try { this.canvas.style.cursor = onCtl ? 'pointer' : 'default'; } catch (_) {}
     } else if (this.activeTool === 'cursor') {
       // v2.22.1 (TradingView affordance): a 'move' cursor over a selectable
@@ -4181,6 +4196,43 @@ class TradingChart {
     if (this.settingsCard) {
       this.settingsCard = null;
       return;
+    }
+
+    // 1a-ter. v2.35.0: FREE-DESIGN replay UI clicks — the custom badge/bar
+    // capture clicks inside their rects (consume-by-default, same rule as
+    // the free-design settings cards: return false from badgeClick /
+    // barClick to let a click pass through to the chart).
+    if (this.replay.active && this.replayUI) {
+      const rui = this.replayUI;
+      const prog = this._replayProgress();
+      if (typeof rui.renderBadge === 'function' && this._replayBadgeRect) {
+        const b = this._replayBadgeRect;
+        if (x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h) {
+          if (typeof rui.badgeClick === 'function') {
+            try {
+              const r = rui.badgeClick(x - b.x, y - b.y,
+                                       this._replayBadgeObj(prog), this.replay, this);
+              if (r !== false) { this.invalidate(); return; }
+            } catch (e) {
+              if (BADI_DEBUG) console.error('[BadiCharts] badgeClick error:', e);
+            }
+          } else { this.invalidate(); return; }   // custom badge = UI: consume
+        }
+      }
+      if (this.replay.showBar && typeof rui.renderBar === 'function' && this._replayBarRect) {
+        const b = this._replayBarRect;
+        if (x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h) {
+          if (typeof rui.barClick === 'function') {
+            try {
+              const r = rui.barClick(x - b.x, y - b.y,
+                                     this._replayBarObj(prog), this.replay, this);
+              if (r !== false) { this.invalidate(); return; }
+            } catch (e) {
+              if (BADI_DEBUG) console.error('[BadiCharts] barClick error:', e);
+            }
+          } else { this.invalidate(); return; }   // custom bar = UI: consume
+        }
+      }
     }
 
     // 1a-bis. v2.19.0: REPLAY playback bar click (overlay UI)
@@ -5860,6 +5912,13 @@ class TradingChart {
     this._replayClearTimers();
     this.replay.active = false;
     this.replay.playing = false;
+    // v2.35.0: drop the free-design UI rects — stale rects would keep
+    // capturing clicks / _overUI hits after replay mode has ended.
+    this._replayBadgeRect = null;
+    this._replayBarRect = null;
+    this._replayBadgeObjLive = null;
+    this._replayBarObjLive = null;
+    this._replayHover = null;
     if (this.replay.fullData && this.replay.fullData.length > 0) {
       this.sim.candles = this.replay.fullData;   // restore complete history
       this.replay.fullData = [];
@@ -5877,6 +5936,48 @@ class TradingChart {
     return this;
   }
   isReplaying() { return !!this.replay.active; }
+
+  /* -------------------- FREE-DESIGN REPLAY UI (v2.35.0) ------------------ */
+  // Replace the built-in REPLAY badge and/or playback bar with your own
+  // canvas UI — the user designs them freely (same philosophy as the v2.34.0
+  // free-design settings cards). ui hooks (ALL optional):
+  //   badgeSize(replay, chart)  → { w, h, x?, y? }   badge geometry
+  //   renderBadge(ctx, badge, replay, chart)   own every pixel of the badge
+  //   badgeClick(rx, ry, badge, replay, chart) rx/ry RELATIVE to badge
+  //                                            (return false = pass through)
+  //   barSize(replay, chart)    → { w, h, x?, y? }   bar geometry
+  //   renderBar(ctx, bar, replay, chart)       own every pixel of the bar
+  //   barClick(rx, ry, bar, replay, chart)     rx/ry RELATIVE to bar
+  //                                            (return false = pass through)
+  // badge / bar objects: { kind, x, y, w, h, hovered, mx, my, progress? }
+  // (mx/my are mouse coords RELATIVE to the rect, -1 when outside; progress
+  // = { startIdx, total, shown, frac } for bars). Helpers the UI can call:
+  // chart.replayPlay() / replayPause() / replayStep(n) / replayCycleSpeed()
+  // / stopReplay() / replaySeekFrac(frac). Providing renderBadge or
+  // renderBar switches that component to custom mode where the library
+  // draws NOTHING itself. Pass null to restore the built-in UI.
+  setReplayUI(ui) {
+    this.replayUI = (ui && typeof ui === 'object') ? ui : null;
+    this._replayBadgeRect = null;
+    this._replayBarRect = null;
+    this._replayBadgeObjLive = null;
+    this._replayBarObjLive = null;
+    this.invalidate();
+    return this;
+  }
+  getReplayUI() { return this.replayUI; }
+
+  // v2.35.0: seek to a 0..1 fraction of the replay history — the public
+  // equivalent of clicking the built-in progress bar. Chainable.
+  replaySeekFrac(frac) {
+    if (!this.replay.active) return this;
+    frac = clamp(typeof frac === 'number' && isFinite(frac) ? frac : 0, 0, 1);
+    const startIdx = this._replayStartIdx();
+    const total = this.replay.fullData.length - startIdx - 1;
+    if (total > 0) this._replayJumpTo(startIdx + 1 + Math.round(frac * total));
+    this.invalidate();
+    return this;
+  }
 
   // Reveal n candles. n > 0 steps FORWARD (each revealed candle appears
   // COMPLETE — manual stepping never animates), n < 0 steps BACK (removes
@@ -6123,24 +6224,118 @@ class TradingChart {
     ctx.fill();
     ctx.restore();
   }
+  // v2.35.0: live objects handed to renderBadge / renderBar (and reused by
+  // the click dispatch). The SAME object is re-used every frame (fields
+  // updated in place) so anything the user's renderBar/renderBadge attaches
+  // to it (own button rects like bar._play) SURVIVES into barClick /
+  // badgeClick — mirroring the v2.34.0 settings-card contract where card
+  // fields stored by renderCard are visible in cardClick.
+  _replayBadgeObj(prog) {
+    const b = this._replayBadgeRect;
+    const o = this._replayBadgeObjLive ||
+              (this._replayBadgeObjLive = { kind: 'replayBadge' });
+    const over = this.mouseInside && !!b &&
+                 this.mouseX >= b.x && this.mouseX <= b.x + b.w &&
+                 this.mouseY >= b.y && this.mouseY <= b.y + b.h;
+    o.x = b.x; o.y = b.y; o.w = b.w; o.h = b.h;
+    o.hovered = over;
+    o.mx = over ? this.mouseX - b.x : -1;
+    o.my = over ? this.mouseY - b.y : -1;
+    return o;
+  }
+  _replayBarObj(prog) {
+    const b = this._replayBarRect;
+    const o = this._replayBarObjLive ||
+              (this._replayBarObjLive = { kind: 'replayBar' });
+    const over = this.mouseInside && !!b &&
+                 this.mouseX >= b.x && this.mouseX <= b.x + b.w &&
+                 this.mouseY >= b.y && this.mouseY <= b.y + b.h;
+    o.x = b.x; o.y = b.y; o.w = b.w; o.h = b.h;
+    o.hovered = over;
+    o.mx = over ? this.mouseX - b.x : -1;
+    o.my = over ? this.mouseY - b.y : -1;
+    o.progress = prog;
+    return o;
+  }
+  // v2.35.0: replay progress snapshot — shared by the default painter, the
+  // free-design bar object and replaySeekFrac().
+  _replayProgress() {
+    const startIdx = this._replayStartIdx();
+    const total = Math.max(0, this.replay.fullData.length - startIdx - 1);
+    const shown = Math.max(0, this.sim.candles.length - startIdx - 1);
+    const frac = total > 0 ? Math.min(1, shown / total) : 1;
+    return { startIdx: startIdx, total: total, shown: shown, frac: frac };
+  }
+  // v2.35.0: is (x, y) inside a free-design replay badge/bar rect? Used by
+  // _overUI (crosshair suppression) and the pointer-cursor styling.
+  _overCustomReplayRect(x, y) {
+    if (!this.replayUI || !this.replay.active) return false;
+    if (typeof this.replayUI.renderBadge === 'function' && this._replayBadgeRect) {
+      const b = this._replayBadgeRect;
+      if (x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h) return true;
+    }
+    if (this.replay.showBar && typeof this.replayUI.renderBar === 'function' && this._replayBarRect) {
+      const b = this._replayBarRect;
+      if (x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h) return true;
+    }
+    return false;
+  }
   // REPLAY badge (top-right) + playback bar (over the time axis, centered).
+  // v2.35.0: FREE-DESIGN — if replayUI.renderBadge / renderBar exist the
+  // library draws NOTHING for that component; geometry comes from
+  // badgeSize / barSize (or a default) and is remembered in
+  // _replayBadgeRect / _replayBarRect for clicks, hover and cursor styling.
   drawReplayOverlay() {
     if (!this.replay.active) return;
     const ctx = this.ctx;
+    const ui = this.replayUI || null;
+    const prog = this._replayProgress();
     // ---- badge ----
-    const label = 'REPLAY ' + this.replay.speed + 'x' + (this.replay.playing ? '' : ' ⏸');
-    ctx.font = 'bold 11px -apple-system, Segoe UI, Roboto, sans-serif';
-    const bw = ctx.measureText(label).width + 16;
-    const bx = this.chartRight - bw - 8;
-    const by = this.chartTop + 8;
-    ctx.fillStyle = '#2962ff';
-    this._roundRect(bx, by, bw, 20, 10);
-    ctx.fill();
-    ctx.fillStyle = '#ffffff';
-    ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
-    ctx.fillText(label, bx + 8, by + 11);
-    if (!this.replay.showBar) return;
+    if (ui && typeof ui.renderBadge === 'function') {
+      let size = { w: 90, h: 20 };
+      if (typeof ui.badgeSize === 'function') {
+        try { const s = ui.badgeSize(this.replay, this); if (s && s.w && s.h) size = s; } catch (_) {}
+      }
+      const bx = isFinite(size.x) ? size.x : this.chartRight - size.w - 8;
+      const by = isFinite(size.y) ? size.y : this.chartTop + 8;
+      this._replayBadgeRect = { x: bx, y: by, w: size.w, h: size.h };
+      try {
+        ui.renderBadge(ctx, this._replayBadgeObj(prog), this.replay, this);
+      } catch (e) {
+        if (BADI_DEBUG) console.error('[BadiCharts] renderBadge error:', e);
+      }
+    } else {
+      const label = 'REPLAY ' + this.replay.speed + 'x' + (this.replay.playing ? '' : ' ⏸');
+      ctx.font = 'bold 11px -apple-system, Segoe UI, Roboto, sans-serif';
+      const bw = ctx.measureText(label).width + 16;
+      const bx = this.chartRight - bw - 8;
+      const by = this.chartTop + 8;
+      ctx.fillStyle = '#2962ff';
+      this._roundRect(bx, by, bw, 20, 10);
+      ctx.fill();
+      ctx.fillStyle = '#ffffff';
+      ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+      ctx.fillText(label, bx + 8, by + 11);
+      this._replayBadgeRect = { x: bx, y: by, w: bw, h: 20 };
+    }
+    if (!this.replay.showBar) { this._replayBarRect = null; return; }
     // ---- playback bar over the time axis ----
+    if (ui && typeof ui.renderBar === 'function') {
+      let size = { w: 320, h: 30 };
+      if (typeof ui.barSize === 'function') {
+        try { const s = ui.barSize(this.replay, this); if (s && s.w && s.h) size = s; } catch (_) {}
+      }
+      const bx = isFinite(size.x) ? size.x : Math.max(this.chartLeft + 8, (this.W - size.w) / 2);
+      const by = isFinite(size.y) ? size.y : this.H - this.layout.timeAxisH - size.h - 2;
+      this._replayBarRect = { x: bx, y: by, w: size.w, h: size.h };
+      this._replayHits = [];   // custom UI owns its clicks via barClick
+      try {
+        ui.renderBar(ctx, this._replayBarObj(prog), this.replay, this);
+      } catch (e) {
+        if (BADI_DEBUG) console.error('[BadiCharts] renderBar error:', e);
+      }
+      return;
+    }
     const barH = 30;
     const barY = this.H - this.layout.timeAxisH - barH - 2;
     // Buttons: [⏮ start] [◀ back] [play/pause] [▶ step] [speed] ... [progress] ... [✕]
@@ -6224,10 +6419,10 @@ class TradingChart {
     });
     // 6. progress bar (click to jump)
     {
-      const startIdx = this._replayStartIdx();
-      const total = this.replay.fullData.length - startIdx - 1;
-      const shown = Math.max(0, this.sim.candles.length - startIdx - 1);
-      const frac = total > 0 ? Math.min(1, shown / total) : 1;
+      // v2.35.0: the shared progress snapshot (identical math to the old
+      // inline computation, now also used by the free-design bar object).
+      const startIdx = prog.startIdx, total = prog.total,
+            shown = prog.shown, frac = prog.frac;
       const px = x + 2, pw = progW - 4;
       ctx.fillStyle = '#2a2e39';
       this._roundRect(px, cy - 4, pw, 8, 4);
