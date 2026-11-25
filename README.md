@@ -4,10 +4,51 @@
 >
 > Pixel-perfect rendering, 14 drawing tools, fully custom indicators via API — you bring the data, the UI, and the indicators. BADI-CHARTS-V2 renders the chart.
 
-[![Version](https://img.shields.io/badge/version-2.20.9-2962ff.svg)](#)
+[![Version](https://img.shields.io/badge/version-2.34.0-2962ff.svg)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-26a69a.svg)](LICENSE)
 [![No Dependencies](https://img.shields.io/badge/dependencies-zero-ff9800.svg)](#)
 [![Headless](https://img.shields.io/badge/UI-headless-9c27b0.svg)](#)
+
+---
+
+## 🎨 v2.34.0 — Free-Design Settings Cards (indicator + drawing tool)
+
+The settings card is no longer a fixed shape. If your indicator definition or custom drawing tool provides a `renderCard` hook, the library draws NOTHING and you own every pixel of the card (background, controls, title, close button — everything).
+
+```js
+chart.addIndicator({
+  id: 'myInd', label: 'My Indicator', type: 'overlay',
+  settings: { period: 20 },
+  calculate(candles, s) { /* ... */ },
+  render(ctx, values, h) { /* ... */ },
+
+  // ── FREE-DESIGN SETTINGS CARD (optional) ──
+  cardSize(state, chart) {
+    return { w: 220, h: 120, x: 40, y: 60 };  // x/y optional = pinned position
+  },
+  renderCard(ctx, card, state, chart) {
+    // Draw ANYTHING. card = { x, y, w, h, id, state, close(), apply(), moveTo(x,y) }
+    ctx.fillStyle = '#1e222d';
+    chart._roundRect(card.x, card.y, card.w, card.h, 8);
+    ctx.fill();
+    // ... your own buttons / sliders / swatches ...
+    card._btn = { x: 12, y: 38, w: 56, h: 26 };  // store rects (card-relative)
+  },
+  cardClick(rx, ry, card, state, chart) {
+    // rx/ry are RELATIVE to the card's top-left
+    if (/* rx,ry inside card._btn */) {
+      state.settings.period = 50;   // mutate settings directly
+      card.apply();                 // recompute + autoscale + repaint
+    }
+    return true;  // consume the click (false = let it pass through)
+  }
+});
+```
+
+- `card.apply()` — for indicator cards it recomputes the indicator; for drawing-tool cards it fires the tool's `onSettings(drawing, drawing)` hook.
+- `card.close()` closes the popup; a click OUTSIDE the card also closes it; Esc still cancels.
+- Works in both engines (`chart.js` and `chart-webgl.js`), with mouse and touch.
+- Tools without `renderCard` keep the classic auto-generated card — nothing breaks.
 
 ---
 

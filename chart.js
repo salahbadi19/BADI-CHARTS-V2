@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.33.2 — Pixel-Perfect Pure JavaScript Trading Chart Library
+ * BADI-CHARTS-V2 v2.34.0 — Pixel-Perfect Pure JavaScript Trading Chart Library
  *
  * A lightweight, dependency-free candlestick charting library built entirely
  * with the HTML5 Canvas API. Inspired by TradingView Lightweight Charts.
@@ -378,7 +378,7 @@ var Path2D = (typeof window !== 'undefined' && window.Path2D)
     })();
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.33.2';
+const VERSION = '2.34.0';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 
 // v2.31.0/v2.32.0: the supported chart types (ids + display labels) — 20
@@ -3837,6 +3837,14 @@ class TradingChart {
   _hitSettingsCard(x, y) {
     if (!this.settingsCard) return null;
     const sc = this.settingsCard;
+    // v2.34.0: free-design card — the definition owns its interior; the
+    // library only knows "inside vs outside" (outside click closes).
+    if (sc.custom) {
+      if (x >= sc.x && x <= sc.x + sc.w && y >= sc.y && y <= sc.y + sc.h) {
+        return { action: 'inside' };
+      }
+      return null;
+    }
     // Close button (X)
     if (x >= sc.x + sc.w - 22 && x <= sc.x + sc.w - 6 && y >= sc.y + 8 && y <= sc.y + 22) {
       return {action: 'close'};
@@ -4026,6 +4034,26 @@ class TradingChart {
     if (this.chartSettingsCard) {
       this.chartSettingsCard = null;
       return;
+    }
+
+    // v2.34.0: FREE-DESIGN settings card — every click inside the card rect
+    // goes to def.cardClick(rx, ry, card, state|drawing, chart). Return false
+    // from cardClick to let a click pass through (rare — e.g. transparent
+    // zones). Clicks OUTSIDE the card still close it (handled just below).
+    if (this.settingsCard && this.settingsCard.custom) {
+      const scc = this.settingsCard;
+      if (x >= scc.x && x <= scc.x + scc.w && y >= scc.y && y <= scc.y + scc.h) {
+        let consumed = true;
+        if (typeof scc.def.cardClick === 'function') {
+          try {
+            const r = scc.def.cardClick(x - scc.x, y - scc.y, scc, scc.isDrawingCard ? scc.drawing : scc.state, this);
+            if (r === false) consumed = false;
+          } catch (e) {
+            if (BADI_DEBUG) console.error('[BadiCharts] cardClick error:', e);
+          }
+        }
+        if (consumed) { this.invalidate(); return; }
+      }
     }
 
     // 1. Check settings card first (topmost overlay)
@@ -8760,12 +8788,37 @@ class TradingChart {
   // settings card). Fields: color, lineWidth, plus any custom-tool defaultStyle
   // keys. When saved, the custom tool's onSettings(drawing, settings) hook is
   // called (if defined) so tools can react to deep changes.
+  // v2.34.0: FREE-DESIGN CARD for drawing tools — if the tool provides
+  // renderCard(ctx, card, drawing, chart), the library gets out of the way
+  // entirely (same contract as indicator free-design cards, with the drawing
+  // instance passed instead of the indicator state; card.apply() fires the
+  // tool's onSettings(drawing, drawing) hook after the user's mutations).
   _openDrawingSettingsCard(d) {
+    const tool = this._customTools && this._customTools[d.type];
+    if (tool && typeof tool.renderCard === 'function') {
+      let size = { w: 240, h: 160 };
+      if (typeof tool.cardSize === 'function') {
+        try { const s2 = tool.cardSize(d, this); if (s2 && s2.w && s2.h) size = s2; } catch (_) {}
+      }
+      const sc = {
+        id: '__drawing__' + d.id, custom: true, isDrawingCard: true,
+        def: tool, state: null, drawing: d,
+        x: this.chartLeft + 50, y: this.chartTop + 50,
+        w: Math.max(40, size.w | 0), h: Math.max(30, size.h | 0),
+        title: (tool.label || d.type || 'Drawing') + ' Settings'
+      };
+      if (isFinite(size.x)) sc.x = size.x;
+      if (isFinite(size.y)) sc.y = size.y;
+      this.settingsCard = sc;
+      this._attachSettingsCardHelpers(sc);
+      this.invalidate();   // v2.34.0: repaint immediately (programmatic opens rely on this)
+      return;
+    }
     const fields = [];
     fields.push({key: 'color', label: 'Color', type: 'color', value: d.color || this.theme.drawing});
     fields.push({key: 'lineWidth', label: 'Line Width', type: 'number', value: d.lineWidth || 1.5});
     // Custom tool: include defaultStyle keys as editable fields
-    const tool = this._customTools && this._customTools[d.type];
+    // (tool already declared at the top — v2.34.0 free-design branch)
     if (tool && tool.defaultStyle) {
       for (const key in tool.defaultStyle) {
         if (key === 'color' || key === 'lineWidth') continue;
@@ -8788,6 +8841,37 @@ class TradingChart {
       title: (tool && tool.label) ? tool.label : (d.type || 'Drawing'),
       draft: {color: d.color, lineWidth: d.lineWidth}
     };
+  }
+
+  // v2.34.0: helpers attached to every free-design settings card. They live
+  // on the card object so the definition's renderCard/cardClick can close
+  // the card, commit changes or reposition it without reaching into chart
+  // internals.
+  _attachSettingsCardHelpers(sc) {
+    const self = this;
+    sc.close = function () {
+      if (self.settingsCard === sc) { self.settingsCard = null; self.invalidate(); }
+    };
+    sc.apply = function () { self._applyCardChanges(sc); };
+    sc.moveTo = function (nx, ny) { sc.x = nx; sc.y = ny; self.invalidate(); };
+  }
+  // v2.34.0: commit hook for free-design cards. The user mutates
+  // state.settings (indicator cards) or the drawing object (tool cards)
+  // directly inside their own UI, then calls card.apply() to recompute and
+  // repaint. Tool cards additionally fire the tool's onSettings hook.
+  _applyCardChanges(sc) {
+    if (sc.isDrawingCard && sc.drawing) {
+      const d = sc.drawing;
+      const tool = this._customTools && this._customTools[d.type];
+      if (tool && typeof tool.onSettings === 'function') {
+        try { tool.onSettings(d, d); } catch (e) {
+          if (BADI_DEBUG) console.error('[BadiCharts] Tool onSettings error:', e);
+        }
+      }
+    } else if (sc.state && sc.id) {
+      this.setIndicatorSettings(sc.id, Object.assign({}, sc.state.settings));
+    }
+    this.invalidate();
   }
 
   findDrawingAt(x, y) {
@@ -10006,6 +10090,37 @@ class TradingChart {
 
   // Open a settings card popup for an indicator
   _openSettingsCard(id, state) {
+    // v2.34.0: FREE-DESIGN SETTINGS CARD — if the indicator definition
+    // provides renderCard(ctx, card, state, chart), the library draws NOTHING
+    // itself: the user owns every pixel of the card (background, controls,
+    // title, close button — everything). Optional hooks on the definition:
+    //   cardSize(state, chart) → { w, h, x?, y? }   (default 240x160)
+    //   cardClick(rx, ry, card, state, chart) — rx/ry RELATIVE to card
+    //       top-left; return false to NOT consume the click.
+    // The card object carries { x, y, w, h, id, state, title, close(),
+    // apply(), moveTo(x, y) }. The user mutates state.settings directly and
+    // calls card.apply() (recompute + autoscale + repaint). card.close()
+    // closes the popup; a click OUTSIDE the card also closes it.
+    // Esc/right-click still cancel (standard card behavior preserved).
+    const def = state.def || null;
+    if (def && typeof def.renderCard === 'function') {
+      let size = { w: 240, h: 160 };
+      if (typeof def.cardSize === 'function') {
+        try { const s2 = def.cardSize(state, this); if (s2 && s2.w && s2.h) size = s2; } catch (_) {}
+      }
+      const sc = {
+        id: id, custom: true, def: def, state: state,
+        x: this.chartLeft + 50, y: this.chartTop + 50,
+        w: Math.max(40, size.w | 0), h: Math.max(30, size.h | 0),
+        title: (def.label || id) + ' Settings'
+      };
+      if (isFinite(size.x)) sc.x = size.x;   // cardSize may also pin a position
+      if (isFinite(size.y)) sc.y = size.y;
+      this.settingsCard = sc;
+      this._attachSettingsCardHelpers(sc);
+      this.invalidate();   // v2.34.0: repaint immediately (programmatic opens rely on this)
+      return;
+    }
     // HEADLESS v2.1.0+: settings fields are auto-generated from the indicator's
     // settings object (any key present becomes an editable field).
     // v2.16.0 FIX (#22c): the previous implementation only knew about a
@@ -10067,6 +10182,25 @@ class TradingChart {
     if (!this.settingsCard) return;
     const ctx = this.ctx;
     const sc = this.settingsCard;
+    // v2.34.0: FREE-DESIGN card — the definition renders the whole card.
+    // No backdrop, no chrome, no default hit zones. A throwing renderCard
+    // must not break the chart: a minimal red chip replaces the frame.
+    if (sc.custom) {
+      try {
+        sc.def.renderCard(ctx, sc, sc.isDrawingCard ? sc.drawing : sc.state, this);
+      } catch (e) {
+        if (BADI_DEBUG) console.error('[BadiCharts] renderCard error:', e);
+        ctx.fillStyle = 'rgba(239,83,80,0.85)';
+        this._roundRect(sc.x, sc.y, sc.w, 26, 4);
+        ctx.fill();
+        ctx.fillStyle = '#ffffff';
+        ctx.font = 'bold 11px -apple-system, Segoe UI, Roboto, sans-serif';
+        ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+        ctx.fillText('renderCard error: ' + e.message, sc.x + 8, sc.y + 13);
+        ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+      }
+      return;
+    }
     // Backdrop overlay (semi-transparent) — clicking outside closes
     ctx.fillStyle = 'rgba(0,0,0,0.3)';
     ctx.fillRect(0, 0, this.W, this.H);
