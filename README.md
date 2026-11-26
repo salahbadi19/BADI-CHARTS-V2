@@ -4,10 +4,59 @@
 >
 > Pixel-perfect rendering, 14 drawing tools, fully custom indicators via API — you bring the data, the UI, and the indicators. BADI-CHARTS-V2 renders the chart.
 
-[![Version](https://img.shields.io/badge/version-2.35.0-2962ff.svg)](#)
+[![Version](https://img.shields.io/badge/version-2.36.0-2962ff.svg)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-26a69a.svg)](LICENSE)
 [![No Dependencies](https://img.shields.io/badge/dependencies-zero-ff9800.svg)](#)
 [![Headless](https://img.shields.io/badge/UI-headless-9c27b0.svg)](#)
+
+---
+
+## 🧰 v2.36.0 — Free-Design Drawing Tools (أدوات الرسم بحرية كاملة)
+
+The 14 drawing tools are no longer fixed shapes either. **`chart.setToolStyle(toolId, style)`** restyles any built-in tool — and a `render` hook takes over every pixel (same philosophy as the free-design cards and replay UI).
+
+```js
+// 1) STYLE the built-in renderers — every hard-coded constant is now a key:
+chart.setToolStyle('trend', {
+  dash: [6, 4],        // or 'solid' — default keeps the tool's old look
+  dotSize: 5,          // endpoint dots (showDots:false hides them)
+  extend: 'right',     // trend line extends to the right edge ('both' = both)
+  lineWidth: 2,        // fallback width (the drawing's own width wins)
+  lineCap: 'round', lineJoin: 'round'
+});
+chart.setToolStyle('rect', { fill: true, fillAlpha: 0.25 });   // 0..1
+chart.setToolStyle('fib', {
+  fibLevels: [0, 0.382, 0.5, 0.618, 1],                        // any levels
+  fibColors: ['#787b86', '#e100f7', '#26a69a'],                // cycled
+  labelFont: '11px Tahoma', labelBg: false                     // labels too
+});
+chart.setToolStyle('arrow', { headLength: 20 });
+chart.setToolStyle('hline', { dash: 'solid', labelBg: false });
+chart.getToolStyle('trend');   // → the merged style
+chart.resetToolStyle('trend'); // → back to the built-in look
+
+// 2) OWN EVERY PIXEL — render/hitTest/handles overrides:
+chart.setToolStyle('rect', {
+  render(ctx, d, helpers, chart) { /* draw it entirely yourself */ },
+  hitTest(d, x, y, helpers, chart) { return true; },   // custom hit geometry
+  handles(d, helpers, chart) { return [{key:'p1', x:10, y:10}]; },
+  handleStyle: { size: 7, shape: 'square', color: '#2962ff', lineWidth: 2 }
+});
+// while overridden, the library still handles creation, dragging, the
+// settings card, the eraser and selection.
+
+// 3) Per-drawing override (the settings card writes here):
+drawing.style = { dash: [], fill: false };   // wins over the tool style
+
+// 4) At construction:
+new BadiCharts(el, { toolStyles: { trend: { dash: [6,4] } } });
+```
+
+- Works for **all 14 built-in tools** and custom `addDrawingTool()` tools, both engines.
+- Styles resolve LIVE — changing a style repaints every existing drawing of that type instantly.
+- The drawing settings card now exposes the style keys per tool (Line Style / Fill % / Dots / Head Size / Extend / Levels) — end users tune each drawing without code; a tool style may also carry `renderCard` for a fully custom card.
+- The selection handles are styleable (`handleStyle`) and their geometry overridable (`handles`).
+- `brush` width finally honours the drawing's width and `lineWidth` styles (was hard-coded 2).
 
 ---
 

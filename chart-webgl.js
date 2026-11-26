@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.34.1 — WEBGL EDITION (chart-webgl.js)
+ * BADI-CHARTS-V2 v2.36.0 — WEBGL EDITION (chart-webgl.js)
  * The complete standalone trading chart library, rendered with real WebGL.
  *
  * THIS FILE IS A FULL LIBRARY, NOT A LAYER. Load it INSTEAD of chart.js —
@@ -385,7 +385,7 @@
 'use strict';
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.35.0';
+const VERSION = '2.36.0';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 
 // v2.31.0/v2.32.0: the supported chart types (ids + display labels) — 20
@@ -3481,6 +3481,16 @@ class TradingChart {
     // runtime with setReplayUI(). null = the built-in default UI.
     this.replayUI = (opts && opts.replayUI && typeof opts.replayUI === 'object')
       ? opts.replayUI : null;
+    // v2.36.0: free-design tool styles can also be set at construction time:
+    // new BadiCharts(el, { toolStyles: { trend: { dash: [6,4] } } })
+    if (opts && opts.toolStyles && typeof opts.toolStyles === 'object') {
+      // direct assignment — setToolStyle calls invalidate() which is not safe
+      // before the constructor has finished wiring the canvas.
+      if (!this._toolStyles) this._toolStyles = {};
+      for (const tsk in opts.toolStyles) {
+        this._toolStyles[tsk] = Object.assign({}, this._toolStyles[tsk] || {}, opts.toolStyles[tsk]);
+      }
+    }
     this._replayBadgeRect = null;   // live geometry of the badge (custom UI)
     this._replayBarRect = null;     // live geometry of the bar (custom UI)
 
@@ -3590,6 +3600,7 @@ class TradingChart {
     this.hoverDrawing = null;
     this.selectedDrawing = null;  // currently selected drawing (shows properties panel)
     this._customTools = {};       // custom drawing tool renderers (per-instance)
+    this._toolStyles = this._toolStyles || {};  // v2.36.0: free-design tool styles (setToolStyle; kept if opts.toolStyles already set)
     this._instanceTools = [];     // v2.5.0+: per-instance tool metadata (don't pollute global DRAW_TOOLS)
     this._drawPanelHits = [];     // hit-test for drawing properties panel
 
@@ -4423,6 +4434,17 @@ class TradingChart {
   // ─── Drawing handles (v2.7.0) ────────────────────────────────────────────
   // Compute the draggable handle positions (media coords) for a drawing.
   _getDrawingHandles(d) {
+    // v2.36.0: a tool style with handles() owns the handle geometry (the
+    // returned rects are what gets drawn, dragged and hit-tested).
+    const tsH = this._toolStyles && this._toolStyles[d.type];
+    if (tsH && typeof tsH.handles === 'function') {
+      try {
+        const out = tsH.handles(d, this._drawingHelpers(), this);
+        if (Array.isArray(out) && out.length) return out;
+      } catch (e) {
+        if (BADI_DEBUG) console.error('[BadiCharts] Tool style handles error (' + d.type + '):', e);
+      }
+    }
     const handles = [];
     const add = (key, mx, my, extra) => handles.push(Object.assign({ key: key, x: mx, y: my }, extra || {}));
     switch (d.type) {
@@ -4642,6 +4664,59 @@ class TradingChart {
       radius: c.radius,
       fg: c.fg
     };
+  }
+
+  // ─── v2.36.0: FREE-DESIGN TOOL STYLES ────────────────────────────────────
+  // setToolStyle(toolId, style) restyles a BUILT-IN or custom drawing tool.
+  // Everything the built-in renderers hard-coded is now a style key:
+  //   dash        : array like [6,4] or 'solid' (default = the tool's old look)
+  //   fill        : true/false  (channel / band / rect / poly / text box)
+  //   fillAlpha   : 0..1        (channel .08, rect/poly .13, band .15, text .19)
+  //   showDots    : true/false  (endpoint / vertex / anchor dots)
+  //   dotSize     : pixels      (default 3, text anchor 2.5)
+  //   headLength  : pixels      (arrow head, default 12)
+  //   extend      : 'none'|'right'|'both'  (trend line)
+  //   fibLevels   : array of levels   (fib, default [0,.236,.382,.5,.618,.786,1,1.618])
+  //   fibColors   : array of colors    (fib, cycled)
+  //   labelFont   : CSS font    (hline/band/fib/text labels)
+  //   labelBg     : true/false  (label background box)
+  //   lineCap/lineJoin : canvas values
+  //   lineWidth   : fallback line width (the drawing's own width wins)
+  //   handleStyle : { size, shape:'circle'|'square'|'ring'|'diamond', color, bg, lineWidth }
+  // FULL OVERRIDE (own every pixel, same philosophy as the free-design cards):
+  //   render(ctx, drawing, helpers, chart)  — the library draws NOTHING
+  //   hitTest(drawing, x, y, helpers, chart) → boolean
+  //   handles(drawing, helpers, chart) → [{ key, x, y, ptIndex? }]
+  //   renderCard(ctx, card, drawing, chart) + cardSize(d, chart) + cardClick —
+  //                                          free-design settings card
+  // Per-drawing override: drawing.style = { dash: [...] } wins over the tool
+  // style (the settings card writes there). Resolution is LIVE — changing a
+  // style repaints every existing drawing of that type instantly.
+  setToolStyle(toolId, style) {
+    if (!toolId || !style || typeof style !== 'object') return this;
+    if (!this._toolStyles) this._toolStyles = {};
+    const cur = this._toolStyles[toolId] || {};
+    this._toolStyles[toolId] = Object.assign({}, cur, style);
+    this.invalidate();
+    return this;
+  }
+  getToolStyle(toolId) {
+    const s = this._toolStyles && this._toolStyles[toolId];
+    return s ? Object.assign({}, s) : null;
+  }
+  resetToolStyle(toolId) {
+    if (this._toolStyles && this._toolStyles[toolId]) {
+      delete this._toolStyles[toolId];
+      this.invalidate();
+    }
+    return this;
+  }
+  // Style resolver: drawing.style[key] → tool style[key] → fallback.
+  _ts(d, key, fallback) {
+    if (d && d.style && d.style[key] !== undefined) return d.style[key];
+    const t = this._toolStyles && d && this._toolStyles[d.type];
+    if (t && t[key] !== undefined) return t[key];
+    return fallback;
   }
   // Visibility — the USER decides whether the strip appears at all.
   showDrawingPanel()  { this._drawPanelCfg.enabled = true;  this.invalidate(); return this; }
@@ -6049,9 +6124,34 @@ class TradingChart {
           const d = sc.drawing;
           if (newSettings.color !== undefined) d.color = newSettings.color;
           if (newSettings.lineWidth !== undefined) d.lineWidth = +newSettings.lineWidth;
+          // v2.36.0: style.* fields write into the drawing's style object
+          d.style = d.style || {};
+          for (const skey in newSettings) {
+            if (skey.indexOf('style.') !== 0) continue;
+            const sk = skey.slice(6);
+            const sv = newSettings[skey];
+            if (sk === 'dash') {
+              if (sv === '' || sv == null) delete d.style.dash;
+              else if (sv === 'solid') d.style.dash = [];
+              else d.style.dash = String(sv).split(',').map(Number).filter(function (n) { return isFinite(n); });
+            } else if (sk === 'extend') {
+              if (!sv) delete d.style.extend; else d.style.extend = sv;
+            } else if (sk === 'fibLevels') {
+              d.style.fibLevels = String(sv).split(',').map(Number).filter(function (n) { return isFinite(n); });
+            } else if (sk === 'fillAlpha') {
+              d.style.fillAlpha = Math.max(0, Math.min(1, (+sv) / 100));
+            } else if (sk === 'fill' || sk === 'showDots') {
+              d.style[sk] = !!sv;
+            } else {
+              d.style[sk] = +sv;
+            }
+          }
+          if (!Object.keys(d.style).length) delete d.style;
           // Merge remaining custom fields into the drawing
+          // (v2.36.0: 'style.*' keys were already written into d.style above)
           for (const key in newSettings) {
             if (key === 'color' || key === 'lineWidth') continue;
+            if (key.indexOf('style.') === 0) continue;
             d[key] = newSettings[key];
           }
           const tool = this._customTools && this._customTools[d.type];
@@ -6071,6 +6171,24 @@ class TradingChart {
         // Cycle field value — for number/color
         const sc = this.settingsCard;
         const f = sc.fields[scHit.index];
+        // v2.36.0: select fields cycle their options; check fields toggle
+        if (f.type === 'select') {
+          const opts = f.options || [];
+          if (opts.length) {
+            let ci = -1;
+            for (let oi = 0; oi < opts.length; oi++) {
+              if (String(opts[oi].v) === String(f.value)) { ci = oi; break; }
+            }
+            f.value = opts[(ci + 1) % opts.length].v;
+          }
+          this.invalidate();
+          return;
+        }
+        if (f.type === 'check') {
+          f.value = !f.value;
+          this.invalidate();
+          return;
+        }
         if (f.type === 'color') {
           // Cycle through preset colors
           const colors = ['#2962ff','#ff9800','#e91e63','#26a69a','#9c27b0','#ef5350','#7e57c2'];
@@ -10395,10 +10513,12 @@ class TradingChart {
       const isSelected = (d === this.selectedDrawing);
       ctx.strokeStyle = isSelected ? this.theme.drawingActive : color;
       ctx.fillStyle = color;
-      ctx.lineWidth = d.lineWidth || 1.5;
+      // v2.36.0: the base width also honours a tool style lineWidth fallback
+      const baseW = d.lineWidth || this._ts(d, 'lineWidth', 1.5);
+      ctx.lineWidth = baseW;
       const isHover = (d === this.hoverDrawing);
-      if (isHover && !isSelected) { ctx.lineWidth = (d.lineWidth || 1.5) + 1; ctx.strokeStyle = this.theme.drawingActive; }
-      if (isSelected) { ctx.lineWidth = (d.lineWidth || 1.5) + 0.5; }
+      if (isHover && !isSelected) { ctx.lineWidth = baseW + 1; ctx.strokeStyle = this.theme.drawingActive; }
+      if (isSelected) { ctx.lineWidth = baseW + 0.5; }
 
       // v2.2.0+: ALL drawings are clipped to the chart area (chartLeft..chartRight,
       // chartTop..chartBottom). No drawing — including hline, fib, band — is allowed
@@ -10413,6 +10533,34 @@ class TradingChart {
         ctx.clip();
       }
 
+      // v2.36.0: FREE-DESIGN TOOL RENDER — a tool style with a render() hook
+      // owns every pixel of this drawing type (built-in tools included). The
+      // library still handles creation, dragging, handles, the settings card
+      // and the eraser around it.
+      const tsDef = this._toolStyles && this._toolStyles[d.type];
+      if (tsDef && typeof tsDef.render === 'function') {
+        ctx.save();
+        try { tsDef.render(ctx, d, this._drawingHelpers(), this); }
+        catch (e) { console.error('[BadiCharts] Tool style render error (' + d.type + '):', e); }
+        finally { ctx.restore(); }
+        if (needsClip) ctx.restore();
+        return;
+      }
+      // v2.36.0: shared style resolution for the built-in renderers
+      const stVal = (k, fb) => this._ts(d, k, fb);
+      const stOpt = (k) => (d.style && d.style[k] !== undefined) ? d.style[k]
+        : (tsDef && tsDef[k] !== undefined ? tsDef[k] : undefined);
+      const applyDash = (fb) => {
+        let dv = stOpt('dash');
+        if (dv === undefined) dv = fb;
+        if (dv === 'solid') dv = [];
+        if (Array.isArray(dv) && dv.length) ctx.setLineDash(dv);
+        else ctx.setLineDash([]);
+      };
+      const stCap = stOpt('lineCap'), stJoin = stOpt('lineJoin');
+      if (stCap) ctx.lineCap = stCap;
+      if (stJoin) ctx.lineJoin = stJoin;
+
       switch (d.type) {
         case 'trend': {
           const i1 = this._drawingIdxAt(d, 'i1');
@@ -10421,12 +10569,29 @@ class TradingChart {
           const x2 = this.indexToX(i2);
           const y1 = this.priceToY(d.p1);
           const y2 = this.priceToY(d.p2);
+          // v2.36.0: extend 'none' (default) | 'right' | 'both'
+          const ext = stVal('extend', 'none');
+          let ax1 = x1, ay1 = y1, ax2 = x2, ay2 = y2;
+          const ddx = x2 - x1, ddy = y2 - y1;
+          if ((ext === 'right' || ext === 'both') && Math.abs(ddx) > 0.001) {
+            const t = (this.chartRight - x1) / ddx;
+            if (t > 1) { ax2 = this.chartRight; ay2 = y1 + ddy * t; }
+          }
+          if (ext === 'both' && Math.abs(ddx) > 0.001) {
+            const t = (this.chartLeft - x1) / ddx;
+            if (t < 0) { ax1 = this.chartLeft; ay1 = y1 + ddy * t; }
+          }
+          applyDash([]);
           ctx.beginPath();
-          ctx.moveTo(x1, y1);
-          ctx.lineTo(x2, y2);
+          ctx.moveTo(ax1, ay1);
+          ctx.lineTo(ax2, ay2);
           ctx.stroke();
-          ctx.beginPath(); ctx.arc(x1, y1, 3, 0, Math.PI * 2); ctx.fill();
-          ctx.beginPath(); ctx.arc(x2, y2, 3, 0, Math.PI * 2); ctx.fill();
+          ctx.setLineDash([]);
+          if (stVal('showDots', true)) {
+            const dsz = stVal('dotSize', 3);
+            ctx.beginPath(); ctx.arc(x1, y1, dsz, 0, Math.PI * 2); ctx.fill();
+            ctx.beginPath(); ctx.arc(x2, y2, dsz, 0, Math.PI * 2); ctx.fill();
+          }
           break;
         }
         case 'ray': {
@@ -10438,6 +10603,7 @@ class TradingChart {
           const y1 = this.priceToY(d.p1);
           const y2 = this.priceToY(d.p2);
           const dx = x2 - x1, dy = y2 - y1;
+          applyDash([]);
           if (Math.abs(dx) < 0.001) {
             ctx.beginPath(); ctx.moveTo(x1, this.chartTop); ctx.lineTo(x1, this.chartBottom); ctx.stroke();
           } else {
@@ -10447,8 +10613,11 @@ class TradingChart {
             ctx.moveTo(x1, y1);
             ctx.lineTo(this.chartRight, yEnd);
             ctx.stroke();
-            ctx.beginPath(); ctx.arc(x1, y1, 3, 0, Math.PI * 2); ctx.fill();
+            if (stVal('showDots', true)) {
+              ctx.beginPath(); ctx.arc(x1, y1, stVal('dotSize', 3), 0, Math.PI * 2); ctx.fill();
+            }
           }
+          ctx.setLineDash([]);
           break;
         }
         case 'channel': {
@@ -10466,20 +10635,25 @@ class TradingChart {
           const offsetPrice = d.p2 - d.p1;
           const y1b = this.priceToY(d.p1 + offsetPrice);
           const y2b = this.priceToY(d.p2 + offsetPrice);
-          ctx.setLineDash([4, 3]);
+          applyDash([4, 3]);
           ctx.beginPath();
           ctx.moveTo(x1, y1b); ctx.lineTo(x2, y2b); ctx.stroke();
           ctx.setLineDash([]);
-          // Fill between
-          ctx.fillStyle = withAlpha(color, 0.08);
-          ctx.beginPath();
-          ctx.moveTo(x1, y1); ctx.lineTo(x2, y2);
-          ctx.lineTo(x2, y2b); ctx.lineTo(x1, y1b); ctx.closePath(); ctx.fill();
-          // Endpoint dots
-          ctx.beginPath(); ctx.arc(x1, y1, 3, 0, Math.PI * 2); ctx.fill();
-          ctx.beginPath(); ctx.arc(x2, y2, 3, 0, Math.PI * 2); ctx.fill();
-          ctx.beginPath(); ctx.arc(x1, y1b, 3, 0, Math.PI * 2); ctx.fill();
-          ctx.beginPath(); ctx.arc(x2, y2b, 3, 0, Math.PI * 2); ctx.fill();
+          // Fill between (v2.36.0: fill toggle + fillAlpha style)
+          if (stVal('fill', true)) {
+            ctx.fillStyle = withAlpha(color, stVal('fillAlpha', 0.08));
+            ctx.beginPath();
+            ctx.moveTo(x1, y1); ctx.lineTo(x2, y2);
+            ctx.lineTo(x2, y2b); ctx.lineTo(x1, y1b); ctx.closePath(); ctx.fill();
+          }
+          // Endpoint dots (v2.36.0: showDots + dotSize styles)
+          if (stVal('showDots', true)) {
+            const dsz = stVal('dotSize', 3);
+            ctx.beginPath(); ctx.arc(x1, y1, dsz, 0, Math.PI * 2); ctx.fill();
+            ctx.beginPath(); ctx.arc(x2, y2, dsz, 0, Math.PI * 2); ctx.fill();
+            ctx.beginPath(); ctx.arc(x1, y1b, dsz, 0, Math.PI * 2); ctx.fill();
+            ctx.beginPath(); ctx.arc(x2, y2b, dsz, 0, Math.PI * 2); ctx.fill();
+          }
           break;
         }
         case 'arrow': {
@@ -10490,11 +10664,13 @@ class TradingChart {
           const y1 = this.priceToY(d.p1);
           const y2 = this.priceToY(d.p2);
           // Main shaft
+          applyDash([]);
           ctx.beginPath();
           ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
-          // Arrowhead at end (x2,y2)
+          ctx.setLineDash([]);
+          // Arrowhead at end (x2,y2) — v2.36.0: headLength style
           const angle = Math.atan2(y2 - y1, x2 - x1);
-          const headLen = 12;
+          const headLen = stVal('headLength', 12);
           ctx.beginPath();
           ctx.moveTo(x2, y2);
           ctx.lineTo(x2 - headLen * Math.cos(angle - Math.PI / 6), y2 - headLen * Math.sin(angle - Math.PI / 6));
@@ -10508,9 +10684,11 @@ class TradingChart {
           const y1 = this.priceToY(d.p1);
           const y2 = this.priceToY(d.p2);
           const yTop = Math.min(y1, y2), yBot = Math.max(y1, y2);
-          ctx.fillStyle = withAlpha(color, 0.15);
-          ctx.fillRect(this.chartLeft, yTop, this.chartRight - this.chartLeft, yBot - yTop);
-          ctx.setLineDash([3, 3]);
+          if (stVal('fill', true)) {
+            ctx.fillStyle = withAlpha(color, stVal('fillAlpha', 0.15));
+            ctx.fillRect(this.chartLeft, yTop, this.chartRight - this.chartLeft, yBot - yTop);
+          }
+          applyDash([3, 3]);
           ctx.lineWidth = 1;
           ctx.beginPath();
           ctx.moveTo(this.chartLeft, Math.floor(yTop) + 0.5);
@@ -10520,16 +10698,21 @@ class TradingChart {
           ctx.stroke();
           ctx.setLineDash([]);
           // v2.2.0+: Labels INSIDE the chart at the right edge (not on price axis)
-          ctx.font = '10px -apple-system, Segoe UI, Roboto, sans-serif';
+          ctx.font = stVal('labelFont', '10px -apple-system, Segoe UI, Roboto, sans-serif');
           ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
           const t1 = this.priceScale.formatLogical(d.p1);
           const t2 = this.priceScale.formatLogical(d.p2);
           const tw1 = ctx.measureText(t1).width + 8;
           const tw2 = ctx.measureText(t2).width + 8;
-          ctx.fillStyle = color;
-          ctx.fillRect(this.chartRight - tw1 - 2, Math.floor(y1) - 7, tw1, 14);
-          ctx.fillRect(this.chartRight - tw2 - 2, Math.floor(y2) - 7, tw2, 14);
-          ctx.fillStyle = this.theme.bg;
+          const bLb = stVal('labelBg', true);
+          if (bLb) {
+            ctx.fillStyle = color;
+            ctx.fillRect(this.chartRight - tw1 - 2, Math.floor(y1) - 7, tw1, 14);
+            ctx.fillRect(this.chartRight - tw2 - 2, Math.floor(y2) - 7, tw2, 14);
+            ctx.fillStyle = this.theme.bg;
+          } else {
+            ctx.fillStyle = color;
+          }
           ctx.fillText(t1, this.chartRight - 4, Math.floor(y1));
           ctx.fillText(t2, this.chartRight - 4, Math.floor(y2));
           ctx.textAlign = 'left';
@@ -10538,7 +10721,7 @@ class TradingChart {
         case 'hline': {
           const y = this.priceToY(d.price);
           const ys = snapToV(y, _dpr);
-          ctx.setLineDash([4, 4]);
+          applyDash([4, 4]);
           ctx.beginPath();
           ctx.moveTo(this.chartLeft, ys);
           ctx.lineTo(this.chartRight, ys);
@@ -10546,11 +10729,15 @@ class TradingChart {
           ctx.setLineDash([]);
           // v2.2.0+: Price label INSIDE the chart at the right edge (not on price axis)
           const txt = this.priceScale.formatLogical(d.price);
-          ctx.font = '10px -apple-system, Segoe UI, Roboto, sans-serif';
+          ctx.font = stVal('labelFont', '10px -apple-system, Segoe UI, Roboto, sans-serif');
           const tw = ctx.measureText(txt).width + 8;
-          ctx.fillStyle = color;
-          ctx.fillRect(this.chartRight - tw - 2, Math.floor(y) - 7, tw, 14);
-          ctx.fillStyle = this.theme.bg;
+          if (stVal('labelBg', true)) {
+            ctx.fillStyle = color;
+            ctx.fillRect(this.chartRight - tw - 2, Math.floor(y) - 7, tw, 14);
+            ctx.fillStyle = this.theme.bg;
+          } else {
+            ctx.fillStyle = color;
+          }
           ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
           ctx.fillText(txt, this.chartRight - 4, Math.floor(y));
           ctx.textAlign = 'left';
@@ -10560,7 +10747,7 @@ class TradingChart {
           const idx = this._drawingIdxAt(d, 'index');
           const x = this.indexToX(idx);
           const xs = snapToH(x, _dpr);
-          ctx.setLineDash([4, 4]);
+          applyDash([4, 4]);
           ctx.beginPath();
           // v2.2.0+: clip vline to chartTop..chartBottom only (not into pane/time axis)
           ctx.moveTo(xs, this.chartTop);
@@ -10578,14 +10765,20 @@ class TradingChart {
           const y2 = this.priceToY(d.p2);
           const rx = Math.min(x1, x2), ry = Math.min(y1, y2);
           const rw = Math.abs(x2 - x1), rh = Math.abs(y2 - y1);
-          ctx.fillStyle = withAlpha(color, 0.13);
-          ctx.fillRect(rx, ry, rw, rh);
+          if (stVal('fill', true)) {
+            ctx.fillStyle = withAlpha(color, stVal('fillAlpha', 0.13));
+            ctx.fillRect(rx, ry, rw, rh);
+          }
+          applyDash([]);
           ctx.strokeRect(rx, ry, rw, rh);
+          ctx.setLineDash([]);
           break;
         }
         case 'poly': {
           if (!d.points || d.points.length < 2) break;
-          ctx.lineWidth = 1.5; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+          ctx.lineWidth = d.lineWidth || this._ts(d, 'lineWidth', 1.5);
+          ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+          applyDash([]);
           ctx.beginPath();
           for (let i = 0; i < d.points.length; i++) {
             const idx = this._drawingVertexIdx(d, i);
@@ -10593,18 +10786,22 @@ class TradingChart {
             const y = this.priceToY(d.points[i].p);
             if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
           }
-          if (d.closed) {
+          if (d.closed && stVal('fill', true)) {
             ctx.closePath();
-            ctx.fillStyle = withAlpha(color, 0.13);
+            ctx.fillStyle = withAlpha(color, stVal('fillAlpha', 0.13));
             ctx.fill();
           }
           ctx.stroke();
-          // Vertex dots
-          for (let i = 0; i < d.points.length; i++) {
-            const idx = this._drawingVertexIdx(d, i);
-            const x = this.indexToX(idx);
-            const y = this.priceToY(d.points[i].p);
-            ctx.beginPath(); ctx.arc(x, y, 3, 0, Math.PI * 2); ctx.fill();
+          ctx.setLineDash([]);
+          // Vertex dots (v2.36.0: showDots + dotSize styles)
+          if (stVal('showDots', true)) {
+            const dsz = stVal('dotSize', 3);
+            for (let i = 0; i < d.points.length; i++) {
+              const idx = this._drawingVertexIdx(d, i);
+              const x = this.indexToX(idx);
+              const y = this.priceToY(d.points[i].p);
+              ctx.beginPath(); ctx.arc(x, y, dsz, 0, Math.PI * 2); ctx.fill();
+            }
           }
           break;
         }
@@ -10612,16 +10809,20 @@ class TradingChart {
           const idx = this._drawingIdxAt(d, 'i');
           const x = this.indexToX(idx);
           const y = this.priceToY(d.p);
-          ctx.font = '12px -apple-system, Segoe UI, Roboto, sans-serif';
+          ctx.font = stVal('labelFont', '12px -apple-system, Segoe UI, Roboto, sans-serif');
           ctx.textAlign = 'left'; ctx.textBaseline = 'bottom';
-          // Background box for readability
+          // Background box for readability (v2.36.0: fill/fillAlpha styles)
           const tw = ctx.measureText(d.text).width + 8;
-          ctx.fillStyle = withAlpha(color, 0.19);
-          ctx.fillRect(x - 2, y - 16, tw, 18);
+          if (stVal('fill', true)) {
+            ctx.fillStyle = withAlpha(color, stVal('fillAlpha', 0.19));
+            ctx.fillRect(x - 2, y - 16, tw, 18);
+          }
           ctx.fillStyle = color;
           ctx.fillText(d.text, x + 2, y - 2);
-          // Anchor dot
-          ctx.beginPath(); ctx.arc(x, y, 2.5, 0, Math.PI * 2); ctx.fill();
+          // Anchor dot (v2.36.0: showDots + dotSize styles)
+          if (stVal('showDots', true)) {
+            ctx.beginPath(); ctx.arc(x, y, stVal('dotSize', 2.5), 0, Math.PI * 2); ctx.fill();
+          }
           break;
         }
         case 'fib': {
@@ -10632,14 +10833,20 @@ class TradingChart {
           const y1 = this.priceToY(d.p1);
           const y2 = this.priceToY(d.p2);
           const xL = Math.min(x1, x2), xR = Math.max(x1, x2);
-          const levels = [0, 0.236, 0.382, 0.5, 0.618, 0.786, 1, 1.618];
-          const colors = ['#787b86','#ef5350','#ff9800','#26a69a','#2962ff','#9c27b0','#ef5350','#26a69a'];
-          ctx.font = '10px -apple-system, Segoe UI, Roboto, sans-serif';
+          // v2.36.0: fibLevels / fibColors / labelFont / labelBg styles
+          const levels = stVal('fibLevels', [0, 0.236, 0.382, 0.5, 0.618, 0.786, 1, 1.618]);
+          const fcols = stVal('fibColors', ['#787b86','#ef5350','#ff9800','#26a69a','#2962ff','#9c27b0','#ef5350','#26a69a']);
+          const fcol = (i) => fcols[i % fcols.length];
+          ctx.font = stVal('labelFont', '10px -apple-system, Segoe UI, Roboto, sans-serif');
+          const fLb = stVal('labelBg', true);
           ctx.textBaseline = 'middle'; ctx.textAlign = 'right';
           for (let i = 0; i < levels.length; i++) {
             const y = y1 + (y2 - y1) * levels[i];
-            ctx.strokeStyle = colors[i]; ctx.lineWidth = 1;
-            ctx.setLineDash([2, 2]);
+            ctx.strokeStyle = fcol(i); ctx.lineWidth = 1;
+            let fdv = stOpt('dash');
+            if (fdv === undefined) fdv = [2, 2];
+            if (fdv === 'solid') fdv = [];
+            if (Array.isArray(fdv) && fdv.length) ctx.setLineDash(fdv); else ctx.setLineDash([]);
             const ys = snapToV(y, _dpr);
             ctx.beginPath();
             ctx.moveTo(xL, ys);
@@ -10651,9 +10858,13 @@ class TradingChart {
             const tw = ctx.measureText(txt).width + 6;
             // v2.2.0+: Label INSIDE the chart at the right edge of the fib span
             const labelX = Math.min(xR, this.chartRight - tw - 2);
-            ctx.fillStyle = colors[i];
-            ctx.fillRect(labelX, Math.floor(y) - 7, tw, 14);
-            ctx.fillStyle = this.theme.bg;
+            if (fLb) {
+              ctx.fillStyle = fcol(i);
+              ctx.fillRect(labelX, Math.floor(y) - 7, tw, 14);
+              ctx.fillStyle = this.theme.bg;
+            } else {
+              ctx.fillStyle = fcol(i);
+            }
             ctx.fillText(txt, labelX + tw - 3, Math.floor(y));
           }
           ctx.textAlign = 'left';
@@ -10661,7 +10872,11 @@ class TradingChart {
         }
         case 'brush': {
           if (!d.points || d.points.length === 0) break;
-          ctx.lineWidth = 2; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+          // v2.36.0: brush width is no longer hard-coded 2 — the drawing's
+          // width, a tool style lineWidth, then 2.
+          ctx.lineWidth = d.lineWidth || this._ts(d, 'lineWidth', 2);
+          ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+          applyDash([]);
           ctx.beginPath();
           for (let i = 0; i < d.points.length; i++) {
             const idx = this._drawingVertexIdx(d, i);
@@ -10670,6 +10885,7 @@ class TradingChart {
             if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
           }
           ctx.stroke();
+          ctx.setLineDash([]);
           break;
         }
         default: {
@@ -10721,15 +10937,35 @@ class TradingChart {
     }
 
     // v2.7.0: Draw draggable handles for the SELECTED drawing
+    // v2.36.0: handleStyle { size, shape:'circle'|'square'|'ring'|'diamond',
+    // color, bg, lineWidth } — default keeps the exact old look.
     if (this.selectedDrawing && !this.selectedDrawing.locked) {
       const handles = this._getDrawingHandles(this.selectedDrawing);
+      const hst = this._ts(this.selectedDrawing, 'handleStyle', null) || {};
+      const hSize = hst.size != null ? hst.size : 4.5;
+      const hShape = hst.shape || 'circle';
+      const hColor = hst.color || this.theme.accent;
+      const hBg = hst.bg || this.theme.bg;
+      const hLW = hst.lineWidth != null ? hst.lineWidth : 1.5;
       for (const h of handles) {
         ctx.beginPath();
-        ctx.arc(h.x, h.y, 4.5, 0, Math.PI * 2);
-        ctx.fillStyle = this.theme.bg;
-        ctx.fill();
-        ctx.strokeStyle = this.theme.accent;
-        ctx.lineWidth = 1.5;
+        if (hShape === 'square') {
+          ctx.rect(h.x - hSize, h.y - hSize, hSize * 2, hSize * 2);
+        } else if (hShape === 'diamond') {
+          ctx.moveTo(h.x, h.y - hSize);
+          ctx.lineTo(h.x + hSize, h.y);
+          ctx.lineTo(h.x, h.y + hSize);
+          ctx.lineTo(h.x - hSize, h.y);
+          ctx.closePath();
+        } else {
+          ctx.arc(h.x, h.y, hSize, 0, Math.PI * 2);
+        }
+        if (hShape !== 'ring') {
+          ctx.fillStyle = hBg;
+          ctx.fill();
+        }
+        ctx.strokeStyle = hColor;
+        ctx.lineWidth = hLW;
         ctx.stroke();
       }
     }
@@ -11078,17 +11314,22 @@ class TradingChart {
   // tool's onSettings(drawing, drawing) hook after the user's mutations).
   _openDrawingSettingsCard(d) {
     const tool = this._customTools && this._customTools[d.type];
-    if (tool && typeof tool.renderCard === 'function') {
+    // v2.36.0: a TOOL STYLE may also carry a free-design card — built-in
+    // tools can get renderCard via setToolStyle('trend', { renderCard ... })
+    const tsCard = this._toolStyles && this._toolStyles[d.type];
+    const cardDef = (tsCard && typeof tsCard.renderCard === 'function') ? tsCard : tool;
+    const tool0 = cardDef;
+    if (cardDef && typeof cardDef.renderCard === 'function') {
       let size = { w: 240, h: 160 };
-      if (typeof tool.cardSize === 'function') {
-        try { const s2 = tool.cardSize(d, this); if (s2 && s2.w && s2.h) size = s2; } catch (_) {}
+      if (typeof tool0.cardSize === 'function') {
+        try { const s2 = tool0.cardSize(d, this); if (s2 && s2.w && s2.h) size = s2; } catch (_) {}
       }
       const sc = {
         id: '__drawing__' + d.id, custom: true, isDrawingCard: true,
-        def: tool, state: null, drawing: d,
+        def: tool0, state: null, drawing: d,
         x: this.chartLeft + 50, y: this.chartTop + 50,
         w: Math.max(40, size.w | 0), h: Math.max(30, size.h | 0),
-        title: (tool.label || d.type || 'Drawing') + ' Settings'
+        title: (tool0.label || d.type || 'Drawing') + ' Settings'
       };
       if (isFinite(size.x)) sc.x = size.x;
       if (isFinite(size.y)) sc.y = size.y;
@@ -11101,6 +11342,53 @@ class TradingChart {
     const fields = [];
     fields.push({key: 'color', label: 'Color', type: 'color', value: d.color || this.theme.drawing});
     fields.push({key: 'lineWidth', label: 'Line Width', type: 'number', value: d.lineWidth || 1.5});
+    // v2.36.0: FREE-ADJUST fields — the style keys that apply to this tool
+    // type are editable right on the card (they write into drawing.style).
+    if (d.type !== 'text') {
+      const curDash = (d.style && d.style.dash !== undefined) ? d.style.dash
+        : ((tsCard && tsCard.dash !== undefined) ? tsCard.dash : undefined);
+      const dashId = curDash === undefined ? ''
+        : (Array.isArray(curDash) && curDash.length === 0) ? 'solid'
+        : (Array.isArray(curDash) ? curDash.join(',') : String(curDash));
+      fields.push({key: 'style.dash', label: 'Line Style', type: 'select',
+        options: [{v: '', label: 'Default'}, {v: 'solid', label: 'Solid'},
+                  {v: '4,4', label: 'Dashed'}, {v: '2,3', label: 'Dotted'},
+                  {v: '6,3,2,3', label: 'Dash Dot'}],
+        value: dashId});
+    }
+    if (['rect', 'band', 'channel', 'poly'].indexOf(d.type) >= 0) {
+      const dfa = d.type === 'band' ? 0.15 : (d.type === 'channel' ? 0.08 : 0.13);
+      fields.push({key: 'style.fill', label: 'Fill', type: 'check',
+        value: this._ts(d, 'fill', true)});
+      fields.push({key: 'style.fillAlpha', label: 'Fill %', type: 'number',
+        value: Math.round(this._ts(d, 'fillAlpha', dfa) * 100)});
+    }
+    if (['trend', 'ray', 'channel', 'poly', 'text'].indexOf(d.type) >= 0) {
+      fields.push({key: 'style.dotSize', label: 'Dot Size', type: 'number',
+        value: this._ts(d, 'dotSize', d.type === 'text' ? 2.5 : 3)});
+      fields.push({key: 'style.showDots', label: 'Dots', type: 'check',
+        value: this._ts(d, 'showDots', true)});
+    }
+    if (d.type === 'arrow') {
+      fields.push({key: 'style.headLength', label: 'Head Size', type: 'number',
+        value: this._ts(d, 'headLength', 12)});
+    }
+    if (d.type === 'trend') {
+      const cext = this._ts(d, 'extend', 'none');
+      fields.push({key: 'style.extend', label: 'Extend', type: 'select',
+        options: [{v: '', label: 'No'}, {v: 'right', label: 'Right'}, {v: 'both', label: 'Both'}],
+        value: cext === 'none' ? '' : cext});
+    }
+    if (d.type === 'fib') {
+      const clv = this._ts(d, 'fibLevels', [0, 0.236, 0.382, 0.5, 0.618, 0.786, 1, 1.618]).join(',');
+      fields.push({key: 'style.fibLevels', label: 'Levels', type: 'select',
+        options: [
+          {v: '0,0.236,0.382,0.5,0.618,0.786,1,1.618', label: 'Default 8'},
+          {v: '0,0.236,0.382,0.5,0.618,0.786,1', label: 'Classic 7'},
+          {v: '0,0.236,0.382,0.5,0.618,0.786,1,1.618,2.618,4.236', label: 'Extended 10'},
+          {v: '0,0.5,1', label: 'Minimal 3'}],
+        value: clv});
+    }
     // Custom tool: include defaultStyle keys as editable fields
     // (tool already declared at the top — v2.34.0 free-design branch)
     if (tool && tool.defaultStyle) {
@@ -11166,6 +11454,16 @@ class TradingChart {
     return null;
   }
   hitTestDrawing(d, x, y) {
+    // v2.36.0: free-design hit-test override — a tool style with hitTest()
+    // decides alone whether (x, y) is on the drawing.
+    const tsHT = this._toolStyles && this._toolStyles[d.type];
+    if (tsHT && typeof tsHT.hitTest === 'function') {
+      try { return !!tsHT.hitTest(d, x, y, this._drawingHelpers(), this); }
+      catch (e) {
+        if (BADI_DEBUG) console.error('[BadiCharts] Tool style hitTest error (' + d.type + '):', e);
+        return false;
+      }
+    }
     const tol = 6;
     switch (d.type) {
       case 'trend':
@@ -12654,12 +12952,35 @@ class TradingChart {
       // Value text
       ctx.fillStyle = this.theme.textBright;
       ctx.textAlign = 'left';
-      const valStr = String(f.type === 'color' ? f.value : f.value);
-      ctx.fillText(valStr, ix + 6, iy + ih / 2);
-      if (f.type === 'color') {
-        // Color swatch
-        ctx.fillStyle = f.value;
-        ctx.fillRect(ix + iw - 20, iy + 3, 14, 14);
+      // v2.36.0: select fields show their option label + chevron, check
+      // fields show an ON/OFF pill — same look as the chart settings card.
+      if (f.type === 'select') {
+        const opt = (f.options || []).find(o => String(o.v) === String(f.value));
+        ctx.fillText(opt ? opt.label : String(f.value), ix + 6, iy + ih / 2);
+        ctx.strokeStyle = this.theme.textDim;
+        ctx.beginPath();
+        ctx.moveTo(ix + iw - 14, iy + 8);
+        ctx.lineTo(ix + iw - 10, iy + 12);
+        ctx.lineTo(ix + iw - 6, iy + 8);
+        ctx.stroke();
+      } else if (f.type === 'check') {
+        const on = !!f.value;
+        ctx.fillText(on ? 'ON' : 'OFF', ix + 6, iy + ih / 2);
+        ctx.fillStyle = on ? this.theme.accent : this.theme.toolbarBorder;
+        this._roundRect(ix + iw - 34, iy + 3, 28, 14, 7);
+        ctx.fill();
+        ctx.fillStyle = this.theme.textBright;
+        ctx.beginPath();
+        ctx.arc(ix + iw - 26 + (on ? 12 : 0), iy + 10, 5, 0, Math.PI * 2);
+        ctx.fill();
+      } else {
+        const valStr = String(f.type === 'color' ? f.value : f.value);
+        ctx.fillText(valStr, ix + 6, iy + ih / 2);
+        if (f.type === 'color') {
+          // Color swatch
+          ctx.fillStyle = f.value;
+          ctx.fillRect(ix + iw - 20, iy + 3, 14, 14);
+        }
       }
       fy += 30;
     }
