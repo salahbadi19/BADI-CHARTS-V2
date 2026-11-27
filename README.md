@@ -4,10 +4,48 @@
 >
 > Pixel-perfect rendering, 14 drawing tools, fully custom indicators via API — you bring the data, the UI, and the indicators. BADI-CHARTS-V2 renders the chart.
 
-[![Version](https://img.shields.io/badge/version-2.36.0-2962ff.svg)](#)
+[![Version](https://img.shields.io/badge/version-2.37.0-2962ff.svg)](#)
 [![License](https://img.shields.io/badge/license-Apache--2.0-26a69a.svg)](LICENSE)
 [![No Dependencies](https://img.shields.io/badge/dependencies-zero-ff9800.svg)](#)
 [![Headless](https://img.shields.io/badge/UI-headless-9c27b0.svg)](#)
+
+---
+
+## ✨ v2.37.0 — The Modern Edition (الواجهة الحديثة — WebGL)
+
+A complete modern UI & analytics layer appended to the **WebGL engine** (`chart-webgl.js`) without touching a single existing render path — the whole layer is **opt-in** via `chart.enableModernUI({...})`; with the layer off, v2.37.0 behaves exactly like v2.36.0. (The 2D edition `chart.js` is unchanged at v2.36.0.)
+
+```html
+<script src="https://cdn.jsdelivr.net/gh/salahbadi19/BADI-CHARTS-V2@v2.37.0/chart-webgl.js"></script>
+<script>
+  const chart = new BadiCharts(canvas, { symbol: { label:'BTCUSDT', priceScale:100, decimals:2 },
+                                         timeframe: { label:'1H', ms:3600000 } });
+  chart.setData(candles);
+  chart.enableModernUI({
+    theme:   'midnight',   // midnight · ocean · nord · aurora · carbon · solar · rose · terminal …
+    cards:   'all',        // symbol/stats/watchlist/alerts/trade/shortcuts/perf/objects/depth
+    locale:  'ar',         // full Arabic RTL + Arabic-Indic digits option
+    railSide: 'right'
+  });
+  chart.start();
+</script>
+```
+
+**What the layer adds (all documented in MODERN SECTION 12 of the file):**
+
+1. **Glass card suite** — 9 draggable/collapsible cards rendered on the canvas (no DOM): Symbol (animated ticker), Stats, Watchlist, Alerts manager, Trade (paper trading + P&L), Shortcuts, Perf (live FPS), Object tree, Order book. A glass launcher rail + Alt+1…9 toggles them.
+2. **Modern theme engine** — 11+ curated 2025 presets with GLASS design tokens (`BadiThemes`), `chart.setThemePreset('nord')`, `'auto'` follows `prefers-color-scheme`.
+3. **Alerts engine** — `chart.addAlert({price, direction, label, once})` → pulsing axis badges, `onAlert` callbacks, toast + marker + log. `muteAlert / removeAlert / clearAlerts / getAlerts`.
+4. **LWC-v5-style price lines** — `chart.createPriceLine({price, color, title, style, draggable}) → handle.remove()`, draggable, double-click a line to make an alert.
+5. **29 new indicators** — `chart.enableIndicator('vwap'|'supertrend'|'ichimoku'|'psar'|'adx'|'cci'|'obv'|…)` with live settings cards; the math is also on the public `Indicators` utility.
+6. **Measure 2.0 + position tools** — modern ruler (Δprice/Δ%/Δbars/Δtime in a glass pill), long/short position brackets with live R:R, horizontal ray, cross line (`chart.setTool('measure')` …).
+7. **Export** — `chart.exportPNG({scale, watermark, transparent, asBlob})` composites the WebGL layer + text overlay; `chart.exportCSV()` / `chart.exportJSON()`.
+8. **Chart sync** — `chartA.syncWith(chartB, {range:true, crosshair:true})` for multi-chart dashboards; `unsync()` to disconnect.
+9. **Localization + RTL** — `chart.setLocale('ar')` switches every card label and flips the dock; extend `BadiI18n` with any language.
+10. **Session shading** — `chart.setSessions([{start:'09:30', end:'16:00', color, label}])` translucent market-session bands.
+11. **Self test** — `BadiSelfTest.run(chart)` verifies the whole wiring (used by the CI of this release).
+
+Integrators' smoke check without any test framework: open the console and run `BadiSelfTest.run(chart)` — it must return `{ ok: true }`.
 
 ---
 
