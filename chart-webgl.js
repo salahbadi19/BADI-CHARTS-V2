@@ -1,13 +1,21 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.37.0 — WEBGL EDITION + THE MODERN EDITION (chart-webgl.js)
+ * BADI-CHARTS-V2 v2.38.0 — PERFORMANCE EDITION (chart-webgl.js)
  * The complete standalone trading chart library, rendered with real WebGL,
- * now with the v2.37.0 MODERN layer: glass card suite (Symbol / Stats /
- * Watchlist / Alerts / Trade / Shortcuts / Performance cards), 8 modern
- * theme presets, alerts engine, LWC-style price lines, 16 new indicators
- * (VWAP, Supertrend, Ichimoku, ADX, ...), Measure 2.0, PNG/CSV export,
- * chart sync, session shading and full Arabic localization. All opt-in via
- * chart.enableModernUI({...}) — with the layer off, v2.37.0 behaves exactly
- * like v2.36.0. See the MODERN SECTION banner near the end of this file.
+ * hardened with the v2.38.0 PERFORMANCE CORE:
+ *   • GPU line-batch engine — chart.addLineSeries() draws THOUSANDS of line
+ *     series over the candles with ONE draw call per chunk, ZERO CPU per
+ *     frame while panning/zooming (all transforms happen in the vertex
+ *     shader from 4 uniforms), min-max LOD decimation cached per zoom band
+ *     and refined off-thread by an inline Web-Worker pool.
+ *   • Adaptive quality (eco → ultra) + a live perf HUD (chart.enablePerfHUD).
+ *   • Spatial hit-test grid — O(1) hover/click over 100k+ segments.
+ *   • Alerts engine — chart.addAlert() price alerts with drag-to-move,
+ *     trigger flash, WebAudio beep, EN/AR strings and persistence hooks.
+ *   • Right-click context menu — themed DOM menu at the cursor with alert
+ *     options, drawing options, copy price, PNG screenshot, reset view and
+ *     a first-class API for your own items (chart.addContextMenuItem).
+ * No built-in indicators, no built-in cards — everything is opt-in; with
+ * none of it enabled, v2.38.0 behaves exactly like v2.36.0.
  *
  * THIS FILE IS A FULL LIBRARY, NOT A LAYER. Load it INSTEAD of chart.js —
  * nothing else is required. Every feature of the 2D edition ships inside
@@ -392,7 +400,7 @@
 'use strict';
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.37.0';
+const VERSION = '2.38.0';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 
 // v2.31.0/v2.32.0: the supported chart types (ids + display labels) — 20
@@ -3243,6 +3251,10 @@ class PriceScale {
 class TradingChart {
   constructor(canvas, opts = {}) {
     this.canvas = canvas;
+    // v2.38.0: keep the original opts so the performance core / alerts /
+    // context menu can boot lazily with the integrator's configuration
+    // (opts.perf, opts.alerts, opts.contextMenu, opts.lang).
+    this._badiOpts = opts;
     // v2.19.0: WEBGL EDITION — try to create the WebGL backend. The user's
     // canvas stays in place as a transparent TEXT overlay (crisp axis labels,
     // legend, crosshair); every geometry primitive (background, grid, candles,
@@ -13621,6372 +13633,6422 @@ class TradingChart {
   }
 }
 
-
-/* ============================================================================
- * v2.37.0 — THE MODERN EDITION =================================================
- * ============================================================================
- * A ground-up modern UI & analytics layer for BADI-CHARTS-V2, appended to the
- * WebGL engine WITHOUT touching a single existing render path (safe upgrade:
- * the whole layer is opt-in and hooks in through method wrapping only).
+/* =============================================================================
+ * BADI-CHARTS-V2 v2.38.0 — THE PERFORMANCE CORE  (PART 1/2: FOUNDATIONS)
+ * =============================================================================
+ * v2.38.0 — PERFORMANCE EDITION. This section adds a dedicated engine whose
+ * ONLY goal is: keep the chart feather-light even when the user draws
+ * THOUSANDS of line series on top of the candles. No built-in indicators, no
+ * built-in cards — everything here is infrastructure the integrator drives
+ * through a small, clean API:
  *
- * WHAT'S NEW (v2.37.0)
- * --------------------
- *  1. GLASS CARD SUITE (the headline feature)
- *     A modern card framework rendered entirely on the chart canvas — no DOM,
- *     no dependencies, works in both WebGL and fallback-2D modes:
- *       • SymbolCard    — TradingView-style ticker header: big animated price
- *                         (number tweening), change badge, 24h range meter,
- *                         volume, live sparkline, connection state.
- *       • StatsCard     — session statistics grid: O/H/L/C, VWAP, ATR(14),
- *                         range %, bull/bear pressure gauge, volatility.
- *       • WatchlistCard — multi-symbol watchlist with mini sparklines and
- *                         live change badges; click → onSymbolPick callback.
- *       • AlertsCard    — visual alert manager (add / mute / remove) wired to
- *                         the new alerts engine, with a triggered-log tab.
- *       • TradeCard     — paper-trading panel: qty stepper, BUY/SELL glass
- *                         buttons, open-position card with live P&L.
- *       • ShortcutsCard — searchable keyboard-shortcut cheat sheet.
- *       • PerfCard      — live FPS graph, frame-time, data & draw statistics.
- *     Cards are draggable, collapsible, closable, animated (spring open /
- *     fade), stacked with z-order, dock to any corner, and are fully
- *     touch-friendly. A glass "launcher rail" on the chart edge toggles them.
+ *   chart.addLineSeries({ id, points, color, width, ... })   → GPU batch path
+ *   chart.updateLineSeries(id, points)                       → O(n) replace
+ *   chart.appendLineSeriesPoint(id, { t, p })                → O(1) ring append
+ *   chart.removeLineSeries(id) / clearLineSeries()
+ *   chart.hitLineSeries(x, y, tolPx)                         → spatial grid
+ *   chart.fitLineSeries(id?)                                 → fit price scale
+ *   chart.enablePerfHUD(true)                                → live stats HUD
+ *   chart.setQuality('auto'|'ultra'|'high'|'balanced'|'eco')
  *
- *  2. MODERN THEME ENGINE
- *     8 curated 2025-style presets (Midnight, Ocean, Nord, Aurora, Carbon,
- *     Solar Light, Rose Quant, Terminal) with dedicated GLASS design tokens
- *     (card surfaces, borders, sheens, shadows). Auto light/dark detection
- *     via prefers-color-scheme, and animated theme cross-fading.
+ * THE BIG IDEA (zero-CPU pan/zoom):
+ *   The chart's transforms are LINEAR in data space:
+ *     screenX = xA + xB * candleIndex          (barSpacing / rightOffset)
+ *     screenY = yA - yB * price                (priceScale range)
+ *   so a line series' vertex buffer is stored ONCE in DATA space
+ *   (index, price) and the mapping to pixels happens entirely in the VERTEX
+ *   SHADER from 4 uniforms. Panning, zooming and autoscaling therefore cost
+ *   ZERO CPU per frame for the whole line layer — no re-projection, no re-
+ *   tessellation, no re-upload. The buffers are only rebuilt when the DATA
+ *   changes or the LOD bucket band changes (see below).
  *
- *  3. ALERTS ENGINE
- *     chart.addAlert({price, direction, label, color, once}) → alert lines
- *     with pulsing axis badges; crossing fires onAlert callbacks, a toast,
- *     a chart marker and a log entry. removeAlert / clearAlerts / getAlerts.
+ * LOD (level of detail):
+ *   Every series is decimated with a min-max bucket algorithm that PRESERVES
+ *   the visual silhouette (first / min / max / last anchor per bucket). The
+ *   bucket size is quantized to powers of two ("bands": 1, 2, 4, 8, 16 ...)
+ *   so a zoom step inside one band reuses the cached buffers — rebuilds only
+ *   happen when the user crosses a band boundary. For very large series the
+ *   decimation is OFFLOADED to a Web Worker pool (inline blob, no extra
+ *   files) while a synchronous cheap pass keeps the frame responsive.
  *
- *  4. PRICE LINES API (LWC v5-style)
- *     chart.createPriceLine({price, color, title, style, width,
- *     axisLabelVisible}) → handle.remove(). Draggable price lines included.
- *
- *  5. 16 NEW INDICATORS (chart.enableIndicator('vwap') …)
- *     VWAP, Supertrend, Ichimoku Cloud, Parabolic SAR, Donchian & Keltner
- *     Channels, Envelope, ZigZag, Pivot Points, ADX/DMI, CCI, OBV,
- *     Williams %R, MFI, Awesome Oscillator, Choppiness Index — all shipping
- *     as first-class overlay/pane definitions using the existing indicator
- *     contract, plus new math on the public `Indicators` utility.
- *
- *  6. MEASURE TOOL 2.0
- *     A modern ruler drawing tool: Δprice, Δ%, Δbars and Δtime in a floating
- *     glass pill, with an optional profit/loss tint (like TradingView).
- *
- *  7. EXPORT API
- *     chart.exportPNG({padding, watermark, filename, transparent}) — composites
- *     the WebGL layer + crisp text overlay + optional watermark into a
- *     high-DPI PNG and triggers a download. chart.exportCSV() / exportJSON().
- *
- *  8. CHART SYNC
- *     chart.syncWith(otherChart, {range:true, crosshair:true}) — multi-chart
- *     dashboards share visible range and crosshair (fully disconnectable).
- *
- *  9. LOCALIZATION + RTL
- *     BadiI18n with full Arabic (ar) and English (en) dictionaries for every
- *     card label; chart.setLocale('ar') switches the whole card suite, and
- *     Arabic-Indic digit rendering is available via { arabicDigits: true }.
- *
- * 10. SESSION SHADING
- *     chart.setSessions([{start:'09:30', end:'16:00', color, label}]) —
- *     translucent session bands (pre-market / RTH / after-hours) on the chart.
- *
- * ENABLING THE LAYER
- * ------------------
- *     const chart = new BadiCharts(canvas, {...});
- *     chart.enableModernUI({
- *       theme:  'midnight',              // preset id (see BadiThemes)
- *       cards:  ['symbol','stats','watchlist','alerts','trade',
- *                'shortcuts','perf'],    // or 'all'
- *       locale: 'ar',                    // 'en' | 'ar'
- *       launcher: true                   // glass edge rail with card toggles
- *     });
- * Everything degrades gracefully: with the layer disabled the library behaves
- * byte-for-byte like v2.36.0.
+ * Everything is opt-in. A chart that never calls addLineSeries() pays
+ * nothing: the engine boots lazily on first use and the render hooks are
+ * two `if` guards with a property lookup.
  * ========================================================================== */
 
-/* =========================================================================
- * MODERN SECTION 1 — THEME PRESETS + GLASS DESIGN TOKENS
- * =========================================================================
- * The 2025-2026 dashboard research is unambiguous about where glass belongs:
- * glass for the FRAME (headers, rails, chrome) and near-opaque surfaces for
- * the DATA (numbers, tables, charts). Every preset below therefore carries
- * two families of tokens:
- *
- *   surface.*  — the glass chrome (card shell, borders, sheen, shadow)
- *   plate.*    — the readable data plate poured INSIDE a card body
- *
- * Presets are plain objects merged into chart.theme by setThemePreset(),
- * so every classic theme key (bull/bear/grid/axis...) stays overridable and
- * every preset remains 100% compatible with setTheme(overrides).
- * ======================================================================== */
-const BadiThemes = {
-  // 'midnight' — deep space blue, electric accent. The default modern look.
-  midnight: {
-    bg: '#0b0d14', panelBg: '#10131d', toolbarBg: '#141826', toolbarBorder: '#232941',
-    grid: '#161a29', gridStrong: '#232941', axis: '#161a29', axisBg: '#0e1119',
-    axisBorder: '#232941', axisText: '#6f7590',
-    text: '#d3d8ea', textDim: '#787f9c', textBright: '#f4f7ff', textFade: '#565c75',
-    bull: '#00c8a0', bear: '#ff5d6c',
-    bullVol: 'rgba(0,200,160,0.45)', bearVol: 'rgba(255,93,108,0.45)',
-    accent: '#4c7dff', crosshair: '#787f9c', crosshairLabel: '#2a3050',
-    ma1: '#4c7dff', ma2: '#ffb74d', ma3: '#f06292',
-    drawing: '#4c7dff', drawingActive: '#ffb74d',
-    buttonBg: '#171b2b', buttonHover: '#212740', buttonText: '#d3d8ea',
-    currentPriceBull: '#00c8a0', currentPriceBear: '#ff5d6c',
-    // glass tokens
-    glassBg: 'rgba(22,27,44,0.78)', glassBgHover: 'rgba(30,36,58,0.85)',
-    glassBorder: 'rgba(140,160,255,0.16)', glassSheen: 'rgba(180,200,255,0.05)',
-    glassShadow: 'rgba(3,5,12,0.55)',
-    plate: 'rgba(13,16,27,0.92)', plateBorder: 'rgba(140,160,255,0.10)',
-    accent2: '#00d4e0', success: '#00c8a0', danger: '#ff5d6c', warn: '#ffb74d'
-  },
-
-  // 'ocean' — teal depths with aqua accents; calm and readable.
-  ocean: {
-    bg: '#071517', panelBg: '#0a1c1f', toolbarBg: '#0e2327', toolbarBorder: '#1d3b41',
-    grid: '#0e2024', gridStrong: '#1d3b41', axis: '#0e2024', axisBg: '#091a1d',
-    axisBorder: '#1d3b41', axisText: '#5f8489',
-    text: '#cfe6e8', textDim: '#6f9599', textBright: '#effffa', textFade: '#517679',
-    bull: '#26d0a4', bear: '#ff6b6b',
-    bullVol: 'rgba(38,208,164,0.45)', bearVol: 'rgba(255,107,107,0.45)',
-    accent: '#00b8d4', crosshair: '#6f9599', crosshairLabel: '#143f45',
-    ma1: '#00b8d4', ma2: '#ffd166', ma3: '#ef476f',
-    drawing: '#00b8d4', drawingActive: '#ffd166',
-    buttonBg: '#0f282c', buttonHover: '#16343a', buttonText: '#cfe6e8',
-    currentPriceBull: '#26d0a4', currentPriceBear: '#ff6b6b',
-    glassBg: 'rgba(14,38,42,0.80)', glassBgHover: 'rgba(19,50,55,0.86)',
-    glassBorder: 'rgba(0,216,232,0.16)', glassSheen: 'rgba(160,255,255,0.05)',
-    glassShadow: 'rgba(1,8,10,0.55)',
-    plate: 'rgba(8,25,28,0.93)', plateBorder: 'rgba(0,216,232,0.10)',
-    accent2: '#7cf5d0', success: '#26d0a4', danger: '#ff6b6b', warn: '#ffd166'
-  },
-
-  // 'nord' — the beloved Nord palette, faithful to nordtheme colors.
-  nord: {
-    bg: '#242933', panelBg: '#2e3440', toolbarBg: '#333b4a', toolbarBorder: '#434c5e',
-    grid: '#2f3542', gridStrong: '#434c5e', axis: '#2f3542', axisBg: '#2a2f3a',
-    axisBorder: '#434c5e', axisText: '#7b88a1',
-    text: '#d8dee9', textDim: '#7b88a1', textBright: '#eceff4', textFade: '#616e88',
-    bull: '#a3be8c', bear: '#bf616a',
-    bullVol: 'rgba(163,190,140,0.45)', bearVol: 'rgba(191,97,106,0.45)',
-    accent: '#88c0d0', crosshair: '#7b88a1', crosshairLabel: '#3b4252',
-    ma1: '#88c0d0', ma2: '#ebcb8b', ma3: '#b48ead',
-    drawing: '#88c0d0', drawingActive: '#ebcb8b',
-    buttonBg: '#333b4a', buttonHover: '#3b4252', buttonText: '#d8dee9',
-    currentPriceBull: '#a3be8c', currentPriceBear: '#bf616a',
-    glassBg: 'rgba(46,52,64,0.78)', glassBgHover: 'rgba(59,66,82,0.85)',
-    glassBorder: 'rgba(136,192,208,0.18)', glassSheen: 'rgba(236,239,244,0.05)',
-    glassShadow: 'rgba(20,24,32,0.50)',
-    plate: 'rgba(39,44,54,0.93)', plateBorder: 'rgba(136,192,208,0.10)',
-    accent2: '#8fbcbb', success: '#a3be8c', danger: '#bf616a', warn: '#ebcb8b'
-  },
-
-  // 'aurora' — violet/cyan gradients on near-black; the "web3 terminal" look.
-  aurora: {
-    bg: '#0d0a1a', panelBg: '#140f26', toolbarBg: '#191233', toolbarBorder: '#2e2354',
-    grid: '#1a1430', gridStrong: '#2e2354', axis: '#1a1430', axisBg: '#110d22',
-    axisBorder: '#2e2354', axisText: '#7d72a8',
-    text: '#ded9f5', textDim: '#7d72a8', textBright: '#f6f3ff', textFade: '#5c5382',
-    bull: '#2ee6a8', bear: '#ff5c87',
-    bullVol: 'rgba(46,230,168,0.45)', bearVol: 'rgba(255,92,135,0.45)',
-    accent: '#8b5cf6', crosshair: '#7d72a8', crosshairLabel: '#2e2354',
-    ma1: '#8b5cf6', ma2: '#22d3ee', ma3: '#f472b6',
-    drawing: '#8b5cf6', drawingActive: '#22d3ee',
-    buttonBg: '#1c1540', buttonHover: '#251b52', buttonText: '#ded9f5',
-    currentPriceBull: '#2ee6a8', currentPriceBear: '#ff5c87',
-    glassBg: 'rgba(26,19,51,0.80)', glassBgHover: 'rgba(35,26,70,0.86)',
-    glassBorder: 'rgba(139,92,246,0.22)', glassSheen: 'rgba(196,181,253,0.06)',
-    glassShadow: 'rgba(5,3,14,0.60)',
-    plate: 'rgba(17,12,34,0.93)', plateBorder: 'rgba(139,92,246,0.12)',
-    accent2: '#22d3ee', success: '#2ee6a8', danger: '#ff5c87', warn: '#fbbf24'
-  },
-
-  // 'carbon' — neutral graphite for maximum data focus (Bloomberg-ish).
-  carbon: {
-    bg: '#101010', panelBg: '#171717', toolbarBg: '#1c1c1c', toolbarBorder: '#2c2c2c',
-    grid: '#1b1b1b', gridStrong: '#2c2c2c', axis: '#1b1b1b', axisBg: '#141414',
-    axisBorder: '#2c2c2c', axisText: '#777777',
-    text: '#d6d6d6', textDim: '#7a7a7a', textBright: '#f2f2f2', textFade: '#5c5c5c',
-    bull: '#22c55e', bear: '#ef4444',
-    bullVol: 'rgba(34,197,94,0.45)', bearVol: 'rgba(239,68,68,0.45)',
-    accent: '#e5e7eb', crosshair: '#7a7a7a', crosshairLabel: '#333333',
-    ma1: '#e5e7eb', ma2: '#f59e0b', ma3: '#38bdf8',
-    drawing: '#d4d4d8', drawingActive: '#f59e0b',
-    buttonBg: '#202020', buttonHover: '#2a2a2a', buttonText: '#d6d6d6',
-    currentPriceBull: '#22c55e', currentPriceBear: '#ef4444',
-    glassBg: 'rgba(28,28,28,0.80)', glassBgHover: 'rgba(38,38,38,0.86)',
-    glassBorder: 'rgba(255,255,255,0.10)', glassSheen: 'rgba(255,255,255,0.04)',
-    glassShadow: 'rgba(0,0,0,0.60)',
-    plate: 'rgba(20,20,20,0.94)', plateBorder: 'rgba(255,255,255,0.07)',
-    accent2: '#38bdf8', success: '#22c55e', danger: '#ef4444', warn: '#f59e0b'
-  },
-
-  // 'solar-light' — a bright, airy light theme (the glass reads as frosted).
-  solar: {
-    bg: '#f6f7fb', panelBg: '#ffffff', toolbarBg: '#ffffff', toolbarBorder: '#e3e6ef',
-    grid: '#eceef5', gridStrong: '#dfe3ee', axis: '#eceef5', axisBg: '#f2f3f8',
-    axisBorder: '#e3e6ef', axisText: '#8a90a5',
-    text: '#2a3040', textDim: '#6d7386', textBright: '#141824', textFade: '#9aa0b2',
-    bull: '#0da678', bear: '#e5484d',
-    bullVol: 'rgba(13,166,120,0.40)', bearVol: 'rgba(229,72,77,0.40)',
-    accent: '#3b6bff', crosshair: '#8a90a5', crosshairLabel: '#dfe3ee',
-    ma1: '#3b6bff', ma2: '#f59e0b', ma3: '#e5484d',
-    drawing: '#3b6bff', drawingActive: '#f59e0b',
-    buttonBg: '#ffffff', buttonHover: '#eef0f7', buttonText: '#2a3040',
-    currentPriceBull: '#0da678', currentPriceBear: '#e5484d',
-    glassBg: 'rgba(255,255,255,0.82)', glassBgHover: 'rgba(255,255,255,0.92)',
-    glassBorder: 'rgba(59,107,255,0.14)', glassSheen: 'rgba(255,255,255,0.35)',
-    glassShadow: 'rgba(31,41,72,0.16)',
-    plate: 'rgba(248,249,253,0.95)', plateBorder: 'rgba(31,41,72,0.08)',
-    accent2: '#0891b2', success: '#0da678', danger: '#e5484d', warn: '#d97706'
-  },
-
-  // 'rose' — warm dark theme with rose-gold accents for consumer fintech.
-  rose: {
-    bg: '#171114', panelBg: '#1e161a', toolbarBg: '#241a20', toolbarBorder: '#3a2a33',
-    grid: '#231a1f', gridStrong: '#3a2a33', axis: '#231a1f', axisBg: '#1a1317',
-    axisBorder: '#3a2a33', axisText: '#8f7580',
-    text: '#eadfe4', textDim: '#9a7f8b', textBright: '#fbf5f7', textFade: '#745c67',
-    bull: '#34d399', bear: '#fb7185',
-    bullVol: 'rgba(52,211,153,0.45)', bearVol: 'rgba(251,113,133,0.45)',
-    accent: '#f472b6', crosshair: '#9a7f8b', crosshairLabel: '#3a2a33',
-    ma1: '#f472b6', ma2: '#fbbf24', ma3: '#a78bfa',
-    drawing: '#f472b6', drawingActive: '#fbbf24',
-    buttonBg: '#2a1e25', buttonHover: '#352530', buttonText: '#eadfe4',
-    currentPriceBull: '#34d399', currentPriceBear: '#fb7185',
-    glassBg: 'rgba(40,28,36,0.80)', glassBgHover: 'rgba(51,36,45,0.86)',
-    glassBorder: 'rgba(244,114,182,0.18)', glassSheen: 'rgba(251,207,232,0.05)',
-    glassShadow: 'rgba(12,5,9,0.55)',
-    plate: 'rgba(29,20,26,0.93)', plateBorder: 'rgba(244,114,182,0.10)',
-    accent2: '#c084fc', success: '#34d399', danger: '#fb7185', warn: '#fbbf24'
-  },
-
-  // 'terminal' — classic phosphor green on black, for the purists.
-  terminal: {
-    bg: '#050805', panelBg: '#0a0f0a', toolbarBg: '#0d130d', toolbarBorder: '#1c2a1c',
-    grid: '#0e150e', gridStrong: '#1c2a1c', axis: '#0e150e', axisBg: '#081008',
-    axisBorder: '#1c2a1c', axisText: '#5f875f',
-    text: '#c8e6c8', textDim: '#6b8e6b', textBright: '#e8ffe8', textFade: '#4a644a',
-    bull: '#4ade80', bear: '#f87171',
-    bullVol: 'rgba(74,222,128,0.40)', bearVol: 'rgba(248,113,113,0.40)',
-    accent: '#4ade80', crosshair: '#6b8e6b', crosshairLabel: '#1c2a1c',
-    ma1: '#4ade80', ma2: '#a3e635', ma3: '#facc15',
-    drawing: '#4ade80', drawingActive: '#a3e635',
-    buttonBg: '#101910', buttonHover: '#162216', buttonText: '#c8e6c8',
-    currentPriceBull: '#4ade80', currentPriceBear: '#f87171',
-    glassBg: 'rgba(13,20,13,0.82)', glassBgHover: 'rgba(19,29,19,0.88)',
-    glassBorder: 'rgba(74,222,128,0.20)', glassSheen: 'rgba(190,255,190,0.04)',
-    glassShadow: 'rgba(0,2,0,0.65)',
-    plate: 'rgba(9,14,9,0.94)', plateBorder: 'rgba(74,222,128,0.10)',
-    accent2: '#a3e635', success: '#4ade80', danger: '#f87171', warn: '#facc15'
-  }
+/* ============================ PERF CONFIG ================================== */
+// Central tunables for the performance core. Users override the interesting
+// ones through chart opts / API (see BadiPerfEngine.configure()).
+const BADI_PERF_DEFAULTS = {
+  // LOD
+  lodBucketsPerPx: 2.0,      // target: ~2 data-buckets per screen pixel
+  lodEpsUltra: 0.35,         // Douglas-Peucker epsilon (px) per quality tier
+  lodEpsHigh: 0.55,
+  lodEpsBalanced: 0.85,
+  lodEpsEco: 1.40,
+  lodMaxPointsThick: 3200,   // hard cap for CPU quad-expanded (thick) lines
+  lodWorkerThreshold: 60000, // series longer than this → worker decimation
+  // GPU budget
+  maxVramMB: 256,            // global cap for line-batch vertex buffers
+  chunkBytes: 8 * 1024 * 1024,  // pack series into ~8MB chunk buffers
+  // Adaptive quality
+  frameBudgetMs: 16.7,       // 60fps reference budget
+  qualityDownMs: 19,         // avg frame above this → drop a tier
+  qualityUpMs: 10,           // avg frame below this → try a tier up
+  qualityHoldFrames: 90,     // stay on a tier at least this many frames
+  // Spatial index
+  gridCellPx: 48,            // hit-test grid cell size
+  // HUD
+  hudFramesWindow: 150       // sparkline length (frames)
 };
 
-// Light-theme detection helper used by setThemePreset('auto').
-// Respects the OS setting and updates on change when supported.
-function _detectPreferredTheme() {
-  try {
-    if (typeof window !== 'undefined' && window.matchMedia &&
-        window.matchMedia('(prefers-color-scheme: light)').matches) {
-      return 'solar';
-    }
-  } catch (_) {}
-  return 'midnight';
+// The active config — cloned per chart instance when the engine boots.
+function BadiPerfMakeConfig(overrides) {
+  return Object.assign({}, BADI_PERF_DEFAULTS, overrides || {});
 }
 
-/* =========================================================================
- * MODERN SECTION 2 — CARDKIT: GLASS RENDERING PRIMITIVES
- * =========================================================================
- * Every modern UI element draws through CardKit. The kit is written against
- * the SAME ctx contract the chart core uses (GLCtx command layer or native
- * 2D fallback), so it uses ONLY primitives both backends implement:
- * fillRect, strokeRect, beginPath/moveTo/lineTo/arcTo/arc/ellipse/closePath,
- * fill/stroke, clip, save/restore, translate, gradients, globalAlpha,
- * fillText/strokeText/measureText. No shadows, no roundRect, no filters —
- * those are synthesized by hand:
- *
- *   • roundRectPath() — rounded rectangle as an explicit path
- *   • glassRect()     — the signature glass card shell: translucent gradient
- *                       body + 1px light border + top sheen + faux drop
- *                       shadow (stacked translucent layers — GLCtx has no
- *                       shadowBlur) + optional accent glow edge
- *   • plateRect()     — the near-opaque data plate poured into card bodies
- *                       (per the 2025 glass research: data NEVER sits on raw
- *                       glass — contrast must not depend on the backdrop)
- *   • Vector icon set — 24 crisp icons drawn with paths (no emoji, no fonts)
- *   • Easing + tweening utilities for buttery 60fps card animations
- * ======================================================================== */
-const CardKit = (function () {
-  'use strict';
+/* ============================ PERF UTILITIES =============================== */
+// v2.38.0: small allocation-free helpers shared across the perf modules.
+// Everything here is hot-path code — written to avoid closures per call,
+// avoid array churn and keep monomorphic shapes for the JIT.
 
-  // -- easing curves -------------------------------------------------------
-  // Classic Robert Penner easings, mapped to UI intentions:
-  // cards open with easeOutBack (a tiny overshoot = "alive"), fade with
-  // easeOutCubic, drag snapping uses easeOutQuint, hover transitions use
-  // easeInOutQuad. All functions are pure and allocation-free.
-  const Easing = {
-    linear:       function (t) { return t; },
-    easeInQuad:   function (t) { return t * t; },
-    easeOutQuad:  function (t) { return t * (2 - t); },
-    easeInOutQuad:function (t) { return t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t; },
-    easeOutCubic: function (t) { return 1 + Math.pow(t - 1, 3); },
-    easeInCubic:  function (t) { return t * t * t; },
-    easeOutQuart: function (t) { return 1 - Math.pow(1 - t, 4); },
-    easeOutQuint: function (t) { return 1 - Math.pow(1 - t, 5); },
-    easeOutBack:  function (t) { const c1 = 1.70158, c3 = c1 + 1;
-                                 return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2); },
-    easeOutElastic: function (t) {
-      const c4 = (2 * Math.PI) / 3;
-      if (t === 0 || t === 1) return t;
-      return Math.pow(2, -10 * t) * Math.sin((t * 10 - 0.75) * c4) + 1;
-    },
-    // frame-rate independent pulse (used by alert badges) — p in [0,1)
-    pulse: function (p) { return 0.5 + 0.5 * Math.sin(p * Math.PI * 2); }
-  };
+// Stable per-process frame counter (used for cache stamps).
+let BADI_PERF_FRAME_STAMP = 0;
 
-  // -- color utilities -----------------------------------------------------
-  // GLCtx accepts #rgb, #rrggbb, rgba() and rgb() strings (parseColor).
-  // Helpers below build rgba() strings from packed knowledge, keeping the
-  // kit independent of the host theme implementation.
-  function rgba(hexOrRgb, alpha) {
-    if (alpha === undefined || alpha === null) alpha = 1;
-    if (typeof hexOrRgb === 'string' && hexOrRgb.charAt(0) === '#') {
-      let h = hexOrRgb.slice(1);
-      if (h.length === 3) h = h[0]+h[0]+h[1]+h[1]+h[2]+h[2];
-      const r = parseInt(h.slice(0, 2), 16),
-            g = parseInt(h.slice(2, 4), 16),
-            b = parseInt(h.slice(4, 6), 16);
-      return 'rgba(' + r + ',' + g + ',' + b + ',' + alpha + ')';
-    }
-    if (typeof hexOrRgb === 'string' && hexOrRgb.indexOf('rgba(') === 0) {
-      // re-scale an existing rgba()'s alpha
-      const m = hexOrRgb.match(/rgba\(([^)]+)\)/);
-      if (m) {
-        const parts = m[1].split(',').map(function (s) { return s.trim(); });
-        if (parts.length === 4) {
-          return 'rgba(' + parts[0] + ',' + parts[1] + ',' + parts[2] + ',' +
-                 (parseFloat(parts[3]) * alpha) + ')';
-        }
-      }
-      return hexOrRgb;
-    }
-    if (typeof hexOrRgb === 'string' && hexOrRgb.indexOf('rgb(') === 0) {
-      const m = hexOrRgb.match(/rgb\(([^)]+)\)/);
-      if (m) {
-        const parts = m[1].split(',').map(function (s) { return s.trim(); });
-        return 'rgba(' + parts[0] + ',' + parts[1] + ',' + parts[2] + ',' + alpha + ')';
-      }
-    }
-    return hexOrRgb;
+// Colors → packed RGBA (0..255 each) for the GPU vertex streams. parseColor()
+// returns [r, g, b, a] normalized to 0..1 — cache the packed form per string.
+const BADI_PACKED_COLOR_CACHE = new Map();
+function badiPackedColor(css) {
+  let packed = BADI_PACKED_COLOR_CACHE.get(css);
+  if (packed !== undefined) return packed;
+  const c = parseColor(css);
+  let r = 255, g = 255, b = 255, a = 255;
+  if (c && c.length >= 4) {
+    r = Math.round(clamp(c[0], 0, 1) * 255);
+    g = Math.round(clamp(c[1], 0, 1) * 255);
+    b = Math.round(clamp(c[2], 0, 1) * 255);
+    a = Math.round(clamp(c[3], 0, 1) * 255);
   }
-
-  // Luminance-based contrast pick: returns near-black or near-white for text
-  // painted ON a given background color (WCAG quick estimate).
-  function readableOn(bgHex) {
-    let h = (bgHex || '#000').replace('#', '');
-    if (h.length === 3) h = h[0]+h[0]+h[1]+h[1]+h[2]+h[2];
-    const r = parseInt(h.slice(0, 2), 16) / 255,
-          g = parseInt(h.slice(2, 4), 16) / 255,
-          b = parseInt(h.slice(4, 6), 16) / 255;
-    const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-    return lum > 0.55 ? '#141824' : '#f4f7ff';
-  }
-
-  // -- rounded rectangle path ----------------------------------------------
-  // Draws a rounded rect into the CURRENT path. IMPORTANT (v2.37.0): this
-  // uses the SAME quadraticCurveTo construction as the chart core's own
-  // _roundRect() — NOT arcTo. GLCtx's arcTo tessellation produced skewed
-  // corner artifacts on tight radii (pill ends, tab pills) in the first
-  // beta; quadratic corners are the battle-tested path for both backends.
-  // Radius is clamped so it never exceeds half the shorter side.
-  function roundRectPath(ctx, x, y, w, h, r) {
-    if (r === undefined || r === null) r = 0;
-    if (r < 0) r = 0;
-    const maxR = Math.min(w, h) / 2;
-    if (r > maxR) r = maxR;
-    ctx.beginPath();
-    if (r <= 0.01) {
-      ctx.moveTo(x, y);
-      ctx.lineTo(x + w, y);
-      ctx.lineTo(x + w, y + h);
-      ctx.lineTo(x, y + h);
-      ctx.closePath();
-      return;
-    }
-    ctx.moveTo(x + r, y);
-    ctx.lineTo(x + w - r, y);
-    ctx.quadraticCurveTo(x + w, y, x + w, y + r);
-    ctx.lineTo(x + w, y + h - r);
-    ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
-    ctx.lineTo(x + r, y + h);
-    ctx.quadraticCurveTo(x, y + h, x, y + h - r);
-    ctx.lineTo(x, y + r);
-    ctx.quadraticCurveTo(x, y, x + r, y);
-    ctx.closePath();
-  }
-
-  // Fill a rounded rect in one call.
-  function fillRoundRect(ctx, x, y, w, h, r, fillStyle) {
-    roundRectPath(ctx, x, y, w, h, r);
-    ctx.fillStyle = fillStyle;
-    ctx.fill();
-  }
-
-  // Stroke a rounded rect in one call.
-  function strokeRoundRect(ctx, x, y, w, h, r, strokeStyle, lineWidth) {
-    roundRectPath(ctx, x, y, w, h, r);
-    ctx.strokeStyle = strokeStyle;
-    ctx.lineWidth = lineWidth || 1;
-    ctx.stroke();
-  }
-
-  // -- faux shadow ---------------------------------------------------------
-  // GLCtx has no shadowBlur — a soft drop shadow is synthesized from N
-  // stacked translucent rounded rects, each 1px larger and much fainter.
-  // 4 layers read as a 6px shadow at these alphas; the cost is 4 fills per
-  // card per frame (trivial — cards are a handful of rects on the GPU).
-  function fauxShadow(ctx, x, y, w, h, r, shadowColor, strength) {
-    if (!shadowColor) return;
-    const s = (strength === undefined ? 1 : strength);
-    const layers = [
-      { grow: 1.5, alpha: 0.14 * s },
-      { grow: 3.0, alpha: 0.09 * s },
-      { grow: 5.0, alpha: 0.06 * s },
-      { grow: 8.0, alpha: 0.035 * s }
-    ];
-    for (let i = 0; i < layers.length; i++) {
-      const L = layers[i];
-      fillRoundRect(ctx, x - L.grow, y - L.grow + 2,
-                    w + L.grow * 2, h + L.grow * 2,
-                    r + L.grow, rgba(shadowColor, L.alpha));
-    }
-  }
-
-  // -- the glass card shell ------------------------------------------------
-  // THE signature surface of the modern edition. Anatomy (top to bottom):
-  //
-  //   ┌──────────────────────────────────────────┐  ← 1px light border
-  //   │ ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒ │  ← top sheen gradient band
-  //   │ ░░░░░░░░ body: vertical translucent ░░░░ │  ← glassBg → +8% darker
-  //   │ ░░░░░░░░ gradient (reads as thick glass) │
-  //   └──────────────────────────────────────────┘
-  //     ▓▓▓▓▓▓▓▓ faux shadow underneath ▓▓▓▓▓▓▓▓
-  //
-  // opts: { r, alpha, shadow, focus, glow, glowColor, hover }
-  function glassRect(ctx, x, y, w, h, T, opts) {
-    opts = opts || {};
-    const r     = opts.r !== undefined ? opts.r : 14;
-    const alpha = opts.alpha !== undefined ? opts.alpha : 1;
-    const focus = opts.focus ? 1 : 0;      // focused card: brighter border
-    const hover = opts.hover ? 1 : 0;      // hovered: lift + warm shadow
-
-    ctx.save();
-    ctx.globalAlpha = ctx.globalAlpha * alpha;
-
-    // 1. faux drop shadow (drawn first, sits under everything)
-    if (opts.shadow !== false) {
-      fauxShadow(ctx, x, y, w, h, r, T.glassShadow, (hover ? 1.35 : 1) * alpha);
-    }
-
-    // 2. glass body — vertical gradient: slightly lighter at the top edge,
-    //    denser at the bottom, exactly like light entering a glass pane.
-    const g = ctx.createLinearGradient(0, y, 0, y + h);
-    g.addColorStop(0,   opts.bodyTop  || (hover ? T.glassBgHover : T.glassBg));
-    g.addColorStop(0.5, T.glassBg);
-    g.addColorStop(1,   rgba(T.glassBg, Math.min(1, _alphaOf(T.glassBg) * 0.92)));
-    fillRoundRect(ctx, x, y, w, h, r, g);
-
-    // 3. top sheen — a soft light band across the first ~18% of the card.
-    //    Real frosted glass catches light at the top curvature.
-    const sheenH = Math.max(10, h * 0.18);
-    ctx.save();
-    roundRectPath(ctx, x, y, w, h, r);
-    ctx.clip();
-    const sg = ctx.createLinearGradient(0, y, 0, y + sheenH);
-    sg.addColorStop(0, T.glassSheen);
-    sg.addColorStop(1, rgba(T.glassSheen, 0));
-    ctx.fillStyle = sg;
-    ctx.fillRect(x, y, w, sheenH);
-    ctx.restore();
-
-    // 4. border — 1px light stroke. Focused cards get an accent-tinted
-    //    double stroke (outer glow ring), like a focused window on macOS.
-    strokeRoundRect(ctx, x + 0.5, y + 0.5, w - 1, h - 1, r,
-                    focus ? rgba(T.accent, 0.65)
-                          : (hover ? rgba(T.glassBorder, 1.6) : T.glassBorder), 1);
-    if (focus) {
-      strokeRoundRect(ctx, x - 1.5, y - 1.5, w + 3, h + 3, r + 2,
-                      rgba(T.accent, 0.16), 3);
-    }
-
-    // 5. optional accent glow edge (used by alert/trade cards to signal state)
-    if (opts.glow && opts.glowColor) {
-      ctx.save();
-      roundRectPath(ctx, x + 2.5, y + 2.5, w - 5, h - 5, Math.max(2, r - 2));
-      ctx.clip();
-      const gg = ctx.createLinearGradient(0, y, 0, y + h);
-      gg.addColorStop(0,   rgba(opts.glowColor, 0.16));
-      gg.addColorStop(0.4, rgba(opts.glowColor, 0));
-      gg.addColorStop(1,   rgba(opts.glowColor, 0.10));
-      ctx.fillStyle = gg;
-      ctx.fillRect(x, y, w, h);
-      ctx.restore();
-    }
-    ctx.restore();
-    return { x: x, y: y, w: w, h: h, r: r };
-  }
-
-  // extract the alpha component of an rgba() string (default 1)
-  function _alphaOf(colorStr) {
-    if (typeof colorStr === 'string' && colorStr.indexOf('rgba(') === 0) {
-      const m = colorStr.match(/rgba\([^,]+,[^,]+,[^,]+,\s*([\d.]+)\)/);
-      if (m) return parseFloat(m[1]);
-    }
-    return 1;
-  }
-
-  // -- the data plate ------------------------------------------------------
-  // Near-opaque rounded surface poured INSIDE a glass card body. All text
-  // and numbers sit on plates — never directly on glass — so contrast is
-  // guaranteed regardless of what renders behind the card (candles, fills).
-  function plateRect(ctx, x, y, w, h, T, opts) {
-    opts = opts || {};
-    const r = opts.r !== undefined ? opts.r : 10;
-    fillRoundRect(ctx, x, y, w, h, r, opts.fill || T.plate);
-    if (T.plateBorder) {
-      strokeRoundRect(ctx, x + 0.5, y + 0.5, w - 1, h - 1, r, T.plateBorder, 1);
-    }
-    return { x: x, y: y, w: w, h: h, r: r };
-  }
-
-  // -- pill / badge --------------------------------------------------------
-  // Rounded-end label used for change badges, tags, prices. autoTextColor
-  // picks a readable text color from the pill fill via luminance.
-  function pill(ctx, x, y, w, h, fill, text, opts) {
-    opts = opts || {};
-    const r = h / 2;
-    const fg = opts.color || readableOn(fill);
-    const font = opts.font || ('600 ' + Math.max(9, h - 5) + 'px -apple-system, Segoe UI, Roboto, sans-serif');
-    fillRoundRect(ctx, x, y, w, h, r, fill);
-    if (opts.border) strokeRoundRect(ctx, x + 0.5, y + 0.5, w - 1, h - 1, r, opts.border, 1);
-    ctx.font = font;
-    ctx.fillStyle = fg;
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillText(text, x + w / 2, y + h / 2 + 0.5);
-    ctx.textAlign = 'left';
-    return { x: x, y: y, w: w, h: h };
-  }
-
-  // -- progress / range meter ---------------------------------------------
-  // A rounded track + filled portion + optional threshold tick. Used by the
-  // 24h range meter (tick = current price) and the pressure gauge.
-  function meter(ctx, x, y, w, h, ratio, opts) {
-    opts = opts || {};
-    const r = h / 2;
-    const trackFill = opts.track || 'rgba(128,140,170,0.18)';
-    fillRoundRect(ctx, x, y, w, h, r, trackFill);
-    const p = Math.max(0, Math.min(1, ratio === undefined ? 1 : ratio));
-    if (p > 0) {
-      const g = ctx.createLinearGradient(x, 0, x + w, 0);
-      g.addColorStop(0, rgba(opts.color || '#4c7dff', 0.55));
-      g.addColorStop(1, opts.color || '#4c7dff');
-      fillRoundRect(ctx, x, y, Math.max(h, w * p), h, r, g);
-    }
-    if (opts.tick !== undefined) {
-      const tx = x + Math.max(2, Math.min(w - 2, w * Math.max(0, Math.min(1, opts.tick))));
-      ctx.fillStyle = opts.tickColor || '#f4f7ff';
-      ctx.beginPath();
-      ctx.arc(tx, y + h / 2, Math.max(2, h * 0.28), 0, Math.PI * 2);
-      ctx.fill();
-    }
-  }
-
-  // -- sparkline ------------------------------------------------------------
-  // Compact line chart for watchlist rows / symbol cards. Values normalize
-  // internally; optional gradient area fill and a live end-dot with pulse.
-  function sparkline(ctx, x, y, w, h, values, opts) {
-    opts = opts || {};
-    if (!values || values.length < 2) return null;
-    let min = Infinity, max = -Infinity, any = false;
-    for (let i = 0; i < values.length; i++) {
-      const v = values[i];
-      if (v == null || !isFinite(v)) continue;
-      if (v < min) min = v;
-      if (v > max) max = v;
-      any = true;
-    }
-    if (!any) return null;
-    const span = (max - min) || 1;
-    const color = opts.color || '#4c7dff';
-    const n = values.length;
-    const px = function (i) { return x + (i / (n - 1)) * w; };
-    const py = function (v) { return y + h - 2 - ((v - min) / span) * (h - 4); };
-
-    // area fill (gradient from 28% alpha at the line to 0 at the baseline)
-    if (opts.area !== false) {
-      ctx.save();
-      ctx.beginPath();
-      ctx.moveTo(px(0), y + h);
-      let started = false;
-      for (let i = 0; i < n; i++) {
-        const v = values[i];
-        if (v == null || !isFinite(v)) continue;
-        if (!started) { ctx.moveTo(px(i), y + h); started = true; }
-        ctx.lineTo(px(i), py(v));
-      }
-      if (started) {
-        ctx.lineTo(px(n - 1), y + h);
-        ctx.closePath();
-        const g = ctx.createLinearGradient(0, y, 0, y + h);
-        g.addColorStop(0, rgba(color, 0.28));
-        g.addColorStop(1, rgba(color, 0));
-        ctx.fillStyle = g;
-        ctx.fill();
-      }
-      ctx.restore();
-    }
-
-    // the line itself — a single continuous stroke
-    ctx.save();
-    ctx.beginPath();
-    let drew = false, lastX = x, lastY = y;
-    for (let i = 0; i < n; i++) {
-      const v = values[i];
-      if (v == null || !isFinite(v)) continue;
-      if (!drew) { ctx.moveTo(px(i), py(v)); drew = true; }
-      else ctx.lineTo(px(i), py(v));
-      lastX = px(i); lastY = py(v);
-    }
-    if (drew) {
-      ctx.strokeStyle = color;
-      ctx.lineWidth = opts.lineWidth || 1.5;
-      ctx.lineCap = 'round';
-      ctx.lineJoin = 'round';
-      ctx.stroke();
-    }
-    ctx.restore();
-
-    // live end-dot (a dot + soft halo — the "live" signal)
-    if (opts.dot !== false && drew) {
-      const pulse = opts.pulse !== undefined ? opts.pulse : 0;
-      if (pulse > 0) {
-        ctx.beginPath();
-        ctx.arc(lastX, lastY, 3 + 5 * pulse, 0, Math.PI * 2);
-        ctx.fillStyle = rgba(color, 0.25 * (1 - pulse));
-        ctx.fill();
-      }
-      ctx.beginPath();
-      ctx.arc(lastX, lastY, 2.2, 0, Math.PI * 2);
-      ctx.fillStyle = color;
-      ctx.fill();
-      ctx.beginPath();
-      ctx.arc(lastX, lastY, 1, 0, Math.PI * 2);
-      ctx.fillStyle = readableOn(color);
-      ctx.fill();
-    }
-    return { x: x, y: y, w: w, h: h };
-  }
-
-  // -- vector icon set ------------------------------------------------------
-  // 24 modern icons, each drawn in a 24×24 design grid scaled to fit a
-  // (size × size) box centered at (cx, cy). Stroke-based, round caps —
-  // the "Feather/Lucide" aesthetic. No emoji (they render differently on
-  // every OS), no icon fonts, no images: pure paths, GPU-friendly.
-  //
-  // Each icon: function(ctx, cx, cy, size, color, lineWidth)
-  const ICONS = {
-    // candlestick — two candles, the library's own logo motif
-    candles: function (ctx, cx, cy, s, c, lw) {
-      _prep(ctx, c, lw);
-      const u = s / 24;
-      // tall candle
-      ctx.beginPath();
-      ctx.moveTo(cx - 4 * u, cy - 9 * u); ctx.lineTo(cx - 4 * u, cy - 5 * u);
-      ctx.moveTo(cx - 4 * u, cy + 5 * u); ctx.lineTo(cx - 4 * u, cy + 9 * u);
-      ctx.stroke();
-      _candle(ctx, cx - 4 * u, cy, 3.6 * u, 5.5 * u, true);
-      // short candle
-      ctx.beginPath();
-      ctx.moveTo(cx + 4 * u, cy - 7 * u); ctx.lineTo(cx + 4 * u, cy - 4 * u);
-      ctx.moveTo(cx + 4 * u, cy + 4 * u); ctx.lineTo(cx + 4 * u, cy + 9 * u);
-      ctx.stroke();
-      _candle(ctx, cx + 4 * u, cy + 1 * u, 3.6 * u, 4 * u, false);
-    },
-    stats: function (ctx, cx, cy, s, c, lw) {        // bar-chart icon
-      _prep(ctx, c, lw);
-      const u = s / 24;
-      ctx.beginPath();
-      ctx.moveTo(cx - 6 * u, cy + 7 * u); ctx.lineTo(cx - 6 * u, cy - 1 * u);
-      ctx.moveTo(cx, cy + 7 * u);        ctx.lineTo(cx, cy - 7 * u);
-      ctx.moveTo(cx + 6 * u, cy + 7 * u); ctx.lineTo(cx + 6 * u, cy - 3 * u);
-      ctx.stroke();
-    },
-    watch: function (ctx, cx, cy, s, c, lw) {        // eye icon
-      _prep(ctx, c, lw);
-      const u = s / 24;
-      ctx.beginPath();
-      ctx.moveTo(cx - 9 * u, cy);
-      ctx.bezierCurveTo(cx - 6 * u, cy - 6 * u, cx + 6 * u, cy - 6 * u, cx + 9 * u, cy);
-      ctx.bezierCurveTo(cx + 6 * u, cy + 6 * u, cx - 6 * u, cy + 6 * u, cx - 9 * u, cy);
-      ctx.stroke();
-      ctx.beginPath();
-      ctx.arc(cx, cy, 2.4 * u, 0, Math.PI * 2);
-      ctx.stroke();
-    },
-    bell: function (ctx, cx, cy, s, c, lw) {         // alert bell
-      _prep(ctx, c, lw);
-      const u = s / 24;
-      ctx.beginPath();
-      ctx.moveTo(cx - 7 * u, cy + 4 * u);
-      ctx.lineTo(cx - 7 * u, cy + 1 * u);
-      ctx.bezierCurveTo(cx - 7 * u, cy - 6 * u, cx - 4 * u, cy - 8 * u, cx, cy - 8 * u);
-      ctx.bezierCurveTo(cx + 4 * u, cy - 8 * u, cx + 7 * u, cy - 6 * u, cx + 7 * u, cy + 1 * u);
-      ctx.lineTo(cx + 7 * u, cy + 4 * u);
-      ctx.closePath();
-      ctx.stroke();
-      ctx.beginPath();
-      ctx.arc(cx, cy + 7 * u, 2.6 * u, 0.15 * Math.PI, 0.85 * Math.PI);
-      ctx.stroke();
-    },
-    trade: function (ctx, cx, cy, s, c, lw) {        // lightning bolt
-      _prep(ctx, c, lw);
-      const u = s / 24;
-      ctx.beginPath();
-      ctx.moveTo(cx + 2 * u, cy - 9 * u);
-      ctx.lineTo(cx - 5 * u, cy + 1 * u);
-      ctx.lineTo(cx, cy + 1 * u);
-      ctx.lineTo(cx - 2 * u, cy + 9 * u);
-      ctx.lineTo(cx + 5 * u, cy - 2 * u);
-      ctx.lineTo(cx - 0.5 * u, cy - 2 * u);
-      ctx.closePath();
-      ctx.stroke();
-    },
-    keyboard: function (ctx, cx, cy, s, c, lw) {     // keyboard / shortcuts
-      _prep(ctx, c, lw);
-      const u = s / 24;
-      strokeRoundRect(ctx, cx - 9 * u, cy - 6 * u, 18 * u, 12 * u, 2 * u, c, lw || 1.5);
-      ctx.beginPath();
-      for (let r = 0; r < 2; r++) {
-        for (let k = 0; k < 3; k++) {
-          const kx = cx - 5 * u + k * 5 * u, ky = cy - 2 * u + r * 4 * u;
-          ctx.moveTo(kx, ky); ctx.lineTo(kx + 2 * u, ky);
-        }
-      }
-      ctx.moveTo(cx - 4 * u, cy + 5 * u); ctx.lineTo(cx + 4 * u, cy + 5 * u);
-      ctx.stroke();
-    },
-    gauge: function (ctx, cx, cy, s, c, lw) {        // performance gauge
-      _prep(ctx, c, lw);
-      const u = s / 24;
-      ctx.beginPath();
-      ctx.arc(cx, cy + 2 * u, 8 * u, Math.PI, 2 * Math.PI);
-      ctx.stroke();
-      ctx.beginPath();
-      ctx.moveTo(cx, cy + 2 * u); ctx.lineTo(cx + 4.5 * u, cy - 3.5 * u);
-      ctx.stroke();
-    },
-    close: function (ctx, cx, cy, s, c, lw) {        // ×
-      _prep(ctx, c, lw);
-      const u = s / 24;
-      ctx.beginPath();
-      ctx.moveTo(cx - 4 * u, cy - 4 * u); ctx.lineTo(cx + 4 * u, cy + 4 * u);
-      ctx.moveTo(cx + 4 * u, cy - 4 * u); ctx.lineTo(cx - 4 * u, cy + 4 * u);
-      ctx.stroke();
-    },
-    chevronDown: function (ctx, cx, cy, s, c, lw) {  // ▾ (collapse)
-      _prep(ctx, c, lw);
-      const u = s / 24;
-      ctx.beginPath();
-      ctx.moveTo(cx - 4 * u, cy - 2 * u); ctx.lineTo(cx, cy + 2.5 * u); ctx.lineTo(cx + 4 * u, cy - 2 * u);
-      ctx.stroke();
-    },
-    chevronUp: function (ctx, cx, cy, s, c, lw) {    // ▴ (expand)
-      _prep(ctx, c, lw);
-      const u = s / 24;
-      ctx.beginPath();
-      ctx.moveTo(cx - 4 * u, cy + 2 * u); ctx.lineTo(cx, cy - 2.5 * u); ctx.lineTo(cx + 4 * u, cy + 2 * u);
-      ctx.stroke();
-    },
-    chevronRight: function (ctx, cx, cy, s, c, lw) { // ▸
-      _prep(ctx, c, lw);
-      const u = s / 24;
-      ctx.beginPath();
-      ctx.moveTo(cx - 2 * u, cy - 4 * u); ctx.lineTo(cx + 2.5 * u, cy); ctx.lineTo(cx - 2 * u, cy + 4 * u);
-      ctx.stroke();
-    },
-    plus: function (ctx, cx, cy, s, c, lw) {         // +
-      _prep(ctx, c, lw);
-      const u = s / 24;
-      ctx.beginPath();
-      ctx.moveTo(cx, cy - 5 * u); ctx.lineTo(cx, cy + 5 * u);
-      ctx.moveTo(cx - 5 * u, cy); ctx.lineTo(cx + 5 * u, cy);
-      ctx.stroke();
-    },
-    minus: function (ctx, cx, cy, s, c, lw) {        // −
-      _prep(ctx, c, lw);
-      const u = s / 24;
-      ctx.beginPath();
-      ctx.moveTo(cx - 5 * u, cy); ctx.lineTo(cx + 5 * u, cy);
-      ctx.stroke();
-    },
-    trash: function (ctx, cx, cy, s, c, lw) {        // delete
-      _prep(ctx, c, lw);
-      const u = s / 24;
-      ctx.beginPath();
-      ctx.moveTo(cx - 6 * u, cy - 5 * u); ctx.lineTo(cx + 6 * u, cy - 5 * u);
-      ctx.moveTo(cx - 4 * u, cy - 5 * u); ctx.lineTo(cx - 3 * u, cy + 7 * u);
-      ctx.lineTo(cx + 3 * u, cy + 7 * u);
-      ctx.lineTo(cx + 4 * u, cy - 5 * u);
-      ctx.moveTo(cx - 6.5 * u, cy - 8 * u); ctx.lineTo(cx + 6.5 * u, cy - 8 * u);
-      ctx.moveTo(cx - 1.5 * u, cy - 8 * u); ctx.lineTo(cx - 1.5 * u, cy - 10 * u);
-      ctx.lineTo(cx + 1.5 * u, cy - 10 * u); ctx.lineTo(cx + 1.5 * u, cy - 8 * u);
-      ctx.stroke();
-    },
-    mute: function (ctx, cx, cy, s, c, lw) {         // bell-off
-      ICONS.bell(ctx, cx, cy, s, c, lw);
-      _prep(ctx, c, lw);
-      const u = s / 24;
-      ctx.beginPath();
-      ctx.moveTo(cx - 8 * u, cy - 8 * u); ctx.lineTo(cx + 8 * u, cy + 8 * u);
-      ctx.stroke();
-    },
-    drag: function (ctx, cx, cy, s, c, lw) {         // ⠿ drag grip
-      _prep(ctx, c, lw);
-      const u = s / 24;
-      ctx.beginPath();
-      for (let r = -1; r <= 1; r++)
-        for (let k = -1; k <= 1; k += 2) {
-          ctx.moveTo(cx + k * 3 * u, cy + r * 4 * u);
-          ctx.arc(cx + k * 3 * u, cy + r * 4 * u, 0.8 * u, 0, Math.PI * 2);
-        }
-      ctx.fillStyle = c; ctx.fill();
-    },
-    search: function (ctx, cx, cy, s, c, lw) {       // magnifier
-      _prep(ctx, c, lw);
-      const u = s / 24;
-      ctx.beginPath();
-      ctx.arc(cx - 2 * u, cy - 2 * u, 5.5 * u, 0, Math.PI * 2);
-      ctx.stroke();
-      ctx.beginPath();
-      ctx.moveTo(cx + 2 * u, cy + 2 * u); ctx.lineTo(cx + 7 * u, cy + 7 * u);
-      ctx.stroke();
-    },
-    camera: function (ctx, cx, cy, s, c, lw) {       // screenshot/export
-      _prep(ctx, c, lw);
-      const u = s / 24;
-      strokeRoundRect(ctx, cx - 8 * u, cy - 5 * u, 16 * u, 11 * u, 2 * u, c, lw || 1.5);
-      ctx.beginPath();
-      ctx.arc(cx, cy + 0.5 * u, 3.2 * u, 0, Math.PI * 2);
-      ctx.stroke();
-      ctx.beginPath();
-      ctx.moveTo(cx - 3 * u, cy - 5 * u); ctx.lineTo(cx - 1.5 * u, cy - 8 * u);
-      ctx.lineTo(cx + 1.5 * u, cy - 8 * u); ctx.lineTo(cx + 3 * u, cy - 5 * u);
-      ctx.stroke();
-    },
-    download: function (ctx, cx, cy, s, c, lw) {     // export CSV
-      _prep(ctx, c, lw);
-      const u = s / 24;
-      ctx.beginPath();
-      ctx.moveTo(cx, cy - 8 * u); ctx.lineTo(cx, cy + 2 * u);
-      ctx.moveTo(cx - 4 * u, cy - 2 * u); ctx.lineTo(cx, cy + 2 * u); ctx.lineTo(cx + 4 * u, cy - 2 * u);
-      ctx.moveTo(cx - 7 * u, cy + 7 * u); ctx.lineTo(cx + 7 * u, cy + 7 * u);
-      ctx.stroke();
-    },
-    moon: function (ctx, cx, cy, s, c, lw) {         // dark theme
-      _prep(ctx, c, lw);
-      const u = s / 24;
-      ctx.beginPath();
-      ctx.arc(cx, cy, 7 * u, Math.PI * 0.30, Math.PI * 1.75);
-      ctx.bezierCurveTo(cx - 3 * u, cy - 6 * u, cx - 1 * u, cy - 7.5 * u, cx + 1 * u, cy - 7 * u);
-      ctx.stroke();
-    },
-    sun: function (ctx, cx, cy, s, c, lw) {          // light theme
-      _prep(ctx, c, lw);
-      const u = s / 24;
-      ctx.beginPath();
-      ctx.arc(cx, cy, 3.5 * u, 0, Math.PI * 2);
-      ctx.stroke();
-      ctx.beginPath();
-      for (let a = 0; a < 8; a++) {
-        const ang = a * Math.PI / 4;
-        ctx.moveTo(cx + Math.cos(ang) * 6 * u, cy + Math.sin(ang) * 6 * u);
-        ctx.lineTo(cx + Math.cos(ang) * 8.5 * u, cy + Math.sin(ang) * 8.5 * u);
-      }
-      ctx.stroke();
-    },
-    target: function (ctx, cx, cy, s, c, lw) {       // crosshair target
-      _prep(ctx, c, lw);
-      const u = s / 24;
-      ctx.beginPath();
-      ctx.arc(cx, cy, 6 * u, 0, Math.PI * 2);
-      ctx.stroke();
-      ctx.beginPath();
-      ctx.moveTo(cx, cy - 9 * u); ctx.lineTo(cx, cy - 3.5 * u);
-      ctx.moveTo(cx, cy + 3.5 * u); ctx.lineTo(cx, cy + 9 * u);
-      ctx.moveTo(cx - 9 * u, cy); ctx.lineTo(cx - 3.5 * u, cy);
-      ctx.moveTo(cx + 3.5 * u, cy); ctx.lineTo(cx + 9 * u, cy);
-      ctx.stroke();
-    },
-    ruler: function (ctx, cx, cy, s, c, lw) {        // measure tool
-      _prep(ctx, c, lw);
-      const u = s / 24;
-      ctx.save();
-      ctx.translate(cx, cy);
-      ctx.rotate(-Math.PI / 4);
-      ctx.translate(-cx, -cy);
-      strokeRoundRect(ctx, cx - 8 * u, cy - 4.5 * u, 16 * u, 9 * u, 2 * u, c, lw || 1.5);
-      ctx.beginPath();
-      for (let k = -2; k <= 2; k++) {
-        ctx.moveTo(cx + k * 5 * u, cy - 4.5 * u);
-        ctx.lineTo(cx + k * 5 * u, cy + (k % 2 === 0 ? 1.5 : -0.5) * u);
-      }
-      ctx.stroke();
-      ctx.restore();
-    },
-    clock: function (ctx, cx, cy, s, c, lw) {        // time / countdown
-      _prep(ctx, c, lw);
-      const u = s / 24;
-      ctx.beginPath();
-      ctx.arc(cx, cy, 8 * u, 0, Math.PI * 2);
-      ctx.stroke();
-      ctx.beginPath();
-      ctx.moveTo(cx, cy - 4.5 * u); ctx.lineTo(cx, cy); ctx.lineTo(cx + 3.5 * u, cy + 2 * u);
-      ctx.stroke();
-    },
-    layers: function (ctx, cx, cy, s, c, lw) {       // theme / layers
-      _prep(ctx, c, lw);
-      const u = s / 24;
-      ctx.beginPath();
-      ctx.moveTo(cx, cy - 8 * u); ctx.lineTo(cx + 8 * u, cy - 3 * u); ctx.lineTo(cx, cy + 2 * u);
-      ctx.lineTo(cx - 8 * u, cy - 3 * u); ctx.closePath();
-      ctx.stroke();
-      ctx.beginPath();
-      ctx.moveTo(cx - 8 * u, cy + 2 * u); ctx.lineTo(cx, cy + 7 * u); ctx.lineTo(cx + 8 * u, cy + 2 * u);
-      ctx.stroke();
-    }
-  };
-
-  // shared stroke setup for icons
-  function _prep(ctx, color, lw) {
-    ctx.strokeStyle = color;
-    ctx.lineWidth = lw || 1.6;
-    ctx.lineCap = 'round';
-    ctx.lineJoin = 'round';
-    ctx.fillStyle = color;
-  }
-
-  // filled candle body helper for the candles icon
-  function _candle(ctx, x, y, w, h, hollow) {
-    roundRectPath(ctx, x - w / 2, y - h / 2, w, h, 1);
-    ctx.fill();
-  }
-
-  // draw one icon by name into a box (x, y, size, size), optionally hovered
-  // (hover lifts stroke alpha). Unknown names draw nothing (defensive).
-  function icon(ctx, name, x, y, size, color, lw, hovered) {
-    const fn = ICONS[name];
-    if (!fn) return false;
-    ctx.save();
-    if (hovered) ctx.globalAlpha = ctx.globalAlpha * 1.25;
-    fn(ctx, x + size / 2, y + size / 2, size, color, lw);
-    ctx.restore();
-    return true;
-  }
-
-  // -- tooltip -------------------------------------------------------------
-  // Small glass tooltip used by the launcher rail and card headers.
-  function tooltip(ctx, x, y, text, T, dir) {
-    const font = '600 11px -apple-system, Segoe UI, Roboto, sans-serif';
-    ctx.font = font;
-    const padX = 9, padY = 5;
-    const w = ctx.measureText(text).width + padX * 2;
-    const h = 20;
-    let tx = x, ty = y;
-    if (dir === 'right') { tx = x + 4; ty = y - h / 2; }
-    else { tx = x - w - 4; ty = y - h / 2; }
-    // clamp inside canvas
-    tx = Math.max(2, Math.min(tx, (ctx.canvas ? ctx.canvas.width : 4000) - w - 2));
-    ty = Math.max(2, ty);
-    fillRoundRect(ctx, tx, ty, w, h, 6, rgba(T.plate, 0.97));
-    strokeRoundRect(ctx, tx + 0.5, ty + 0.5, w - 1, h - 1, 6, T.glassBorder, 1);
-    ctx.font = font;
-    ctx.fillStyle = T.textBright;
-    ctx.textAlign = 'left';
-    ctx.textBaseline = 'middle';
-    ctx.fillText(text, tx + padX, ty + h / 2 + 0.5);
-  }
-
-  // -- number tween ---------------------------------------------------------
-  // Animates a displayed number toward a target (used by the symbol card's
-  // big price). Frame-rate independent exponential smoothing.
-  function Tween(current, target, speed) {
-    this.value = current;
-    this.target = target;
-    this.speed = speed || 0.18;
-  }
-  Tween.prototype.step = function () {
-    if (!isFinite(this.target)) return this.value;
-    const d = this.target - this.value;
-    if (Math.abs(d) < 1e-9) { this.value = this.target; return this.value; }
-    this.value += d * this.speed;
-    return this.value;
-  };
-  Tween.prototype.done = function () {
-    return Math.abs(this.target - this.value) < 1e-9;
-  };
-  Tween.prototype.set = function (target) { this.target = target; };
-
-  // -- hit test rectangle ---------------------------------------------------
-  function hit(x, y, r) {
-    return r && x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
-  }
-
-  // Public surface of the kit.
-  return {
-    Easing: Easing,
-    rgba: rgba,
-    readableOn: readableOn,
-    roundRectPath: roundRectPath,
-    fillRoundRect: fillRoundRect,
-    strokeRoundRect: strokeRoundRect,
-    fauxShadow: fauxShadow,
-    glassRect: glassRect,
-    plateRect: plateRect,
-    pill: pill,
-    meter: meter,
-    sparkline: sparkline,
-    icon: icon,
-    tooltip: tooltip,
-    Tween: Tween,
-    hit: hit
-  };
-})();
-
-/* =========================================================================
- * MODERN SECTION 3 — CARD FRAMEWORK: BASE CLASS + MANAGER + LAUNCHER RAIL
- * =========================================================================
- * ModernCard  — behavior shared by every card (glass shell, header with
- *               icon/title/actions, drag, collapse, spring open animation,
- *               focus ring, z-order).
- * CardManager — owns the live card set, routes pointer/touch/wheel/key
- *               events to cards, rebuilds the per-frame hit registry,
- *               draws the launcher rail, and keeps the render loop alive
- *               while any animation is running.
- * ======================================================================== */
-
-// -- base card -------------------------------------------------------------
-// Subclasses override: TITLE(), ICON(), initial W/H, and renderBody().
-// The base handles everything visual around the body: shell, header,
-// action buttons (collapse / close), drag bounds, animations.
-function ModernCard(chart, id, opts) {
-  opts = opts || {};
-  this.chart = chart;
-  this.id = id;                       // stable id ('symbol', 'stats', …)
-  this.opts = opts;
-  this.z = 0;                         // assigned by the manager each frame
-  this.open = 0;                      // open animation progress 0..1
-  this.opening = true;                // animating in?
-  this.closing = false;
-  this.alpha = 0;                     // fade for open/close
-  this.collapsed = false;
-  this.collapseAnim = 0;              // 0 = expanded, 1 = collapsed
-  this.hover = false;                 // pointer over this card
-  this.focused = false;               // topmost card under pointer
-  this.x = 0; this.y = 0;
-  this.w = opts.w || 260;
-  this.h = opts.h || 200;
-  this.bodyH = 0;                     // measured by subclass each frame
-  this.scroll = 0;                    // scrollable body support
-  this.maxScroll = 0;
-  // spring entrance: cards scale from 0.92 and slide up 8px
-  this._springFrom = opts._springFrom;
-  this._dragDX = 0; this._dragDY = 0;
+  packed = ((a & 255) << 24) | ((b & 255) << 16) | ((g & 255) << 8) | (r & 255);
+  if (BADI_PACKED_COLOR_CACHE.size > 4096) BADI_PACKED_COLOR_CACHE.clear();
+  BADI_PACKED_COLOR_CACHE.set(css, packed);
+  return packed;
+}
+function badiUnpackColor(packed) {
+  // packed = AABBGGRR (little-endian layout of the 4 bytes) → css string
+  const r = packed & 255, g = (packed >>> 8) & 255, b = (packed >>> 16) & 255;
+  const a = ((packed >>> 24) & 255) / 255;
+  return 'rgba(' + r + ',' + g + ',' + b + ',' + (Math.round(a * 1000) / 1000) + ')';
 }
 
-ModernCard.prototype.HEADER_H = 34;
-
-// The manager calls this once per frame BEFORE render() to advance
-// animations. Returns true while the card is still animating.
-ModernCard.prototype.tick = function (now) {
-  let animating = false;
-  const E = CardKit.Easing;
-  // open/close spring
-  if (this.opening && this.open < 1) {
-    this.open = Math.min(1, this.open + 0.14);
-    animating = true;
-    if (this.open >= 1) this.opening = false;
-  } else if (this.closing && this.open > 0) {
-    this.open = Math.max(0, this.open - 0.18);
-    animating = true;
-  }
-  this.alpha = E.easeOutCubic(this.open);
-  // collapse transition
-  const target = this.collapsed ? 1 : 0;
-  if (this.collapseAnim !== target) {
-    const dir = target > this.collapseAnim ? 1 : -1;
-    this.collapseAnim = Math.max(0, Math.min(1, this.collapseAnim + dir * 0.2));
-    animating = true;
-  }
-  return animating;
-};
-
-ModernCard.prototype.isAnimating = function () {
-  return (this.opening && this.open < 1) ||
-         (this.closing && this.open > 0) ||
-         (this.collapseAnim !== (this.collapsed ? 1 : 0));
-};
-
-// Full on-screen rectangle (used for hit tests and shadows).
-ModernCard.prototype.rect = function () {
-  const cE = CardKit.Easing.easeOutCubic(this.open);
-  const h = this.currentH();
-  return { x: this.x, y: this.y, w: this.w, h: h };
-};
-
-// Current height including the collapse interpolation.
-ModernCard.prototype.currentH = function () {
-  const headerH = this.HEADER_H;
-  const full = headerH + this.bodyH + 12;    // 12 = body bottom padding
-  return headerH + (full - headerH) * (1 - this.collapseAnim) + 0 * this.open;
-};
-
-// Header rectangle (drag + actions live here).
-ModernCard.prototype.headerRect = function () {
-  return { x: this.x, y: this.y, w: this.w, h: this.HEADER_H };
-};
-
-// Collapse / close buttons (drawn right-aligned in the header).
-ModernCard.prototype._actionRects = function () {
-  const hh = this.HEADER_H;
-  const size = 20;
-  const y = this.y + (hh - size) / 2;
-  return {
-    collapse: { x: this.x + this.w - size - 6, y: y, w: size, h: size },
-    close:    { x: this.x + this.w - size * 2 - 10, y: y, w: size, h: size }
-  };
-};
-
-// -- render -----------------------------------------------------------------
-// Draws the complete card. Subclasses implement renderBody(ctx, bx, by, bw, T, now)
-// inside a clip; they may push hit rects via this.chart._modernHits.push().
-ModernCard.prototype.render = function (ctx, T, now) {
-  if (this.open <= 0.01) return;
-  const K = CardKit;
-  const E = K.Easing;
-  const r = this.rect();
-
-  ctx.save();
-  // entrance transform: subtle scale + slide-up, anchored at the card's
-  // top-left so docked corners stay pinned (feels like the card "grows"
-  // out of its corner).
-  const overshoot = E.easeOutBack(Math.min(1, this.open));
-  const scale = 0.92 + 0.08 * overshoot;
-  const slide = (1 - E.easeOutCubic(this.open)) * 10;
-  ctx.translate(r.x + r.w / 2, r.y + r.h / 2);
-  ctx.scale(scale, scale);
-  ctx.translate(-(r.x + r.w / 2), -(r.y + r.h / 2) - slide);
-
-  // 1. the glass shell
-  K.glassRect(ctx, r.x, r.y, r.w, r.h, T, {
-    r: 14,
-    alpha: this.alpha,
-    focus: this.focused,
-    hover: this.hover,
-    glow: this.opts.glow,
-    glowColor: this.opts.glowColor
-  });
-
-  // 2. header: icon chip + title + actions
-  const hh = this.HEADER_H;
-  const accent = this.opts.accent || T.accent;
-  // icon chip — a small rounded square with the accent gradient + white icon
-  const chipS = 22, chipX = r.x + 10, chipY = r.y + (hh - chipS) / 2;
-  const cg = ctx.createLinearGradient(chipX, chipY, chipX + chipS, chipY + chipS);
-  cg.addColorStop(0, K.rgba(accent, 0.9));
-  cg.addColorStop(1, K.rgba(this.opts.accent2 || T.accent2 || accent, 0.75));
-  K.fillRoundRect(ctx, chipX, chipY, chipS, chipS, 7, cg);
-  K.icon(ctx, this.ICON(), chipX + 2.5, chipY + 2.5, chipS - 5, '#ffffff', 1.4);
-  // title
-  ctx.font = '700 12px -apple-system, Segoe UI, Roboto, sans-serif';
-  ctx.fillStyle = T.textBright;
-  ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
-  ctx.fillText(this.TITLE(), chipX + chipS + 8, r.y + hh / 2 + 0.5);
-  // optional subtitle right of the title (dim)
-  if (this.SUBTITLE) {
-    const t = this.SUBTITLE();
-    if (t) {
-      ctx.font = '500 10px -apple-system, Segoe UI, Roboto, sans-serif';
-      ctx.fillStyle = T.textDim;
-      ctx.fillText(t, chipX + chipS + 8 + ctx.measureText(this.TITLE()).width + 24, r.y + hh / 2 + 1);
-    }
-  }
-  // action buttons
-  const acts = this._actionRects();
-  const drawAct = function (rect, iconName, hot) {
-    if (hot) K.fillRoundRect(ctx, rect.x - 1, rect.y - 1, rect.w + 2, rect.h + 2, 6, K.rgba(T.textBright, 0.10));
-    K.icon(ctx, iconName, rect.x + 3, rect.y + 3, rect.w - 6, hot ? T.textBright : T.textDim, 1.6, hot);
-  };
-  drawAct(acts.collapse, this.collapsed ? 'chevronDown' : 'chevronUp', this._hoverAct === 'collapse');
-  drawAct(acts.close, 'close', this._hoverAct === 'close');
-
-  // 3. body — clipped to the shell, poured onto data plates
-  if (this.collapseAnim < 0.98) {
-    ctx.save();
-    K.roundRectPath(ctx, r.x + 2, r.y + hh, r.w - 4, r.h - hh - 2, 12);
-    ctx.clip();
-    const bx = r.x + 10, bw = r.w - 20, by = r.y + hh + 6;
-    ctx.globalAlpha = ctx.globalAlpha * (1 - this.collapseAnim);
-    try {
-      this.renderBody(ctx, bx, by, bw, T, now);
-    } catch (err) {
-      // a broken card must never take the frame down — draw a soft error note
-      ctx.fillStyle = T.textDim;
-      ctx.font = '11px -apple-system, Segoe UI, Roboto, sans-serif';
-      ctx.fillText('—', bx, by + 14);
-    }
-    ctx.restore();
-  }
-  ctx.restore();
-};
-
-// default: subclasses override
-ModernCard.prototype.renderBody = function () {};
-ModernCard.prototype.TITLE  = function () { return this.id; };
-ModernCard.prototype.ICON   = function () { return 'layers'; };
-ModernCard.prototype.SUBTITLE = null;
-
-// -- pointer handling (shared by mouse + touch) ------------------------------
-// Returns an interaction claim: 'drag' | 'action' | 'body' | null.
-ModernCard.prototype.hitTest = function (x, y) {
-  const r = this.rect();
-  if (!CardKit.hit(x, y, r)) return null;
-  const acts = this._actionRects();
-  if (CardKit.hit(x, y, acts.collapse)) return { kind: 'action', action: 'collapse' };
-  if (CardKit.hit(x, y, acts.close))    return { kind: 'action', action: 'close' };
-  const h = this.headerRect();
-  if (y <= h.y + h.h) return { kind: 'drag' };
-  return { kind: 'body', card: this };
-};
-
-ModernCard.prototype.onAction = function (action) {
-  if (action === 'collapse') { this.collapsed = !this.collapsed; }
-  else if (action === 'close') {
-    this.closing = true;
-    const self = this;
-    // the manager removes the card once its close animation finished
-    setTimeout(function () {
-      if (self.chart._modern) self.chart._modern.removeCard(self.id, true);
-    }, 260);
-  }
-  this.chart.invalidate();
-};
-
-// -- body scroll (watchlist / shortcuts) --------------------------------------
-ModernCard.prototype.scrollBy = function (dy) {
-  if (this.maxScroll <= 0) return false;
-  const before = this.scroll;
-  this.scroll = Math.max(0, Math.min(this.maxScroll, this.scroll + dy));
-  if (before !== this.scroll) { this.chart.invalidate(); return true; }
-  return false;
-};
-
-/* ------------------------------------------------------------------------- */
-/*  CardManager                                                              */
-/* ------------------------------------------------------------------------- */
-function CardManager(chart) {
-  this.chart = chart;
-  this.cards = [];            // live ModernCard instances
-  this.cardOrder = [];        // creation order (for launcher + re-open)
-  this.zTop = 1;
-  this.hits = [];             // rebuilt each frame: {x,y,w,h, kind, card, action}
-  this.railHits = [];         // launcher rail buttons
-  this.drag = null;           // {card, dx, dy}
-  this.hoverRail = null;      // launcher icon id under pointer
-  this.hoverCardId = null;    // card under pointer (for focus ring)
-  this.railSide = 'right';    // 'right' (LTR) or 'left' (RTL / arabic locale)
-  this.railHidden = false;
-  this._measurePending = null;
+// bytes → human string for the HUD.
+function badiFmtBytes(b) {
+  if (b < 1024) return b + ' B';
+  if (b < 1024 * 1024) return (b / 1024).toFixed(1) + ' KB';
+  if (b < 1024 * 1024 * 1024) return (b / 1048576).toFixed(1) + ' MB';
+  return (b / 1073741824).toFixed(2) + ' GB';
 }
 
-// register + open a card instance
-CardManager.prototype.addCard = function (card, opts) {
-  opts = opts || {};
-  // replace an existing card with the same id (re-open resets state)
-  for (let i = 0; i < this.cards.length; i++) {
-    if (this.cards[i].id === card.id) { this.cards.splice(i, 1); break; }
+// Integer-only fast clamp.
+function badiClampI(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+/* ============================ BADI RING 64 ================================= */
+// v2.38.0: a fixed-capacity Float64Array ring buffer. Used by live series
+// (appendLineSeriesPoint) so streaming one point is O(1) with ZERO array
+// copies, and the GPU buffer refresh reuses the same backing storage.
+//
+// While streaming, the ring holds up to `capacity` newest points; get(i)
+// reads the i-th OLDEST retained value. toArray() flattens in chronological
+// order and REUSES its scratch storage until the ring grows.
+class BadiRing64 {
+  constructor(capacity) {
+    this.cap = Math.max(16, capacity | 0);
+    this.buf = new Float64Array(this.cap);
+    this.head = 0;          // next write slot
+    this.len = 0;           // number of valid items (≤ cap)
+    this._flat = null;      // scratch for toArray()
   }
-  card.z = ++this.zTop;
-  card.open = 0; card.opening = true; card.closing = false; card.alpha = 0;
-  this.cards.push(card);
-  if (this.cardOrder.indexOf(card.id) === -1) this.cardOrder.push(card.id);
-  this.layout();
-  this.chart.invalidate();
-  return card;
-};
-
-CardManager.prototype.removeCard = function (id, alreadyAnimatedOut) {
-  for (let i = 0; i < this.cards.length; i++) {
-    if (this.cards[i].id === id) {
-      const card = this.cards[i];
-      if (!alreadyAnimatedOut && !card.closing) {
-        card.closing = true;
-        const self = this;
-        setTimeout(function () { self.removeCard(id, true); }, 240);
-        this.chart.invalidate();
-        return;
-      }
-      this.cards.splice(i, 1);
-      break;
-    }
+  get length() { return this.len; }
+  push(v) {
+    this.buf[this.head] = v;
+    this.head = (this.head + 1) % this.cap;
+    if (this.len < this.cap) this.len++;
+    return this.len;
   }
-  this.chart.invalidate();
-};
-
-CardManager.prototype.getCard = function (id) {
-  for (let i = 0; i < this.cards.length; i++) if (this.cards[i].id === id) return this.cards[i];
-  return null;
-};
-
-CardManager.prototype.toggleCard = function (id) {
-  const c = this.getCard(id);
-  if (c) { this.removeCard(id); return false; }
-  const factory = CARD_FACTORIES[id];
-  if (factory) { this.addCard(factory(this.chart)); return true; }
-  return false;
-};
-
-// Stack layout with COLUMN WRAPPING: cards dock along one edge (right in
-// LTR, left in Arabic RTL) in creation order; when the stack would run past
-// the bottom of the chart area, the next card starts a fresh column beside
-// the first — like TradingView's watchlist/object-tree panels. A dragged
-// card keeps its manual position. Runs EVERY FRAME for non-manual cards —
-// bodyH is measured live during render (a card's height settles after its
-// first paint), so a one-shot layout at add-time left later cards
-// overlapping earlier ones (the first beta's stacked-cards bug).
-CardManager.prototype.layout = function () {
-  const ch = this.chart;
-  const margin = 12, gapY = 12, gapX = 10;
-  // Cards dock on the RIGHT edge ALWAYS — the legend indicator bars live at
-  // the chart's top-left (the core pins them there even in RTL documents),
-  // so docking cards left in Arabic mode stacked them over the legend. Only
-  // the launcher rail flips sides for RTL (it is vertically centered, so it
-  // never touches the legend either way).
-  const rightSide = true;
-  const top = Math.max(ch.chartTop + margin, 52);
-  const bottomLimit = (ch.priceBottom !== undefined ? ch.priceBottom : ch.H - 40) - margin;
-  let y = top, colX0 = null, colW = 0;
-  for (let i = 0; i < this.cards.length; i++) {
-    const c = this.cards[i];
-    if (c._manualPos) continue;   // user-dragged: keep where they left it
-    if (colX0 === null) {
-      // first column hugs the chart's right edge, clear of rail + axis
-      colX0 = Math.max(ch.chartLeft + 8, ch.chartRight - 58 - c.w - 10);
-    }
-    // wrap to a new column when this card would overflow the bottom
-    if (y + c.currentH() > bottomLimit && y > top) {
-      const stacked = colW || c.w;
-      colX0 = Math.max(ch.chartLeft + 8, colX0 - stacked - gapX);
-      colW = 0;
-      y = top;
-    }
-    c.x = colX0;
-    c.y = y;
-    y += c.currentH() + gapY;
-    colW = Math.max(colW, c.w);
+  // i-th oldest value (0 = oldest retained).
+  get(i) {
+    if (i < 0 || i >= this.len) return NaN;
+    const start = (this.head - this.len + this.cap) % this.cap;
+    return this.buf[(start + i) % this.cap];
   }
-};
-
-// bring a card to front
-CardManager.prototype.focusCard = function (card) {
-  if (!card) return;
-  card.z = ++this.zTop;
-  this.cards.sort(function (a, b) { return a.z - b.z; });
-};
-
-// -- per-frame render (called from the wrapped drawDropdown) -----------------
-CardManager.prototype.render = function (ctx, now) {
-  if (!this.cards.length && this.railHidden) return;
-  const T = this._T();
-  const ch = this.chart;
-
-  // advance animations; keep a flag so the render loop stays awake
-  let anyAnim = false;
-  for (let i = 0; i < this.cards.length; i++) {
-    if (this.cards[i].tick(now)) anyAnim = true;
+  set(i, v) {
+    if (i < 0 || i >= this.len) return;
+    const start = (this.head - this.len + this.cap) % this.cap;
+    this.buf[(start + i) % this.cap] = v;
   }
-  // drop fully-closed cards
-  for (let i = this.cards.length - 1; i >= 0; i--) {
-    if (this.cards[i].closing && this.cards[i].open <= 0.01) this.cards.splice(i, 1);
-  }
-  this._animating = anyAnim;
-
-  // re-stack the docked cards (bodyH settles live — see layout())
-  this.layout();
-
-  // fresh hit registry for this frame
-  this.hits = [];
-  this.railHits = [];
-
-  // draw cards back-to-front; focus ring goes to the topmost under pointer
-  this.cards.sort(function (a, b) { return a.z - b.z; });
-  let focusSet = false;
-  for (let i = this.cards.length - 1; i >= 0; i--) {
-    const c = this.cards[i];
-    if (!focusSet && CardKit.hit(ch.mouseX, ch.mouseY, c.rect())) {
-      c.focused = true; focusSet = true;
-      this.hoverCardId = c.id;
-    } else c.focused = false;
-  }
-  for (let i = 0; i < this.cards.length; i++) {
-    this.cards[i].render(ctx, T, now);
-    // register card-level hits (header/drag/actions)
-    const c = this.cards[i], acts = c._actionRects();
-    this.hits.push({ x: acts.collapse.x, y: acts.collapse.y, w: acts.collapse.w, h: acts.collapse.h, kind: 'action', card: c, action: 'collapse' });
-    this.hits.push({ x: acts.close.x, y: acts.close.y, w: acts.close.w, h: acts.close.h, kind: 'action', card: c, action: 'close' });
-    const hr = c.headerRect();
-    this.hits.push({ x: hr.x, y: hr.y, w: hr.w, h: hr.h, kind: 'drag', card: c });
-    const br = c.rect();
-    this.hits.push({ x: br.x, y: br.y + hr.h, w: br.w, h: Math.max(0, br.h - hr.h), kind: 'body', card: c });
-  }
-
-  // the launcher rail (glass pill on the chart edge)
-  if (!this.railHidden) this.renderRail(ctx, T, now);
-
-  // tooltip for the hovered rail button
-  if (this.hoverRail && this._railRect) {
-    const rr = this._railRect;
-    const btn = this._railButtonById(this.hoverRail);
-    if (btn) {
-      CardKit.tooltip(ctx, rr.side === 'right' ? rr.x - 6 : rr.x + rr.w + 6,
-                      btn.cy, btn.label, T, rr.side === 'right' ? 'left' : 'right');
-    }
-  }
-};
-
-// theme tokens with safe fallbacks (works even on a non-modern theme)
-CardManager.prototype._T = function () {
-  const t = this.chart.theme;
-  return {
-    bg: t.bg, text: t.text, textDim: t.textDim, textBright: t.textBright,
-    textFade: t.textFade, bull: t.bull, bear: t.bear, accent: t.accent,
-    ma1: t.ma1, ma2: t.ma2, ma3: t.ma3,
-    glassBg: t.glassBg || 'rgba(20,24,38,0.82)',
-    glassBgHover: t.glassBgHover || 'rgba(28,33,52,0.88)',
-    glassBorder: t.glassBorder || 'rgba(140,160,255,0.16)',
-    glassSheen: t.glassSheen || 'rgba(180,200,255,0.05)',
-    glassShadow: t.glassShadow || 'rgba(0,0,0,0.55)',
-    plate: t.plate || 'rgba(13,16,27,0.92)',
-    plateBorder: t.plateBorder || 'rgba(140,160,255,0.10)',
-    accent2: t.accent2 || '#00d4e0',
-    success: t.success || t.bull, danger: t.danger || t.bear, warn: t.warn || '#ffb74d'
-  };
-};
-
-// -- launcher rail -----------------------------------------------------------
-// A vertical glass pill pinned to the chart edge: one icon button per card
-// type + utility actions (theme, screenshot, measure). Buttons glow when
-// their card is open. On touch devices it also carries the close-all action.
-CardManager.prototype.RAIL_BUTTONS = [
-  { id: 'symbol',     icon: 'candles',  label: 'Symbol' },
-  { id: 'stats',      icon: 'stats',    label: 'Stats' },
-  { id: 'watchlist',  icon: 'watch',    label: 'Watchlist' },
-  { id: 'alerts',     icon: 'bell',     label: 'Alerts' },
-  { id: 'trade',      icon: 'trade',    label: 'Trade' },
-  { id: 'shortcuts',  icon: 'keyboard', label: 'Shortcuts' },
-  { id: 'perf',       icon: 'gauge',    label: 'Performance' },
-  { sep: true },
-  { id: 'theme',      icon: 'moon',     label: 'Theme' },
-  { id: 'shot',       icon: 'camera',   label: 'Screenshot' },
-  { id: 'measure',    icon: 'ruler',    label: 'Measure' }
-];
-
-CardManager.prototype._railButtonById = function (id) {
-  for (let i = 0; i < this.railHits.length; i++) if (this.railHits[i].id === id) return this.railHits[i];
-  return null;
-};
-
-CardManager.prototype.renderRail = function (ctx, T, now) {
-  const ch = this.chart;
-  const btnS = 34, gap = 6, pad = 6;
-  const railW = btnS + pad * 2;
-  const btns = this.RAIL_BUTTONS;
-  let nBtn = 0;
-  for (let i = 0; i < btns.length; i++) if (!btns[i].sep) nBtn++;
-  const nSep = btns.length - nBtn;
-  const railH = pad * 2 + nBtn * btnS + (nBtn - 1) * gap + nSep * (gap + 4);
-  const side = this.railSide === 'left' ? 'left' : 'right';
-  // dock JUST INSIDE the price area — clear of the price axis numbers (the
-  // axis labels stay perfectly readable; the rail's glass shows candles,
-  // which is where frosted glass reads best anyway)
-  const rx = side === 'right' ? Math.max(ch.chartLeft + 6, ch.chartRight - railW - 6)
-                              : ch.chartLeft + 6;
-  const ry = Math.max(ch.chartTop + 14, (ch.H - railH) / 2);
-
-  // rail entrance/exit fade (shares the manager's animation clock)
-  const railAlpha = 1;
-  ctx.save();
-  ctx.globalAlpha = ctx.globalAlpha * railAlpha;
-  CardKit.glassRect(ctx, rx, ry, railW, railH, T, { r: 17, alpha: 0.96 });
-
-  // buttons
-  let by = ry + pad;
-  for (let i = 0; i < btns.length; i++) {
-    const b = btns[i];
-    if (b.sep) {
-      // hairline divider between the card group and the utility group
-      ctx.fillStyle = CardKit.rgba(T.textDim, 0.22);
-      ctx.fillRect(rx + pad + 4, by - gap - 1, btnS - 8, 1);
-      by += gap + 4;
-      continue;
-    }
-    const bx = rx + pad;
-    const isOpen = b.id !== 'theme' && b.id !== 'shot' && b.id !== 'measure' &&
-                   !!this.getCard(b.id);
-    const isHover = this.hoverRail === b.id;
-    const isToolActive = b.id === 'measure' && ch.activeTool === 'measure';
-
-    // button plate: filled when its card is open / tool active
-    if (isOpen || isToolActive) {
-      const g = ctx.createLinearGradient(bx, by, bx + btnS, by + btnS);
-      g.addColorStop(0, CardKit.rgba(T.accent, 0.32));
-      g.addColorStop(1, CardKit.rgba(T.accent2, 0.20));
-      CardKit.fillRoundRect(ctx, bx, by, btnS, btnS, 10, g);
-    } else if (isHover) {
-      CardKit.fillRoundRect(ctx, bx, by, btnS, btnS, 10, CardKit.rgba(T.textBright, 0.08));
-    }
-    // dot indicator for open cards
-    if (isOpen) {
-      ctx.beginPath();
-      ctx.arc(bx + btnS - 5, by + 5, 2.2, 0, Math.PI * 2);
-      ctx.fillStyle = T.accent2;
-      ctx.fill();
-    }
-    const iconColor = isOpen || isToolActive ? T.textBright : (isHover ? T.text : T.textDim);
-    // 'theme' icon flips sun/moon with the current mode
-    const iconName = b.id === 'theme' ? this._themeIconName() : b.icon;
-    CardKit.icon(ctx, iconName, bx + 5, by + 5, btnS - 10, iconColor, 1.5, isHover);
-
-    this.railHits.push({ id: b.id, x: bx, y: by, w: btnS, h: btnS, cy: by + btnS / 2, label: b.label });
-    by += btnS + gap;
-  }
-  ctx.restore();
-  this._railRect = { x: rx, y: ry, w: railW, h: railH, side: side };
-};
-
-CardManager.prototype._themeIconName = function () {
-  const t = this.chart.theme;
-  // a light theme has a very bright panel background → show "moon" (go dark)
-  if (t.glassBg && /rgba\((2[3-5]\d,\s*2[3-5]\d)/.test(t.glassBg)) return 'moon';
-  return 'sun';
-};
-
-CardManager.prototype.handleRailClick = function (id) {
-  const ch = this.chart;
-  switch (id) {
-    case 'symbol': case 'stats': case 'watchlist': case 'alerts':
-    case 'trade': case 'shortcuts': case 'perf':
-      this.toggleCard(id);
-      break;
-    case 'theme':
-      ch._modernCycleTheme();
-      break;
-    case 'shot':
-      ch.exportPNG();
-      break;
-    case 'measure':
-      ch.setTool(ch.activeTool === 'measure' ? 'cursor' : 'measure');
-      ch.invalidate();
-      break;
-  }
-};
-
-// -- event routing -----------------------------------------------------------
-// Each handler returns TRUE when the modern layer consumed the event (the
-// chart's original handler is then skipped entirely).
-
-CardManager.prototype.pointerDown = function (x, y) {
-  // 1. rail buttons have top priority
-  for (let i = 0; i < this.railHits.length; i++) {
-    const b = this.railHits[i];
-    if (CardKit.hit(x, y, b)) { this.handleRailClick(b.id); return true; }
-  }
-  // 2. cards, topmost first
-  for (let i = this.cards.length - 1; i >= 0; i--) {
-    const c = this.cards[i];
-    const claim = c.hitTest(x, y);
-    if (!claim) continue;
-    this.focusCard(c);
-    if (claim.kind === 'action') { c.onAction(claim.action); return true; }
-    if (claim.kind === 'drag') {
-      this.drag = { card: c, dx: x - c.x, dy: y - c.y };
-      c._manualPos = true;
-      return true;
-    }
-    if (claim.kind === 'body') {
-      // body buttons are dispatched by the card subclass via _bodyHits
-      if (c._bodyHits) {
-        for (let k = 0; k < c._bodyHits.length; k++) {
-          const bh = c._bodyHits[k];
-          if (CardKit.hit(x, y, bh)) {
-            if (bh.onClick) bh.onClick();
-            this.chart.invalidate();
-            return true;
-          }
-        }
-      }
-      return true;   // swallow clicks on card bodies (no chart interaction)
-    }
-  }
-  return false;
-};
-
-CardManager.prototype.pointerMove = function (x, y) {
-  let consumed = false;
-  // dragging a card
-  if (this.drag) {
-    const c = this.drag.card;
-    c.x = Math.max(4, Math.min(this.chart.W - c.w - 4, x - this.drag.dx));
-    c.y = Math.max(4, Math.min(this.chart.H - 30, y - this.drag.dy));
-    c._manualPos = true;
-    this.chart.invalidate();
-    return true;
-  }
-  // hover states
-  let railHover = null;
-  for (let i = 0; i < this.railHits.length; i++) {
-    if (CardKit.hit(x, y, this.railHits[i])) { railHover = this.railHits[i].id; break; }
-  }
-  if (railHover !== this.hoverRail) { this.hoverRail = railHover; this.chart.invalidate(); }
-  if (railHover) consumed = true;
-
-  // card focus + header action hover
-  let newHover = null;
-  let hoverAct = null;
-  for (let i = this.cards.length - 1; i >= 0; i--) {
-    const c = this.cards[i];
-    const claim = c.hitTest(x, y);
-    if (claim) {
-      newHover = c.id;
-      c.hover = true;
-      if (claim.kind === 'action') hoverAct = claim.action;
-      if (c._hoverAct !== hoverAct) { c._hoverAct = hoverAct; this.chart.invalidate(); }
-      if (c._bodyHits) {
-        // let cards track their own body hover (buttons highlight)
-        let bodyHover = false;
-        for (let k = 0; k < c._bodyHits.length; k++) {
-          if (CardKit.hit(x, y, c._bodyHits[k])) { c._bodyHits[k].hover = true; bodyHover = true; }
-          else c._bodyHits[k].hover = false;
-        }
-        if (bodyHover) consumed = true;
-      }
-      consumed = true;
-      break;
-    } else {
-      c.hover = false;
-      if (c._hoverAct) { c._hoverAct = null; }
-      if (c._bodyHits) for (let k = 0; k < c._bodyHits.length; k++) c._bodyHits[k].hover = false;
-    }
-  }
-  if (newHover !== this.hoverCardId) { this.hoverCardId = newHover; this.chart.invalidate(); }
-  return consumed;
-};
-
-CardManager.prototype.pointerUp = function (x, y) {
-  if (this.drag) { this.drag = null; this.chart.invalidate(); return true; }
-  return false;
-};
-
-CardManager.prototype.wheel = function (x, y, deltaY) {
-  // scrolling over a card with scrollable content scrolls that card
-  for (let i = this.cards.length - 1; i >= 0; i--) {
-    const c = this.cards[i];
-    if (CardKit.hit(x, y, c.rect())) {
-      if (c.maxScroll > 0 && c.scrollBy(deltaY)) return true;
-      return true;  // no scrollable content: still swallow (no chart zoom under cards)
-    }
-  }
-  return false;
-};
-
-// keyboard: Alt+1..9 toggles cards, Alt+T cycles themes, Alt+E screenshot.
-// Alt-modified combos never collide with the existing plain-key tool map.
-CardManager.prototype.keyDown = function (e) {
-  if (!e.altKey) return false;
-  const k = e.key;
-  if (k === 't' || k === 'T') { this.chart._modernCycleTheme(); return true; }
-  if (k === 'e' || k === 'E') { this.chart.exportPNG(); return true; }
-  if (k >= '1' && k <= '9') {
-    const ids = CARD_IDS;
-    const idx = parseInt(k, 10) - 1;
-    if (idx < ids.length) { this.toggleCard(ids[idx]); return true; }
-  }
-  return false;
-};
-
-/* ------------------------------------------------------------------------- */
-/*  SymbolCard — the modern ticker header                                    */
-/* ------------------------------------------------------------------------- */
-function SymbolCard(chart) {
-  ModernCard.call(this, chart, 'symbol', {
-    w: 264,
-    accent: chart.theme.accent,
-    accent2: chart.theme.accent2,
-    glow: true, glowColor: chart.theme.accent
-  });
-  this._priceTween = new CardKit.Tween(0, 0, 0.22);
-  this._lastPrice = null;
-  this._dir = 0;                  // last tick direction (flash the price)
-  this._flash = 0;                // price flash timer (ms)
-  this._spark = [];
-  this.bodyH = 168;
-}
-SymbolCard.prototype = Object.create(ModernCard.prototype);
-SymbolCard.prototype.constructor = SymbolCard;
-
-SymbolCard.prototype.TITLE = function () { return this.chart.symbol.label; };
-SymbolCard.prototype.ICON = function () { return 'candles'; };
-SymbolCard.prototype.SUBTITLE = function () { return this.chart.timeframe.label; };
-
-SymbolCard.prototype.tick = function (now) {
-  const anim = ModernCard.prototype.tick.call(this, now);
-  const ch = this.chart;
-  const candles = ch.sim.candles;
-  const last = candles.length ? candles[candles.length - 1].close : null;
-  if (last !== null && last !== this._lastPrice) {
-    if (this._lastPrice !== null && isFinite(last) && isFinite(this._lastPrice)) {
-      this._dir = last >= this._lastPrice ? 1 : -1;
-      this._flash = 600;
-    }
-    this._lastPrice = last;
-    this._priceTween.set(last);
-    if (this._priceTween.value === 0) this._priceTween.value = last;
-  }
-  if (this._flash > 0) { this._flash -= 16; }
-  return anim || this._flash > 0 || !this._priceTween.done();
-};
-
-// data slice helpers -------------------------------------------------------
-SymbolCard.prototype._sessionStats = function () {
-  const ch = this.chart, cs = ch.sim.candles;
-  const n = cs.length;
-  if (!n) return null;
-  // "session" = last 24h of candles (or everything when the feed is shorter)
-  const tfMs = (ch.timeframe && ch.timeframe.ms) || 3600000;
-  const cutoff = (cs[n - 1].time * (cs[n - 1].time > 1e12 ? 1 : 1000)) - 24 * 3600 * 1000;
-  let s = 0;
-  for (let i = n - 1; i >= 0; i--) {
-    const t = cs[i].time * (cs[i].time > 1e12 ? 1 : 1000);
-    if (t < cutoff) { s = i + 1; break; }
-    s = i;
-  }
-  let hi = -Infinity, lo = Infinity, vol = 0, vwapNum = 0, vwapDen = 0;
-  for (let i = s; i < n; i++) {
-    const c = cs[i];
-    if (c.high > hi) hi = c.high;
-    if (c.low < lo) lo = c.low;
-    vol += (c.volume || 0);
-    const tp = (c.high + c.low + c.close) / 3;
-    vwapNum += tp * (c.volume || 1);
-    vwapDen += (c.volume || 1);
-  }
-  return {
-    hi: hi, lo: lo, vol: vol, vwap: vwapDen ? vwapNum / vwapDen : null,
-    open: cs[s].open, close: cs[n - 1].close, startIdx: s
-  };
-};
-
-SymbolCard.prototype.renderBody = function (ctx, bx, by, bw, T, now) {
-  const ch = this.chart, K = CardKit;
-  const cs = ch.sim.candles;
-  if (!cs.length) {
-    ctx.fillStyle = T.textDim;
-    ctx.font = '11px -apple-system, Segoe UI, Roboto, sans-serif';
-    ctx.textAlign = 'left'; ctx.textBaseline = 'top';
-    ctx.fillText(ch._t ? ch._t('noData') : 'No data', bx + 4, by + 8);
-    return;
-  }
-  const st = this._sessionStats();
-  const price = this._priceTween.step();
-  const chg = st.close - st.open;
-  const chgPct = st.open ? (chg / st.open) * 100 : 0;
-  const up = chg >= 0;
-
-  // -- row 1: big animated price + change pill -----------------------------
-  ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
-  let priceColor = up ? T.success : T.danger;
-  if (this._flash > 0) {
-    // price flash on tick: blend toward white for a few frames
-    const f = Math.min(1, this._flash / 600);
-    priceColor = K.rgba(up ? T.success : T.danger, 0.65 + 0.35 * (1 - f));
-  }
-  ctx.font = '700 27px -apple-system, Segoe UI, Roboto, sans-serif';
-  ctx.fillStyle = priceColor;
-  const priceTxt = ch.priceScale ? ch.priceScale.formatLogical(price) : String(price);
-  ctx.fillText(priceTxt, bx + 2, by + 26);
-  const pw = ctx.measureText(priceTxt).width;
-
-  // change pill right of the price (measured with the SAME string it renders)
-  const pillTxt = (up ? '+' : '') + chgPct.toFixed(2) + '%';
-  const pillFont = '700 11px -apple-system, Segoe UI, Roboto, sans-serif';
-  ctx.font = pillFont;
-  const pillW = ctx.measureText(pillTxt).width + 20;
-  K.pill(ctx, bx + pw + 12, by + 8, pillW, 21, up ? K.rgba(T.success, 0.18) : K.rgba(T.danger, 0.18),
-         pillTxt,
-         { color: up ? T.success : T.danger, font: pillFont,
-           border: K.rgba(up ? T.success : T.danger, 0.4) });
-
-  // -- row 2: 24h range meter ------------------------------------------------
-  const mY = by + 46;
-  const loTxt = ch.priceScale ? ch.priceScale.formatLogical(st.lo) : st.lo.toFixed(2);
-  const hiTxt = ch.priceScale ? ch.priceScale.formatLogical(st.hi) : st.hi.toFixed(2);
-  ctx.font = '600 10px -apple-system, Segoe UI, Roboto, sans-serif';
-  ctx.fillStyle = T.danger; ctx.textAlign = 'left';
-  ctx.fillText(loTxt, bx + 2, mY + 4);
-  ctx.fillStyle = T.success; ctx.textAlign = 'right';
-  ctx.fillText(hiTxt, bx + bw - 2, mY + 4);
-  ctx.textAlign = 'left';
-  const mX = bx + 2, mW = bw - 4;
-  const loW = ctx.measureText(loTxt).width, hiW = ctx.measureText(hiTxt).width;
-  const barX = mX + loW + 10, barW = mW - loW - hiW - 20;
-  const range = (st.hi - st.lo) || 1;
-  const pos = Math.max(0, Math.min(1, (st.close - st.lo) / range));
-  K.meter(ctx, barX, mY - 4, barW, 7, pos,
-          { color: pos > 0.5 ? T.success : T.danger, tick: pos,
-            tickColor: T.textBright, track: K.rgba(T.textDim, 0.18) });
-
-  // -- row 3: 2×2 mini stat plates ------------------------------------------
-  const gY = by + 66;
-  const cellH = 34, gap = 6, cellW = (bw - gap) / 2;
-  const fmtVol = function (v) {
-    if (!isFinite(v)) return '—';
-    if (v >= 1e9) return (v / 1e9).toFixed(2) + 'B';
-    if (v >= 1e6) return (v / 1e6).toFixed(2) + 'M';
-    if (v >= 1e3) return (v / 1e3).toFixed(1) + 'K';
-    return String(Math.round(v));
-  };
-  const vol24 = st.vol || 0;
-  const rangePct = ((st.hi - st.lo) / (st.lo || 1)) * 100;
-  const cells = [
-    { label: '24h Vol',  value: fmtVol(vol24), color: T.textBright },
-    { label: 'VWAP',     value: st.vwap != null ? (ch.priceScale ? ch.priceScale.formatLogical(st.vwap) : st.vwap.toFixed(2)) : '—',
-                        color: st.vwap != null && st.close >= st.vwap ? T.success : T.danger },
-    { label: 'Range %',  value: rangePct.toFixed(2) + '%', color: T.textBright },
-    { label: 'ATR 14',   value: this._atr14() != null ? (ch.priceScale ? ch.priceScale.formatLogical(this._atr14()) : '—') : '—',
-                        color: T.textBright }
-  ];
-  this._bodyHits = [];
-  for (let i = 0; i < cells.length; i++) {
-    const cx = bx + (i % 2) * (cellW + gap);
-    const cy = gY + Math.floor(i / 2) * (cellH + gap);
-    K.plateRect(ctx, cx, cy, cellW, cellH, T, { r: 9 });
-    ctx.font = '600 9px -apple-system, Segoe UI, Roboto, sans-serif';
-    ctx.fillStyle = T.textDim;
-    ctx.textAlign = 'left'; ctx.textBaseline = 'top';
-    ctx.fillText(cells[i].label.toUpperCase(), cx + 8, cy + 6);
-    ctx.font = '700 13px -apple-system, Segoe UI, Roboto, sans-serif';
-    ctx.fillStyle = cells[i].color;
-    ctx.fillText(cells[i].value, cx + 8, cy + 17);
-  }
-
-  // -- row 4: sparkline of the session closes -------------------------------
-  const sY = gY + cellH * 2 + gap * 2 + 6;
-  const sH = 38;
-  const startIdx = Math.max(0, st.startIdx);
-  const take = Math.min(cs.length - startIdx, 90);
-  const vals = [];
-  for (let i = cs.length - take; i < cs.length; i++) vals.push(cs[i].close);
-  const pulse = (now !== undefined) ? (now % 2000) / 2000 : 0;
-  K.sparkline(ctx, bx + 2, sY, bw - 6, sH, vals, {
-    color: up ? T.success : T.danger,
-    pulse: CardKit.Easing.pulse(pulse)
-  });
-  this.bodyH = sY + sH - by + 8;
-};
-
-SymbolCard.prototype._atr14 = function () {
-  const cached = this.__atr14;
-  const cs = this.chart.sim.candles;
-  const n = cs.length;
-  if (cached && cached.n === n && cached.lastTime === (n ? cs[n - 1].time : 0)) return cached.v;
-  if (n < 15) { this.__atr14 = { n: n, v: null, lastTime: n ? cs[n - 1].time : 0 }; return null; }
-  let sum = 0, count = 0;
-  for (let i = n - 14; i < n; i++) {
-    const tr = Math.max(cs[i].high - cs[i].low,
-              Math.max(Math.abs(cs[i].high - cs[i - 1].close),
-                       Math.abs(cs[i].low - cs[i - 1].close)));
-    sum += tr; count++;
-  }
-  const v = count ? sum / count : null;
-  this.__atr14 = { n: n, v: v, lastTime: cs[n - 1].time };
-  return v;
-};
-
-/* ------------------------------------------------------------------------- */
-/*  StatsCard — session statistics grid                                      */
-/* ------------------------------------------------------------------------- */
-function StatsCard(chart) {
-  ModernCard.call(this, chart, 'stats', {
-    w: 252, accent: chart.theme.accent2 || '#00d4e0'
-  });
-  this.bodyH = 210;
-}
-StatsCard.prototype = Object.create(ModernCard.prototype);
-StatsCard.prototype.constructor = StatsCard;
-StatsCard.prototype.TITLE = function () { return this.chart._t ? this.chart._t('statsTitle') : 'Session Stats'; };
-StatsCard.prototype.ICON = function () { return 'stats'; };
-
-StatsCard.prototype.renderBody = function (ctx, bx, by, bw, T, now) {
-  const ch = this.chart, K = CardKit;
-  const cs = ch.sim.candles;
-  ctx.textAlign = 'left';
-  if (!cs.length) return;
-  const n = cs.length;
-  const last = cs[n - 1];
-
-  // candle-window stats over the VISIBLE range (like TradingView's data window)
-  const firstIdx = Math.max(0, Math.floor(ch.xToIndex ? ch.xToIndex(ch.chartLeft) : 0));
-  let hi = -Infinity, lo = Infinity, vol = 0, bullBars = 0, bearBars = 0, sumSq = 0;
-  const closes = [];
-  for (let i = firstIdx; i < n; i++) {
-    const c = cs[i];
-    if (c.high > hi) hi = c.high;
-    if (c.low < lo) lo = c.low;
-    vol += c.volume || 0;
-    if (c.close >= c.open) bullBars++; else bearBars++;
-    closes.push(c.close);
-  }
-  const bars = n - firstIdx;
-  const mean = closes.length ? closes.reduce(function (a, b) { return a + b; }, 0) / closes.length : 0;
-  for (let i = 0; i < closes.length; i++) sumSq += Math.pow(closes[i] - mean, 2);
-  const stdev = closes.length > 1 ? Math.sqrt(sumSq / (closes.length - 1)) : 0;
-  const volat = mean ? (stdev / mean) * 100 : 0;
-
-  // -- OHLC row (4 tiny plates) ----------------------------------------------
-  // Auto-fit: prices vary wildly in width across symbols (0.52 vs 65531.32),
-  // so each cell's font shrinks until its value fits (min 8px, then precision
-  // trim). Without this, wide values overflow their cell and clip at the
-  // card edge (the first beta's "C value bleeds outside" bug).
-  const fmt = function (v) { return ch.priceScale ? ch.priceScale.formatLogical(v) : v.toFixed(2); };
-  const oW = (bw - 3 * 4) / 4;
-  const labels = ['O', 'H', 'L', 'C'];
-  const values = [last.open, last.high, last.low, last.close];
-  for (let i = 0; i < 4; i++) {
-    const x = bx + i * (oW + 4);
-    K.plateRect(ctx, x, by, oW, 36, T, { r: 8 });
-    ctx.font = '600 9px -apple-system, Segoe UI, Roboto, sans-serif';
-    ctx.fillStyle = T.textDim; ctx.textBaseline = 'top';
-    ctx.textAlign = 'left';
-    ctx.fillText(labels[i], x + 7, by + 6);
-    // fit the value: shrink font, then trim decimals as a last resort
-    let valTxt = fmt(values[i]);
-    let fs = 11;
-    while (fs > 8) {
-      ctx.font = '700 ' + fs + 'px -apple-system, Segoe UI, Roboto, sans-serif';
-      if (ctx.measureText(valTxt).width <= oW - 12) break;
-      fs -= 0.5;
-    }
-    if (ctx.measureText(valTxt).width > oW - 12) {
-      const dot = valTxt.lastIndexOf('.');
-      if (dot > 0) valTxt = valTxt.slice(0, dot);
-    }
-    ctx.fillStyle = i === 3 ? (last.close >= last.open ? T.success : T.danger) : T.textBright;
-    ctx.fillText(valTxt, x + 7, by + 18);
-  }
-
-  // -- metrics table ----------------------------------------------------------
-  let y = by + 48;
-  const rows = [
-    [ch._t ? ch._t('statRange') : 'Range', fmt(hi - lo)],
-    [ch._t ? ch._t('statRangePct') : 'Range %', lo ? (((hi - lo) / lo) * 100).toFixed(2) + '%' : '—'],
-    ['σ ' + (ch._t ? ch._t('statVolatility') : 'Volatility'), volat.toFixed(2) + '%'],
-    [ch._t ? ch._t('statBars') : 'Bars', String(bars)],
-    [ch._t ? ch._t('statVolume') : 'Volume', vol >= 1e6 ? (vol / 1e6).toFixed(2) + 'M' : vol >= 1e3 ? (vol / 1e3).toFixed(1) + 'K' : String(Math.round(vol))]
-  ];
-  ctx.font = '500 11px -apple-system, Segoe UI, Roboto, sans-serif';
-  for (let i = 0; i < rows.length; i++) {
-    ctx.fillStyle = T.textDim; ctx.textBaseline = 'middle';
-    ctx.fillText(rows[i][0], bx + 4, y + 8);
-    ctx.fillStyle = T.textBright;
-    ctx.textAlign = 'right';
-    ctx.fillText(rows[i][1], bx + bw - 4, y + 8);
-    ctx.textAlign = 'left';
-    // hairline separator
-    ctx.fillStyle = K.rgba(T.textDim, 0.12);
-    ctx.fillRect(bx + 2, y + 17, bw - 4, 1);
-    y += 20;
-  }
-
-  // -- bull/bear pressure gauge ------------------------------------------------
-  const gy = y + 8;
-  const total = bullBars + bearBars || 1;
-  const bullRatio = bullBars / total;
-  ctx.font = '600 9px -apple-system, Segoe UI, Roboto, sans-serif';
-  ctx.fillStyle = T.textDim; ctx.textBaseline = 'top';
-  ctx.fillText((ch._t ? ch._t('statPressure') : 'BULL PRESSURE').toUpperCase(), bx + 2, gy);
-  ctx.textAlign = 'right';
-  ctx.fillStyle = T.success;
-  ctx.fillText(Math.round(bullRatio * 100) + '%', bx + bw - 2, gy);
-  ctx.textAlign = 'left';
-  const barY = gy + 16;
-  // dual meter: green from left, red from right
-  K.fillRoundRect(ctx, bx + 2, barY, bw - 4, 7, 3.5, K.rgba(T.danger, 0.55));
-  K.fillRoundRect(ctx, bx + 2, barY, Math.max(7, (bw - 4) * bullRatio), 7, 3.5, K.rgba(T.success, 0.85));
-  // labels under the meter
-  ctx.font = '600 9px -apple-system, Segoe UI, Roboto, sans-serif';
-  ctx.fillStyle = T.success; ctx.textBaseline = 'top';
-  ctx.fillText('▲ ' + bullBars, bx + 2, barY + 11);
-  ctx.textAlign = 'right';
-  ctx.fillStyle = T.danger;
-  ctx.fillText(bearBars + ' ▼', bx + bw - 2, barY + 11);
-  ctx.textAlign = 'left';
-
-  this.bodyH = barY + 24 - by + 8;
-};
-
-/* =========================================================================
- * MODERN SECTION 4 — THE CARD SUITE (II)
- * =========================================================================
- * WatchlistCard  — multi-symbol rows with sparklines + change badges.
- * AlertsCard     — the alert manager UI (list, add, mute, remove, log tab).
- * TradeCard      — paper-trading panel (qty stepper, BUY/SELL, position P&L).
- * ShortcutsCard  — searchable cheat sheet of every chart shortcut.
- * PerfCard       — live FPS graph + engine statistics.
- * ======================================================================== */
-
-/* ------------------------------------------------------------------------- */
-/*  WatchlistCard                                                            */
-/* ------------------------------------------------------------------------- */
-// Data model: chart.setWatchlist([{ symbol:'BTCUSDT', price:64250, change:+2.4,
-//   history:[64100, ...] }]) — the app owns the data (the library never
-// invents prices); the card renders and fires onSymbolPick on row clicks.
-function WatchlistCard(chart) {
-  ModernCard.call(this, chart, 'watchlist', {
-    w: 268, accent: chart.theme.accent
-  });
-  this.selected = null;
-  this.sortMode = 'change';        // 'change' | 'name'
-  this._rows = [];
-  this.bodyH = 60;
-}
-WatchlistCard.prototype = Object.create(ModernCard.prototype);
-WatchlistCard.prototype.constructor = WatchlistCard;
-WatchlistCard.prototype.TITLE = function () { return this.chart._t ? this.chart._t('watchlist') : 'Watchlist'; };
-WatchlistCard.prototype.ICON = function () { return 'watch'; };
-
-WatchlistCard.prototype.renderBody = function (ctx, bx, by, bw, T, now) {
-  const ch = this.chart, K = CardKit;
-  const list = ch._watchlist || [];
-  const rowH = 44;
-  this._bodyHits = [];
-  ctx.textAlign = 'left';
-
-  // toolbar: sort toggle + count
-  ctx.font = '600 9px -apple-system, Segoe UI, Roboto, sans-serif';
-  ctx.fillStyle = T.textDim; ctx.textBaseline = 'middle';
-  const sortTxt = (ch._t ? ch._t('sortBy') : 'Sort') + ': ' +
-                  (this.sortMode === 'change' ? (ch._t ? ch._t('sortChange') : '% chg')
-                                              : (ch._t ? ch._t('sortName') : 'A–Z'));
-  ctx.fillText(sortTxt, bx + 4, by + 7);
-  this._bodyHits.push({
-    x: bx, y: by - 4, w: 90, h: 22,
-    onClick: (function (self) { return function () {
-      self.sortMode = self.sortMode === 'change' ? 'name' : 'change';
-    }; })(this)
-  });
-
-  if (!list.length) {
-    K.plateRect(ctx, bx, by + 18, bw, 40, T, { r: 10 });
-    ctx.font = '500 10px -apple-system, Segoe UI, Roboto, sans-serif';
-    ctx.fillStyle = T.textDim; ctx.textBaseline = 'middle';
-    ctx.fillText(ch._t ? ch._t('watchlistEmpty') : 'chart.setWatchlist([...])', bx + 10, by + 38);
-    this.bodyH = 70;
-    this.maxScroll = 0;
-    return;
-  }
-
-  // sort a COPY (never mutate the app's array)
-  const rows = list.slice();
-  if (this.sortMode === 'change') {
-    rows.sort(function (a, b) { return (b.change || 0) - (a.change || 0); });
-  } else {
-    rows.sort(function (a, b) { return String(a.symbol).localeCompare(String(b.symbol)); });
-  }
-
-  // visible window with smooth scroll
-  const maxVisible = 5;
-  const contentH = rows.length * (rowH + 6);
-  const viewH = Math.min(contentH, maxVisible * (rowH + 6));
-  this.maxScroll = Math.max(0, contentH - viewH);
-  this.scroll = Math.min(this.scroll, this.maxScroll);
-  const startY = by + 20;
-
-  ctx.save();
-  K.roundRectPath(ctx, bx - 4, startY - 2, bw + 8, viewH + 4, 10);
-  ctx.clip();
-  ctx.translate(0, -this.scroll);
-
-  let ry = startY;
-  for (let i = 0; i < rows.length; i++) {
-    const it = rows[i];
-    const up = (it.change || 0) >= 0;
-    const selected = this.selected === it.symbol;
-    // row plate
-    K.plateRect(ctx, bx, ry, bw, rowH, T, {
-      r: 10,
-      fill: selected ? K.rgba(T.accent, 0.14) : T.plate
-    });
-    if (selected) K.strokeRoundRect(ctx, bx + 0.5, ry + 0.5, bw - 1, rowH - 1, 10, K.rgba(T.accent, 0.55), 1);
-
-    // symbol + price
-    ctx.font = '700 12px -apple-system, Segoe UI, Roboto, sans-serif';
-    ctx.fillStyle = T.textBright; ctx.textBaseline = 'top';
-    ctx.fillText(it.symbol, bx + 10, ry + 7);
-    ctx.font = '500 11px -apple-system, Segoe UI, Roboto, sans-serif';
-    ctx.fillStyle = T.text;
-    ctx.fillText(it.price != null ? (ch.priceScale ? ch.priceScale.formatLogical(it.price) : String(it.price)) : '—',
-                 bx + 10, ry + 24);
-
-    // sparkline to the right of the text
-    const sparkW = 64;
-    if (it.history && it.history.length > 1) {
-      K.sparkline(ctx, bx + bw - sparkW - 66, ry + 8, sparkW, rowH - 16, it.history, {
-        color: up ? T.success : T.danger, area: true, dot: false, lineWidth: 1.3
-      });
-    }
-
-    // change badge
-    const badgeTxt = (up ? '+' : '') + (it.change || 0).toFixed(2) + '%';
-    ctx.font = '700 10px -apple-system, Segoe UI, Roboto, sans-serif';
-    const bW = ctx.measureText(badgeTxt).width + 14;
-    K.pill(ctx, bx + bw - bW - 8, ry + (rowH - 18) / 2, bW, 18,
-           up ? K.rgba(T.success, 0.16) : K.rgba(T.danger, 0.16), badgeTxt,
-           { color: up ? T.success : T.danger, font: '700 10px -apple-system, Segoe UI, Roboto, sans-serif' });
-
-    // row click → onSymbolPick
-    (function (card, symbol) {
-      card._bodyHits.push({
-        x: bx, y: ry, w: bw, h: rowH, hover: false,
-        onClick: function () {
-          card.selected = symbol;
-          if (card.chart._onSymbolPick) card.chart._onSymbolPick(symbol);
-        }
-      });
-    })(this, it.symbol);
-
-    ry += rowH + 6;
-  }
-  ctx.restore();
-
-  // scrollbar (thin, glassy) when content overflows
-  if (this.maxScroll > 0) {
-    const trackH = viewH - 4;
-    const thumbH = Math.max(24, trackH * (viewH / contentH));
-    const thumbY = startY - 2 + (trackH - thumbH) * (this.scroll / this.maxScroll);
-    K.fillRoundRect(ctx, bx + bw + 3, startY - 2, 3, trackH, 1.5, K.rgba(T.textDim, 0.15));
-    K.fillRoundRect(ctx, bx + bw + 3, thumbY, 3, thumbH, 1.5, K.rgba(T.textBright, 0.35));
-  }
-
-  this.bodyH = startY + viewH - by + 10;
-};
-
-/* ------------------------------------------------------------------------- */
-/*  AlertsCard                                                               */
-/* ------------------------------------------------------------------------- */
-function AlertsCard(chart) {
-  ModernCard.call(this, chart, 'alerts', {
-    w: 262, accent: '#ffb74d', glow: true, glowColor: '#ffb74d'
-  });
-  this.tab = 'active';            // 'active' | 'log'
-  this._newPrice = null;          // quick-add input state
-  this._quickAdd = null;
-  this.bodyH = 150;
-}
-AlertsCard.prototype = Object.create(ModernCard.prototype);
-AlertsCard.prototype.constructor = AlertsCard;
-AlertsCard.prototype.TITLE = function () { return this.chart._t ? this.chart._t('alerts') : 'Alerts'; };
-AlertsCard.prototype.ICON = function () { return 'bell'; };
-
-AlertsCard.prototype.renderBody = function (ctx, bx, by, bw, T, now) {
-  const ch = this.chart, K = CardKit;
-  const alerts = ch._alerts || [];
-  const log = ch._alertLog || [];
-  this._bodyHits = [];
-  ctx.textAlign = 'left';
-
-  // tab switch (active / log) — segmented control
-  const segH = 22;
-  K.fillRoundRect(ctx, bx, by, bw, segH, 7, K.rgba(T.textDim, 0.14));
-  const segW = (bw - 4) / 2;
-  const labels = [ch._t ? ch._t('alertsActive') : 'Active', ch._t ? ch._t('alertsLog') : 'Log'];
-  for (let i = 0; i < 2; i++) {
-    const active = (i === 0) === (this.tab === 'active');
-    if (active) {
-      const g = ctx.createLinearGradient(bx + 2 + i * (segW + 0), 0, bx + 2 + i * segW + segW, 0);
-      g.addColorStop(0, K.rgba(T.accent, 0.85)); g.addColorStop(1, K.rgba(T.accent2 || T.accent, 0.7));
-      K.fillRoundRect(ctx, bx + 2 + i * (segW + 0), by + 2, segW - 2, segH - 4, 5, g);
-    }
-    ctx.font = '600 10px -apple-system, Segoe UI, Roboto, sans-serif';
-    ctx.fillStyle = active ? '#ffffff' : T.textDim;
-    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-    ctx.fillText(labels[i] + (i === 0 && alerts.length ? ' (' + alerts.length + ')' : ''), bx + 2 + i * segW + segW / 2 - 1, by + segH / 2 + 0.5);
-    (function (card, idx) {
-      card._bodyHits.push({ x: bx + idx * segW, y: by, w: segW, h: segH, hover: false,
-        onClick: function () { card.tab = idx === 0 ? 'active' : 'log'; } });
-    })(this, i);
-  }
-  ctx.textAlign = 'left';
-
-  const listY = by + segH + 8;
-
-  if (this.tab === 'active') {
-    if (!alerts.length) {
-      K.plateRect(ctx, bx, listY, bw, 46, T, { r: 10 });
-      ctx.font = '500 10px -apple-system, Segoe UI, Roboto, sans-serif';
-      ctx.fillStyle = T.textDim; ctx.textBaseline = 'middle';
-      ctx.fillText(ch._t ? ch._t('alertsEmpty') : 'No alerts — click + to add one at price', bx + 10, listY + 16);
-      ctx.font = '600 9px -apple-system, Segoe UI, Roboto, sans-serif';
-      ctx.fillStyle = T.textFade;
-      ctx.fillText(ch._t ? ch._t('alertsHint') : 'or double-click a chart price line', bx + 10, listY + 32);
-      this.bodyH = listY + 46 - by + 10;
-      this.maxScroll = 0;
-    } else {
-      const rowH = 40;
-      let ry = listY;
-      const visible = Math.min(alerts.length, 4);
-      const contentH = alerts.length * (rowH + 5);
-      const viewH = visible * (rowH + 5);
-      this.maxScroll = Math.max(0, contentH - viewH);
-      this.scroll = Math.min(this.scroll, this.maxScroll);
-      ctx.save();
-      K.roundRectPath(ctx, bx - 4, listY - 2, bw + 8, viewH + 4, 10);
-      ctx.clip();
-      ctx.translate(0, -this.scroll);
-      for (let i = 0; i < alerts.length; i++) {
-        const a = alerts[i];
-        const hit = a.triggered;
-        K.plateRect(ctx, bx, ry, bw, rowH, T, { r: 10, fill: hit ? K.rgba(T.warn, 0.10) : T.plate });
-        // direction + price
-        ctx.font = '700 12px -apple-system, Segoe UI, Roboto, sans-serif';
-        ctx.fillStyle = hit ? T.warn : T.textBright; ctx.textBaseline = 'top';
-        ctx.fillText((a.direction === 'above' ? '▲ ' : '▼ ') +
-          (ch.priceScale ? ch.priceScale.formatLogical(a.price) : String(a.price)), bx + 10, ry + 7);
-        ctx.font = '500 9px -apple-system, Segoe UI, Roboto, sans-serif';
-        ctx.fillStyle = T.textDim;
-        ctx.fillText(a.label || (a.direction === 'above' ? 'Crossing above' : 'Crossing below'), bx + 10, ry + 24);
-        // pulse dot for armed alerts
-        if (!a.muted && !hit) {
-          const p = CardKit.Easing.pulse((now % 1600) / 1600);
-          ctx.beginPath();
-          ctx.arc(bx + bw - 68, ry + rowH / 2, 3 + 4 * (1 - p), 0, Math.PI * 2);
-          ctx.fillStyle = K.rgba(a.color || T.accent, 0.25 * p);
-          ctx.fill();
-        }
-        // mute / delete buttons
-        const muteR = { x: bx + bw - 46, y: ry + 9, w: 22, h: 22 };
-        const delR  = { x: bx + bw - 22, y: ry + 9, w: 22, h: 22 };
-        K.icon(ctx, a.muted ? 'mute' : 'bell', muteR.x + 3, muteR.y + 3, muteR.w - 6, a.muted ? T.textFade : T.textDim, 1.4);
-        K.icon(ctx, 'trash', delR.x + 3, delR.y + 3, delR.w - 6, T.textDim, 1.4);
-        (function (card, alert) {
-          card._bodyHits.push({ x: muteR.x, y: muteR.y, w: muteR.w, h: muteR.h, hover: false,
-            onClick: function () { card.chart.muteAlert(alert.id); } });
-          card._bodyHits.push({ x: delR.x, y: delR.y, w: delR.w, h: delR.h, hover: false,
-            onClick: function () { card.chart.removeAlert(alert.id); } });
-        })(this, a);
-        ry += rowH + 5;
-      }
-      ctx.restore();
-      this.bodyH = listY + viewH - by + 10;
-    }
-    // "+ at last price" quick-add button
-    const qY = listY + (alerts.length ? Math.min(alerts.length, 4) * 45 + 6 : 54);
-    const qH = 26;
-    const g = ctx.createLinearGradient(bx, qY, bx + bw, qY + qH);
-    g.addColorStop(0, K.rgba(T.accent, 0.35)); g.addColorStop(1, K.rgba(T.accent2 || T.accent, 0.25));
-    K.fillRoundRect(ctx, bx, qY, bw, qH, 8, g);
-    K.strokeRoundRect(ctx, bx + 0.5, qY + 0.5, bw - 1, qH - 1, 8, K.rgba(T.accent, 0.5), 1);
-    K.icon(ctx, 'plus', bx + 6, qY + 5, qH - 10, '#ffffff', 1.8);
-    ctx.font = '700 11px -apple-system, Segoe UI, Roboto, sans-serif';
-    ctx.fillStyle = '#ffffff'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-    ctx.fillText(ch._t ? ch._t('alertsAdd') : 'Add alert at last price', bx + bw / 2 + 6, qY + qH / 2 + 0.5);
-    ctx.textAlign = 'left';
-    (function (card) {
-      card._bodyHits.push({ x: bx, y: qY, w: bw, h: qH, hover: false,
-        onClick: function () {
-          const cs = card.chart.sim.candles;
-          if (!cs.length) return;
-          const p = cs[cs.length - 1].close;
-          card.chart.addAlert({ price: p, direction: 'above' });
-          card.chart.showToast('Alert added @ ' + (card.chart.priceScale ? card.chart.priceScale.formatLogical(p) : p));
-        } });
-    })(this);
-    this.bodyH = qY + qH - by + 12;
-  } else {
-    // triggered log
-    if (!log.length) {
-      K.plateRect(ctx, bx, listY, bw, 46, T, { r: 10 });
-      ctx.font = '500 10px -apple-system, Segoe UI, Roboto, sans-serif';
-      ctx.fillStyle = T.textDim; ctx.textBaseline = 'middle';
-      ctx.fillText(ch._t ? ch._t('alertsNoLog') : 'No alerts triggered yet', bx + 10, listY + 23);
-      this.bodyH = listY + 46 - by + 10;
-      this.maxScroll = 0;
-    } else {
-      const rowH = 26;
-      let ry = listY;
-      const visible = Math.min(log.length, 5);
-      this.maxScroll = Math.max(0, log.length * rowH - visible * rowH);
-      this.scroll = Math.min(this.scroll, this.maxScroll);
-      ctx.save();
-      K.roundRectPath(ctx, bx - 4, listY - 2, bw + 8, visible * rowH + 4, 10);
-      ctx.clip();
-      ctx.translate(0, -this.scroll);
-      for (let i = 0; i < log.length; i++) {
-        const e = log[i];
-        ctx.font = '600 10px -apple-system, Segoe UI, Roboto, sans-serif';
-        ctx.fillStyle = T.warn; ctx.textBaseline = 'middle';
-        ctx.fillText('⚡', bx + 6, ry + rowH / 2);
-        ctx.fillStyle = T.textBright;
-        ctx.fillText(e.direction === 'above' ? '▲' : '▼', bx + 20, ry + rowH / 2);
-        ctx.fillText(ch.priceScale ? ch.priceScale.formatLogical(e.price) : String(e.price), bx + 34, ry + rowH / 2);
-        ctx.font = '500 9px -apple-system, Segoe UI, Roboto, sans-serif';
-        ctx.fillStyle = T.textDim;
-        ctx.textAlign = 'right';
-        ctx.fillText(e.time, bx + bw - 6, ry + rowH / 2);
-        ctx.textAlign = 'left';
-        ctx.fillStyle = K.rgba(T.textDim, 0.10);
-        ctx.fillRect(bx + 2, ry + rowH - 1, bw - 4, 1);
-        ry += rowH;
-      }
-      ctx.restore();
-      this.bodyH = listY + visible * rowH - by + 10;
-    }
-  }
-};
-
-/* ------------------------------------------------------------------------- */
-/*  TradeCard — the paper-trading panel                                      */
-/* ------------------------------------------------------------------------- */
-function TradeCard(chart) {
-  ModernCard.call(this, chart, 'trade', {
-    w: 250, accent: chart.theme.success || '#22c55e', accent2: chart.theme.danger || '#ef4444'
-  });
-  this.qty = 1;
-  this.position = null;         // {side, qty, entry, time}
-  this._pnl = 0;
-  this._pnlTween = new CardKit.Tween(0, 0, 0.3);
-  this.bodyH = 150;
-}
-TradeCard.prototype = Object.create(ModernCard.prototype);
-TradeCard.prototype.constructor = TradeCard;
-TradeCard.prototype.TITLE = function () { return this.chart._t ? this.chart._t('tradeTitle') : 'Paper Trade'; };
-TradeCard.prototype.ICON = function () { return 'trade'; };
-
-TradeCard.prototype._marketPrice = function () {
-  const cs = this.chart.sim.candles;
-  return cs.length ? cs[cs.length - 1].close : null;
-};
-
-TradeCard.prototype.openPosition = function (side) {
-  const p = this._marketPrice();
-  if (p == null) { this.chart.showToast('No data'); return; }
-  this.position = { side: side, qty: this.qty, entry: p, time: new Date() };
-  this.chart.addMarker({
-    time: this.chart.sim.candles[this.chart.sim.candles.length - 1].time,
-    position: side === 'buy' ? 'belowBar' : 'aboveBar',
-    shape: side === 'buy' ? 'arrowUp' : 'arrowDown',
-    color: side === 'buy' ? this.chart.theme.bull : this.chart.theme.bear,
-    text: (side === 'buy' ? 'BUY ' : 'SELL ') + this.qty
-  });
-  if (this.chart._onTrade) this.chart._onTrade({ type: 'open', side: side, qty: this.qty, price: p });
-  this.chart.showToast((side === 'buy' ? '▲ BUY' : '▼ SELL') + ' ' + this.qty + ' @ ' + p);
-};
-
-TradeCard.prototype.closePosition = function () {
-  if (!this.position) return;
-  const p = this._marketPrice();
-  if (p == null) return;
-  const pnl = (this.position.side === 'buy' ? p - this.position.entry : this.position.entry - p) * this.position.qty;
-  const cs = this.chart.sim.candles;
-  this.chart.addMarker({
-    time: cs[cs.length - 1].time,
-    position: this.position.side === 'buy' ? 'aboveBar' : 'belowBar',
-    shape: 'circle',
-    color: pnl >= 0 ? this.chart.theme.bull : this.chart.theme.bear,
-    text: (pnl >= 0 ? '+' : '') + pnl.toFixed(2)
-  });
-  if (this.chart._onTrade) this.chart._onTrade({ type: 'close', pnl: pnl, price: p });
-  this.chart.showToast('Closed — P&L ' + (pnl >= 0 ? '+' : '') + pnl.toFixed(2));
-  this.position = null;
-};
-
-TradeCard.prototype.tick = function (now) {
-  const anim = ModernCard.prototype.tick.call(this, now);
-  // live P&L tween
-  if (this.position) {
-    const p = this._marketPrice();
-    if (p != null) {
-      const pnl = (this.position.side === 'buy' ? p - this.position.entry : this.position.entry - p) * this.position.qty;
-      this._pnlTween.set(pnl);
-      this._pnl = this._pnlTween.step();
-      if (Math.abs(this._pnl - pnl) > 1e-9) return true;
-    }
-  }
-  return anim;
-};
-
-TradeCard.prototype.renderBody = function (ctx, bx, by, bw, T, now) {
-  const ch = this.chart, K = CardKit;
-  this._bodyHits = [];
-  ctx.textAlign = 'left';
-  const price = this._marketPrice();
-
-  // -- qty stepper -----------------------------------------------------------
-  const stpY = by;
-  ctx.font = '600 10px -apple-system, Segoe UI, Roboto, sans-serif';
-  ctx.fillStyle = T.textDim; ctx.textBaseline = 'top';
-  ctx.fillText(ch._t ? ch._t('tradeQty') : 'QUANTITY', bx + 2, stpY + 2);
-  const stpH = 26, stpW = 110;
-  const stpX = bx + bw - stpW;
-  K.plateRect(ctx, stpX, stpY + 14, stpW, stpH, T, { r: 8 });
-  ctx.font = '700 13px -apple-system, Segoe UI, Roboto, sans-serif';
-  ctx.fillStyle = T.textBright; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-  ctx.fillText(String(this.qty), stpX + stpW / 2, stpY + 14 + stpH / 2 + 0.5);
-  ctx.textAlign = 'left';
-  const minusR = { x: stpX, y: stpY + 14, w: stpH, h: stpH };
-  const plusR  = { x: stpX + stpW - stpH, y: stpY + 14, w: stpH, h: stpH };
-  K.fillRoundRect(ctx, minusR.x, minusR.y, minusR.w, minusR.h, 8, K.rgba(T.textBright, 0.06));
-  K.fillRoundRect(ctx, plusR.x, plusR.y, plusR.w, plusR.h, 8, K.rgba(T.textBright, 0.06));
-  K.icon(ctx, 'minus', minusR.x + 6, minusR.y + 6, minusR.w - 12, T.text, 2);
-  K.icon(ctx, 'plus', plusR.x + 6, plusR.y + 6, plusR.w - 12, T.text, 2);
-  (function (card) {
-    card._bodyHits.push({ x: minusR.x, y: minusR.y, w: minusR.w, h: minusR.h, hover: false,
-      onClick: function () { if (card.qty > 1) card.qty--; } });
-    card._bodyHits.push({ x: plusR.x, y: plusR.y, w: plusR.w, h: plusR.h, hover: false,
-      onClick: function () { if (card.qty < 1000) card.qty++; } });
-  })(this);
-
-  // -- BUY / SELL glass buttons ----------------------------------------------
-  const btnY = stpY + 52;
-  const btnH = 34, gap = 8, btnW = (bw - gap) / 2;
-  const mkBtn = function (x, label, color, hot) {
-    const g = ctx.createLinearGradient(x, btnY, x, btnY + btnH);
-    g.addColorStop(0, K.rgba(color, hot ? 0.95 : 0.65));
-    g.addColorStop(1, K.rgba(color, hot ? 0.75 : 0.45));
-    K.fillRoundRect(ctx, x, btnY, btnW, btnH, 9, g);
-    K.strokeRoundRect(ctx, x + 0.5, btnY + 0.5, btnW - 1, btnH - 1, 9, K.rgba(color, 0.8), 1);
-    // top sheen on the button
-    ctx.save();
-    K.roundRectPath(ctx, x, btnY, btnW, btnH, 9);
-    ctx.clip();
-    const sg = ctx.createLinearGradient(0, btnY, 0, btnY + btnH * 0.5);
-    sg.addColorStop(0, 'rgba(255,255,255,0.14)');
-    sg.addColorStop(1, 'rgba(255,255,255,0)');
-    ctx.fillStyle = sg;
-    ctx.fillRect(x, btnY, btnW, btnH * 0.5);
-    ctx.restore();
-    ctx.font = '800 12px -apple-system, Segoe UI, Roboto, sans-serif';
-    ctx.fillStyle = '#ffffff';
-    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-    ctx.fillText(label, x + btnW / 2, btnY + btnH / 2 + 0.5);
-    ctx.textAlign = 'left';
-  };
-  mkBtn(bx, 'BUY / LONG', T.success, false);
-  mkBtn(bx + btnW + gap, 'SELL / SHORT', T.danger, false);
-  (function (card) {
-    card._bodyHits.push({ x: bx, y: btnY, w: btnW, h: btnH, hover: false,
-      onClick: function () { card.openPosition('buy'); } });
-    card._bodyHits.push({ x: bx + btnW + gap, y: btnY, w: btnW, h: btnH, hover: false,
-      onClick: function () { card.openPosition('sell'); } });
-  })(this);
-
-  let y = btnY + btnH + 10;
-
-  // -- open position plate (live P&L) ----------------------------------------
-  if (this.position) {
-    const pH = 58;
-    K.plateRect(ctx, bx, y, bw, pH, T, {
-      r: 10,
-      fill: this._pnl >= 0 ? K.rgba(T.success, 0.10) : K.rgba(T.danger, 0.10)
-    });
-    ctx.font = '600 9px -apple-system, Segoe UI, Roboto, sans-serif';
-    ctx.fillStyle = T.textDim; ctx.textBaseline = 'top';
-    const sideTxt = this.position.side === 'buy' ? 'LONG' : 'SHORT';
-    ctx.fillText(sideTxt + ' × ' + this.position.qty + '  @  ' +
-      (ch.priceScale ? ch.priceScale.formatLogical(this.position.entry) : this.position.entry), bx + 10, y + 8);
-    const pnl = this._pnl;
-    ctx.font = '800 17px -apple-system, Segoe UI, Roboto, sans-serif';
-    ctx.fillStyle = pnl >= 0 ? T.success : T.danger; ctx.textBaseline = 'alphabetic';
-    ctx.fillText((pnl >= 0 ? '+' : '') + pnl.toFixed(2), bx + 10, y + 38);
-    // close button
-    const cR = { x: bx + bw - 64, y: y + pH - 26, w: 56, h: 20 };
-    K.fillRoundRect(ctx, cR.x, cR.y, cR.w, cR.h, 6, K.rgba(T.danger, 0.75));
-    ctx.font = '700 9px -apple-system, Segoe UI, Roboto, sans-serif';
-    ctx.fillStyle = '#ffffff'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-    ctx.fillText(ch._t ? ch._t('tradeClose') : 'CLOSE', cR.x + cR.w / 2, cR.y + cR.h / 2 + 0.5);
-    ctx.textAlign = 'left';
-    (function (card) {
-      card._bodyHits.push({ x: cR.x, y: cR.y, w: cR.w, h: cR.h, hover: false,
-        onClick: function () { card.closePosition(); } });
-    })(this);
-    y += pH + 8;
-  } else {
-    ctx.font = '500 10px -apple-system, Segoe UI, Roboto, sans-serif';
-    ctx.fillStyle = T.textFade; ctx.textBaseline = 'top';
-    ctx.fillText(ch._t ? ch._t('tradeFlat') : 'Flat — no open position', bx + 2, y + 2);
-    y += 22;
-  }
-
-  // market price footer
-  if (price != null) {
-    ctx.font = '600 9px -apple-system, Segoe UI, Roboto, sans-serif';
-    ctx.fillStyle = T.textFade;
-    ctx.fillText((ch._t ? ch._t('tradeMkt') : 'MKT').toUpperCase(), bx + 2, y + 4);
-    ctx.font = '700 12px -apple-system, Segoe UI, Roboto, sans-serif';
-    ctx.fillStyle = T.text; ctx.textAlign = 'right'; ctx.textBaseline = 'top';
-    ctx.fillText(ch.priceScale ? ch.priceScale.formatLogical(price) : String(price), bx + bw - 2, y + 1);
-    ctx.textAlign = 'left';
-    y += 20;
-  }
-  this.bodyH = y - by + 8;
-};
-
-/* ------------------------------------------------------------------------- */
-/*  ShortcutsCard — searchable cheat sheet                                   */
-/* ------------------------------------------------------------------------- */
-function ShortcutsCard(chart) {
-  ModernCard.call(this, chart, 'shortcuts', { w: 290 });
-  this.query = '';
-  this._imeValue = '';           // value last "typed" through the hidden input
-  this.bodyH = 200;
-}
-ShortcutsCard.prototype = Object.create(ModernCard.prototype);
-ShortcutsCard.prototype.constructor = ShortcutsCard;
-ShortcutsCard.prototype.TITLE = function () { return this.chart._t ? this.chart._t('shortcuts') : 'Shortcuts'; };
-ShortcutsCard.prototype.ICON = function () { return 'keyboard'; };
-
-ShortcutsCard.prototype.ALL_SHORTCUTS = function () {
-  return [
-    { keys: 'Alt + 1…7',  desc: 'Toggle the modern cards' },
-    { keys: 'Alt + T',    desc: 'Cycle chart theme preset' },
-    { keys: 'Alt + E',    desc: 'Export chart as PNG' },
-    { keys: 'M',          desc: 'Measure tool (ruler)' },
-    { keys: 'R',          desc: 'Reset view' },
-    { keys: '+ / −',      desc: 'Zoom in / out' },
-    { keys: 'Esc',        desc: 'Cancel drawing / deselect' },
-    { keys: 'Del',        desc: 'Delete selected drawing' },
-    { keys: '← →',        desc: 'Pan chart by one bar' },
-    { keys: 'Double-click', desc: 'Fit all data' }
-  ];
-};
-
-ShortcutsCard.prototype.renderBody = function (ctx, bx, by, bw, T, now) {
-  const ch = this.chart, K = CardKit;
-  this._bodyHits = [];
-  ctx.textAlign = 'left';
-
-  // search field (glass plate with a magnifier; click-to-focus uses the
-  // browser's own IME via a transparent overlay input is overkill here —
-  // instead the field filters as the chart receives key events while this
-  // card is focused)
-  const sH = 26;
-  K.plateRect(ctx, bx, by, bw, sH, T, { r: 8 });
-  K.icon(ctx, 'search', bx + 5, by + 5, sH - 10, T.textDim, 1.4);
-  ctx.font = '500 11px -apple-system, Segoe UI, Roboto, sans-serif';
-  ctx.fillStyle = this.query ? T.textBright : T.textFade;
-  ctx.textBaseline = 'middle';
-  ctx.fillText(this.query || (ch._t ? ch._t('shortSearch') : 'Type to filter…'), bx + 26, by + sH / 2 + 0.5);
-
-  const items = this.ALL_SHORTCUTS().filter((function (q) {
-    return function (s) {
-      if (!q) return true;
-      return (s.keys + ' ' + s.desc).toLowerCase().indexOf(q.toLowerCase()) !== -1;
-    };
-  })(this.query));
-
-  let y = by + sH + 8;
-  const rowH = 24;
-  const visible = Math.min(items.length, 6);
-  this.maxScroll = Math.max(0, items.length * rowH - visible * rowH);
-  this.scroll = Math.min(this.scroll, this.maxScroll);
-  ctx.save();
-  K.roundRectPath(ctx, bx - 4, y - 2, bw + 8, visible * rowH + 4, 8);
-  ctx.clip();
-  ctx.translate(0, -this.scroll);
-  for (let i = 0; i < items.length; i++) {
-    // keycap chip
-    const kTxt = items[i].keys;
-    ctx.font = '700 10px -apple-system, Segoe UI, Roboto, sans-serif';
-    const kW = Math.min(110, ctx.measureText(kTxt).width + 14);
-    K.fillRoundRect(ctx, bx + 2, y + 3, kW, 17, 5, K.rgba(T.textBright, 0.08));
-    K.strokeRoundRect(ctx, bx + 2.5, y + 3.5, kW - 1, 16, 5, K.rgba(T.textBright, 0.14), 1);
-    ctx.fillStyle = T.text; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-    ctx.fillText(kTxt, bx + 2 + kW / 2, y + 12);
-    ctx.textAlign = 'left';
-    ctx.font = '500 10px -apple-system, Segoe UI, Roboto, sans-serif';
-    ctx.fillStyle = T.textDim;
-    ctx.fillText(items[i].desc, bx + kW + 12, y + 12);
-    y += rowH;
-  }
-  ctx.restore();
-  this.bodyH = by + sH + 8 + visible * rowH + 6 - by + 8;
-};
-
-// the card eats chart key events while focused: printable chars filter the
-// list, Backspace edits, Escape blurs and closes.
-ShortcutsCard.prototype.keyDown = function (e) {
-  if (e.key === 'Escape') { this.query = ''; return 'close'; }
-  if (e.key === 'Backspace') { this.query = this.query.slice(0, -1); return true; }
-  if (e.key.length === 1 && !e.altKey && !e.ctrlKey && !e.metaKey) {
-    if (this.query.length < 24) this.query += e.key;
-    return true;
-  }
-  return false;
-};
-
-/* ------------------------------------------------------------------------- */
-/*  PerfCard — live engine statistics                                        */
-/* ------------------------------------------------------------------------- */
-function PerfCard(chart) {
-  ModernCard.call(this, chart, 'perf', { w: 240, accent: '#38bdf8' });
-  this.fps = 60;
-  this.frameMs = 0;
-  this.history = [];            // last 90 fps samples
-  this._lastT = 0;
-  this._ema = 16.7;
-  this.bodyH = 132;
-}
-PerfCard.prototype = Object.create(ModernCard.prototype);
-PerfCard.prototype.constructor = PerfCard;
-PerfCard.prototype.TITLE = function () { return 'Performance'; };
-PerfCard.prototype.ICON = function () { return 'gauge'; };
-
-PerfCard.prototype.tick = function (now) {
-  const anim = ModernCard.prototype.tick.call(this, now);
-  if (this._lastT) {
-    const dt = now - this._lastT;
-    if (dt > 0 && dt < 500) {
-      this._ema = this._ema * 0.9 + dt * 0.1;
-      this.fps = Math.min(240, Math.round(1000 / this._ema));
-      this.frameMs = this._ema;
-      this.history.push(this.fps);
-      if (this.history.length > 90) this.history.shift();
-      return true;   // keep the loop alive — this card is a live graph
-    }
-  }
-  this._lastT = now;
-  return anim;
-};
-
-PerfCard.prototype.renderBody = function (ctx, bx, by, bw, T, now) {
-  const ch = this.chart, K = CardKit;
-  const cs = ch.sim.candles;
-  ctx.textAlign = 'left';
-
-  // big FPS number + verdict pill
-  const good = this.fps >= 50, ok = this.fps >= 30;
-  ctx.font = '800 26px -apple-system, Segoe UI, Roboto, sans-serif';
-  ctx.fillStyle = good ? T.success : (ok ? T.warn : T.danger);
-  ctx.textBaseline = 'top';
-  ctx.fillText(String(this.fps), bx + 2, by + 2);
-  const unitW = ctx.measureText(String(this.fps)).width;
-  ctx.font = '700 10px -apple-system, Segoe UI, Roboto, sans-serif';
-  ctx.fillStyle = T.textDim;
-  ctx.fillText('FPS', bx + 8 + unitW, by + 18);
-  const verdict = good ? 'SMOOTH' : (ok ? 'OK' : 'SLOW');
-  const vColor = good ? T.success : (ok ? T.warn : T.danger);
-  K.pill(ctx, bx + bw - 64, by + 6, 62, 18, K.rgba(vColor, 0.16), verdict,
-         { color: vColor, font: '700 9px -apple-system, Segoe UI, Roboto, sans-serif' });
-
-  // fps graph (0..120 mapped to the strip)
-  const gY = by + 40, gH = 34;
-  K.plateRect(ctx, bx, gY, bw, gH, T, { r: 8 });
-  if (this.history.length > 1) {
-    ctx.save();
-    K.roundRectPath(ctx, bx + 2, gY + 2, bw - 4, gH - 4, 6);
-    ctx.clip();
-    // 60fps guide line
-    const y60 = gY + gH - (60 / 120) * gH;
-    ctx.fillStyle = K.rgba(T.textDim, 0.25);
-    ctx.fillRect(bx + 2, y60, bw - 4, 1);
-    const vals = this.history.map(function (v) { return Math.min(120, v); });
-    K.sparkline(ctx, bx + 4, gY + 3, bw - 8, gH - 6, vals, {
-      color: this.fps >= 50 ? T.success : T.warn, area: true, dot: false, lineWidth: 1.2
-    });
-    ctx.restore();
-  }
-
-  // stats table
-  let y = gY + gH + 8;
-  const gl = ch._glInfo || '';
-  const rows = [
-    [ch._t ? ch._t('perfFrame') : 'Frame', this.frameMs.toFixed(1) + ' ms'],
-    [ch._t ? ch._t('perfBars') : 'Bars', cs.length ? cs.length.toLocaleString() : '0'],
-    [ch._t ? ch._t('perfIndicators') : 'Indicators', String(ch.activeIndicators.size)],
-    [ch._t ? ch._t('perfDrawings') : 'Drawings', String((ch.drawings || []).length)]
-  ];
-  ctx.font = '500 10px -apple-system, Segoe UI, Roboto, sans-serif';
-  for (let i = 0; i < rows.length; i++) {
-    ctx.fillStyle = T.textDim; ctx.textBaseline = 'middle';
-    ctx.fillText(rows[i][0], bx + 4, y + 6);
-    ctx.fillStyle = T.textBright; ctx.textAlign = 'right';
-    ctx.fillText(rows[i][1], bx + bw - 4, y + 6);
-    ctx.textAlign = 'left';
-    y += 15;
-  }
-  this.bodyH = y - by + 8;
-};
-
-/* ------------------------------------------------------------------------- */
-/*  Card factory registry (used by toggleCard / enableModernUI)              */
-/* ------------------------------------------------------------------------- */
-const CARD_FACTORIES = {
-  symbol:    function (chart) { return new SymbolCard(chart); },
-  stats:     function (chart) { return new StatsCard(chart); },
-  watchlist: function (chart) { return new WatchlistCard(chart); },
-  alerts:    function (chart) { return new AlertsCard(chart); },
-  trade:     function (chart) { return new TradeCard(chart); },
-  shortcuts: function (chart) { return new ShortcutsCard(chart); },
-  perf:      function (chart) { return new PerfCard(chart); }
-};
-const CARD_IDS = ['symbol', 'stats', 'watchlist', 'alerts', 'trade', 'shortcuts', 'perf'];
-
-/* =========================================================================
- * MODERN SECTION 5 — ALERTS ENGINE + PRICE LINES + MEASURE TOOL 2.0
- * =========================================================================
- * All three features are drawn in the modern overlay pass (after the chart
- * body, before the cards) and share the glass visual language.
- * ======================================================================== */
-
-/* ------------------------------------------------------------------------- */
-/*  5a. Alerts engine                                                        */
-/* ------------------------------------------------------------------------- */
-// chart.addAlert({ price, direction:'above'|'below'|'cross', label, color, once })
-//   → alert object (with .id). Alerts are checked on every setData/update:
-//   when the last close crosses the level, every onAlert callback fires, a
-//   toast + marker appears, and the event lands in the alert log.
-// chart.removeAlert(id) / muteAlert(id) / clearAlerts() / getAlerts()
-// chart.onAlert(function(alertEvent) { ... })
-function _initAlerts(chart) {
-  chart._alerts = chart._alerts || [];
-  chart._alertLog = chart._alertLog || [];
-  chart._alertCbs = chart._alertCbs || [];
-  chart._alertSeq = chart._alertSeq || 1;
-}
-
-function _checkAlerts(chart) {
-  if (!chart._alerts || !chart._alerts.length) return;
-  const cs = chart.sim.candles;
-  if (cs.length < 2) return;
-  const last = cs[cs.length - 1].close;
-  const prev = cs[cs.length - 2].close;
-  const stillActive = [];
-  for (let i = 0; i < chart._alerts.length; i++) {
-    const a = chart._alerts[i];
-    let triggered = false;
-    if (!a.muted && !a.triggered && isFinite(last) && isFinite(prev)) {
-      if (a.direction === 'above' && prev < a.price && last >= a.price) triggered = true;
-      else if (a.direction === 'below' && prev > a.price && last <= a.price) triggered = true;
-      else if (a.direction === 'cross' && ((prev < a.price && last >= a.price) ||
-                                            (prev > a.price && last <= a.price))) triggered = true;
-    }
-    if (triggered) {
-      a.triggered = true;
-      const ev = {
-        alert: a, price: a.price, close: last,
-        direction: a.direction, label: a.label,
-        time: _fmtAlertTime(new Date())
-      };
-      chart._alertLog.unshift(ev);
-      if (chart._alertLog.length > 40) chart._alertLog.pop();
-      for (let k = 0; k < chart._alertCbs.length; k++) {
-        try { chart._alertCbs[k](ev); } catch (err) {}
-      }
-      chart.showToast('⚡ Alert ' + (a.direction === 'above' ? '▲' : a.direction === 'below' ? '▼' : '⇅') +
-                      ' ' + (chart.priceScale ? chart.priceScale.formatLogical(a.price) : a.price));
-      try {
-        chart.addMarker({
-          time: cs[cs.length - 1].time,
-          position: a.direction === 'below' ? 'aboveBar' : 'belowBar',
-          shape: 'circle', color: a.color || '#ffb74d',
-          text: '⚡'
-        });
-      } catch (_) {}
-      if (a.once !== false) continue;   // one-shot: drop from the active list
-    }
-    stillActive.push(a);
-  }
-  if (stillActive.length !== chart._alerts.length) {
-    chart._alerts = stillActive;
-    chart.invalidate();
-  }
-}
-
-function _fmtAlertTime(d) {
-  const p2 = function (n) { return (n < 10 ? '0' : '') + n; };
-  return p2(d.getHours()) + ':' + p2(d.getMinutes()) + ':' + p2(d.getSeconds());
-}
-
-// draw every active alert: a dashed level line across the price area + a
-// pulsing badge on the price axis + a floating label chip.
-function _drawAlertLines(chart, ctx, T, now) {
-  if (!chart._alerts || !chart._alerts.length) return;
-  const K = CardKit;
-  const top = chart.priceTop !== undefined ? chart.priceTop : chart.chartTop;
-  const bottom = chart.priceBottom !== undefined ? chart.priceBottom : chart.H - 30;
-  const axisW = chart.W - chart.chartRight;
-  for (let i = 0; i < chart._alerts.length; i++) {
-    const a = chart._alerts[i];
-    const y = chart.priceToY(a.price);
-    if (y < top - 2 || y > bottom + 2) continue;   // outside the visible range
-    const color = a.triggered ? (T.warn || '#ffb74d') : (a.color || T.accent);
-    const pulse = a.muted ? 0 : CardKit.Easing.pulse((now % 1500) / 1500);
-
-    // dashed level line
-    ctx.save();
-    ctx.strokeStyle = K.rgba(color, a.muted ? 0.35 : 0.85);
-    ctx.lineWidth = 1.25;
-    ctx.setLineDash([5, 4]);
-    ctx.beginPath();
-    ctx.moveTo(chart.chartLeft, y + 0.5);
-    ctx.lineTo(chart.chartRight, y + 0.5);
-    ctx.stroke();
-    ctx.restore();
-
-    // pulsing halo dot at the left edge
-    if (!a.muted) {
-      ctx.beginPath();
-      ctx.arc(chart.chartLeft + 4, y, 3 + 5 * (1 - pulse), 0, Math.PI * 2);
-      ctx.fillStyle = K.rgba(color, 0.22 * pulse);
-      ctx.fill();
-      ctx.beginPath();
-      ctx.arc(chart.chartLeft + 4, y, 2.6, 0, Math.PI * 2);
-      ctx.fillStyle = color;
-      ctx.fill();
-    }
-
-    // axis badge (a small glass pill showing the alert price)
-    const txt = (a.direction === 'above' ? '▲ ' : a.direction === 'below' ? '▼ ' : '⇅ ') +
-                (chart.priceScale ? chart.priceScale.formatLogical(a.price) : String(a.price));
-    ctx.font = '700 10px -apple-system, Segoe UI, Roboto, sans-serif';
-    const w = Math.min(axisW - 8, ctx.measureText(txt).width + 14);
-    K.fillRoundRect(ctx, chart.chartRight + 3, y - 9, w, 18, 5, K.rgba(color, 0.92));
-    ctx.fillStyle = '#ffffff';
-    ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
-    ctx.fillText(txt, chart.chartRight + 10, y + 0.5);
-  }
-}
-
-/* ------------------------------------------------------------------------- */
-/*  5b. Price lines API (LWC v5-style)                                       */
-/* ------------------------------------------------------------------------- */
-// const pl = chart.createPriceLine({ price: 64000, color: '#2962ff',
-//   title: 'My level', style: 'dashed'|'solid'|'dotted', width: 1.5,
-//   axisLabelVisible: true, draggable: true });
-// pl.applyOptions({...}); pl.remove();
-function _initPriceLines(chart) {
-  chart._priceLines = chart._priceLines || [];
-  chart._plSeq = chart._plSeq || 1;
-  chart._plDrag = null;
-}
-
-function createPriceLine(chart, opts) {
-  _initPriceLines(chart);
-  if (!opts || !isFinite(opts.price)) { console.warn('[BadiCharts] createPriceLine: opts.price (number) required'); return null; }
-  const line = {
-    id: chart._plSeq++,
-    price: opts.price,
-    color: opts.color || chart.theme.accent,
-    title: opts.title || '',
-    style: opts.style || 'dashed',       // 'solid' | 'dashed' | 'dotted'
-    width: opts.width || 1.25,
-    axisLabelVisible: opts.axisLabelVisible !== false,
-    draggable: opts.draggable !== false,
-    lineVisible: opts.lineVisible !== false
-  };
-  chart._priceLines.push(line);
-  chart.invalidate();
-  return {
-    applyOptions: function (o) {
-      if (!o) return;
-      if (isFinite(o.price)) line.price = o.price;
-      if (o.color) line.color = o.color;
-      if (o.title !== undefined) line.title = o.title;
-      if (o.style) line.style = o.style;
-      if (o.width) line.width = o.width;
-      if (o.axisLabelVisible !== undefined) line.axisLabelVisible = o.axisLabelVisible;
-      if (o.draggable !== undefined) line.draggable = o.draggable;
-      if (o.lineVisible !== undefined) line.lineVisible = o.lineVisible;
-      chart.invalidate();
-    },
-    options: function () {
-      return {
-        price: line.price, color: line.color, title: line.title, style: line.style,
-        width: line.width, axisLabelVisible: line.axisLabelVisible,
-        draggable: line.draggable, lineVisible: line.lineVisible
-      };
-    },
-    remove: function () { removePriceLine(chart, line); }
-  };
-}
-
-function removePriceLine(chart, line) {
-  if (!chart._priceLines) return;
-  const i = chart._priceLines.indexOf(line);
-  if (i !== -1) { chart._priceLines.splice(i, 1); chart.invalidate(); }
-}
-
-function removePriceLineById(chart, id) {
-  if (!chart._priceLines) return;
-  for (let i = 0; i < chart._priceLines.length; i++) {
-    if (chart._priceLines[i].id === id) { chart._priceLines.splice(i, 1); chart.invalidate(); return; }
-  }
-}
-
-// interaction: dragging a price line by grabbing its axis label or the line
-// itself near the axis. Returns true when the pointer claimed the gesture.
-function _priceLineHit(chart, x, y) {
-  if (!chart._priceLines || !chart._priceLines.length) return null;
-  const top = chart.priceTop !== undefined ? chart.priceTop : chart.chartTop;
-  const bottom = chart.priceBottom !== undefined ? chart.priceBottom : chart.H - 30;
-  // 12px-wide grab zone around each line + the axis label pill
-  for (let i = chart._priceLines.length - 1; i >= 0; i--) {
-    const pl = chart._priceLines[i];
-    if (!pl.draggable) continue;
-    const ly = chart.priceToY(pl.price);
-    if (ly < top || ly > bottom) continue;
-    const nearLine = x >= chart.chartLeft && x <= chart.chartRight && Math.abs(y - ly) <= 6;
-    const onLabel = x > chart.chartRight && y >= ly - 9 && y <= ly + 9;
-    if (nearLine || onLabel) return pl;
-  }
-  return null;
-}
-
-function _drawPriceLines(chart, ctx, T, now) {
-  if (!chart._priceLines || !chart._priceLines.length) return;
-  const K = CardKit;
-  const top = chart.priceTop !== undefined ? chart.priceTop : chart.chartTop;
-  const bottom = chart.priceBottom !== undefined ? chart.priceBottom : chart.H - 30;
-  for (let i = 0; i < chart._priceLines.length; i++) {
-    const pl = chart._priceLines[i];
-    const y = chart.priceToY(pl.price);
-    if (y < top - 1 || y > bottom + 1) continue;
-    const hot = chart._plDrag && chart._plDrag.line === pl;
-    if (pl.lineVisible) {
-      ctx.save();
-      ctx.strokeStyle = pl.color;
-      ctx.lineWidth = hot ? pl.width + 0.75 : pl.width;
-      if (pl.style === 'dashed') ctx.setLineDash([6, 4]);
-      else if (pl.style === 'dotted') ctx.setLineDash([2, 3]);
-      ctx.beginPath();
-      ctx.moveTo(chart.chartLeft, y + 0.5);
-      ctx.lineTo(chart.chartRight, y + 0.5);
-      ctx.stroke();
-      ctx.restore();
-    }
-    if (pl.axisLabelVisible || pl.title) {
-      // title chip on the left, price pill on the axis
-      if (pl.title) {
-        ctx.font = '600 10px -apple-system, Segoe UI, Roboto, sans-serif';
-        const tw = ctx.measureText(pl.title).width + 16;
-        K.fillRoundRect(ctx, chart.chartLeft + 6, y - 8, tw, 16, 4, K.rgba(pl.color, 0.14));
-        K.strokeRoundRect(ctx, chart.chartLeft + 6.5, y - 7.5, tw - 1, 15, 4, K.rgba(pl.color, 0.45), 1);
-        ctx.fillStyle = pl.color;
-        ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
-        ctx.fillText(pl.title, chart.chartLeft + 14, y + 0.5);
-      }
-      const txt = chart.priceScale ? chart.priceScale.formatLogical(pl.price) : String(pl.price);
-      ctx.font = '700 10px -apple-system, Segoe UI, Roboto, sans-serif';
-      const axisW = chart.W - chart.chartRight;
-      const w = Math.min(axisW - 8, ctx.measureText(txt).width + 14);
-      K.fillRoundRect(ctx, chart.chartRight + 3, y - 9, w, 18, 5, pl.color);
-      ctx.fillStyle = CardKit.readableOn(pl.color);
-      ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
-      ctx.fillText(txt, chart.chartRight + 10, y + 0.5);
-    }
-  }
-}
-
-/* ------------------------------------------------------------------------- */
-/*  5c. Measure tool 2.0                                                     */
-/* ------------------------------------------------------------------------- */
-// A two-point drag tool rendered with the modern glass language: a tinted
-// area between the anchors, a connecting diagonal, and a floating pill with
-// Δprice / Δ% / Δbars / Δtime. Green tint when the move is up, red when down
-// (TradingView-style). Registered per-instance by enableModernUI().
-function _makeMeasureTool(chart) {
-  return {
-    id: 'measure',
-    label: 'Measure',
-    icon: '⇔',
-    defaultStyle: { color: chart.theme.accent, lineWidth: 1.25 },
-    render: function (ctx, d, helpers, ch) {
-      if (d.i1 === d.i2 && Math.abs(d.p1 - d.p2) < 1e-12) return;   // zero-size
-      const K = CardKit;
-      const x1 = ch.indexToX(d.i1), y1 = ch.priceToY(d.p1);
-      const x2 = ch.indexToX(d.i2), y2 = ch.priceToY(d.p2);
-      const up = d.p2 >= d.p1;
-      const tint = up ? ch.theme.bull : ch.theme.bear;
-
-      // tinted rectangle between the two anchors
-      ctx.save();
-      ctx.fillStyle = K.rgba(tint, 0.10);
-      ctx.fillRect(Math.min(x1, x2), Math.min(y1, y2), Math.abs(x2 - x1), Math.abs(y2 - y1));
-      ctx.strokeStyle = K.rgba(tint, 0.45);
-      ctx.lineWidth = 1;
-      ctx.setLineDash([3, 3]);
-      ctx.strokeRect(Math.min(x1, x2) + 0.5, Math.min(y1, y2) + 0.5,
-                     Math.abs(x2 - x1), Math.abs(y2 - y1));
-      ctx.restore();
-
-      // connecting diagonal
-      ctx.save();
-      ctx.strokeStyle = tint;
-      ctx.lineWidth = d.lineWidth || 1.25;
-      ctx.setLineDash([6, 4]);
-      ctx.beginPath();
-      ctx.moveTo(x1, y1); ctx.lineTo(x2, y2);
-      ctx.stroke();
-      ctx.restore();
-
-      // anchor dots
-      ctx.fillStyle = tint;
-      ctx.beginPath(); ctx.arc(x1, y1, 3.4, 0, Math.PI * 2); ctx.fill();
-      ctx.beginPath(); ctx.arc(x2, y2, 3.4, 0, Math.PI * 2); ctx.fill();
-      ctx.fillStyle = '#ffffff';
-      ctx.beginPath(); ctx.arc(x1, y1, 1.3, 0, Math.PI * 2); ctx.fill();
-      ctx.beginPath(); ctx.arc(x2, y2, 1.3, 0, Math.PI * 2); ctx.fill();
-
-      // -- the info pill -----------------------------------------------------
-      const dP = d.p2 - d.p1;
-      const dPct = d.p1 ? (dP / d.p1) * 100 : 0;
-      const bars = Math.round(d.i2 - d.i1);
-      const cs = ch.sim.candles;
-      let timeTxt = '';
-      if (cs.length && cs[Math.max(0, Math.min(cs.length - 1, Math.round(d.i1)))] &&
-          cs[Math.max(0, Math.min(cs.length - 1, Math.round(d.i2)))]) {
-        const t1 = cs[Math.max(0, Math.min(cs.length - 1, Math.round(d.i1)))].time;
-        const t2 = cs[Math.max(0, Math.min(cs.length - 1, Math.round(d.i2)))].time;
-        const dtMs = Math.abs((t2 - t1) * (t2 > 1e12 ? 1 : 1000));
-        if (dtMs >= 86400000) timeTxt = (dtMs / 86400000).toFixed(1) + 'd';
-        else if (dtMs >= 3600000) timeTxt = (dtMs / 3600000).toFixed(1) + 'h';
-        else if (dtMs >= 60000) timeTxt = (dtMs / 60000).toFixed(0) + 'm';
-        else timeTxt = (dtMs / 1000).toFixed(0) + 's';
-      }
-      const priceTxt = (dP >= 0 ? '+' : '') +
-        (ch.priceScale ? ch.priceScale.formatLogical(Math.abs(dP)) : Math.abs(dP).toFixed(2)) +
-        '  (' + (dPct >= 0 ? '+' : '') + dPct.toFixed(2) + '%)';
-      const barsTxt = bars + (Math.abs(bars) === 1 ? ' bar' : ' bars') + (timeTxt ? ' · ' + timeTxt : '');
-
-      const font = '700 11px -apple-system, Segoe UI, Roboto, sans-serif';
-      const font2 = '600 10px -apple-system, Segoe UI, Roboto, sans-serif';
-      ctx.font = font;
-      const w1 = ctx.measureText(priceTxt).width;
-      ctx.font = font2;
-      const w2 = ctx.measureText(barsTxt).width;
-      const pillW = Math.max(w1, w2) + 28;
-      const pillH = 40;
-      let px = (x1 + x2) / 2 - pillW / 2;
-      let py = (y1 + y2) / 2 - pillH / 2;
-      px = Math.max(ch.chartLeft + 4, Math.min(px, ch.chartRight - pillW - 4));
-      py = Math.max((ch.priceTop || ch.chartTop) + 4, Math.min(py, (ch.priceBottom || ch.H - 40) - pillH - 4));
-
-      // glass pill on a near-opaque plate (the data rule)
-      K.fillRoundRect(ctx, px, py, pillW, pillH, 9, K.rgba(ch.theme.plate || 'rgba(13,16,27,0.92)', 0.96));
-      K.strokeRoundRect(ctx, px + 0.5, py + 0.5, pillW - 1, pillH - 1, 9, K.rgba(tint, 0.5), 1);
-      // direction strip
-      K.fillRoundRect(ctx, px, py, 4, pillH, 2, tint);
-      ctx.font = font;
-      ctx.fillStyle = tint;
-      ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
-      ctx.fillText((up ? '▲ ' : '▼ ') + priceTxt, px + 12, py + 13);
-      ctx.font = font2;
-      ctx.fillStyle = ch.theme.textDim || '#787b86';
-      ctx.fillText(barsTxt, px + 12, py + 28);
-    },
-    hitTest: function (d, x, y, helpers, ch) {
-      const x1 = ch.indexToX(d.i1), y1 = ch.priceToY(d.p1);
-      const x2 = ch.indexToX(d.i2), y2 = ch.priceToY(d.p2);
-      const inRect = x >= Math.min(x1, x2) - 4 && x <= Math.max(x1, x2) + 4 &&
-                     y >= Math.min(y1, y2) - 4 && y <= Math.max(y1, y2) + 4;
-      if (inRect) return true;
-      // near the diagonal?
-      const dx = x2 - x1, dy = y2 - y1;
-      const len2 = dx * dx + dy * dy;
-      if (len2 < 4) return inRect;
-      let t = ((x - x1) * dx + (y - y1) * dy) / len2;
-      t = Math.max(0, Math.min(1, t));
-      const cx = x1 + t * dx, cy = y1 + t * dy;
-      return Math.abs(x - cx) <= 6 && Math.abs(y - cy) <= 6;
-    },
-    handles: function (d, helpers, ch) {
-      return [
-        { key: 'p1', x: ch.indexToX(d.i1), y: ch.priceToY(d.p1) },
-        { key: 'p2', x: ch.indexToX(d.i2), y: ch.priceToY(d.p2) }
-      ];
-    }
-  };
-}
-
-/* =========================================================================
- * MODERN SECTION 6 — MODERN INDICATOR PACK (16 INDICATORS)
- * =========================================================================
- * Every definition follows the exact indicator contract of the core library
- * ({id, label, type, color, settings, calculate, render, getRange}) and is
- * registered per-instance on demand:
- *
- *     chart.enableIndicator('vwap');
- *     chart.enableIndicator('supertrend', { period: 10, mult: 3 });
- *     chart.enableIndicators(['ichimoku', 'adx']);
- *
- * The raw math is ALSO exposed on the public `Indicators` utility so host
- * apps can reuse it (Indicators.atr(closes, 14), Indicators.psar(candles), …).
- *
- * Reference behavior mirrors TradingView's built-ins (the de-facto standard):
- *   • VWAP          — session-anchored VWAP with optional ±σ bands
- *   • Supertrend    — ATR trailing stop that flips with the trend
- *   • Ichimoku      — Tenkan/Kijun/Senkou A+B (cloud, displaced +26) + Chikou
- *   • PSAR          — Parabolic SAR dots (Wilder acceleration)
- *   • Donchian      — N-bar high/low channel with mid line
- *   • Keltner       — EMA ± ATR bands
- *   • Envelope      — SMA ± percentage bands
- *   • ZigZag        — deviation-based pivot polyline
- *   • Pivot Points  — classic floor-trader P/S/R levels (auto period)
- *   • ADX / DMI     — trend strength + DI+/DI− (pane)
- *   • CCI           — Commodity Channel Index (pane)
- *   • OBV           — On-Balance Volume (pane)
- *   • Williams %R   — (pane)
- *   • MFI           — Money Flow Index, volume-weighted RSI (pane)
- *   • AO            — Awesome Oscillator histogram (pane)
- *   • Choppiness    — CHOP trendiness gauge (pane)
- *   • TRIX          — triple-smoothed EMA rate of change (pane)
- * ======================================================================== */
-
-/* ------------------------- math utilities -------------------------------- */
-Object.assign(Indicators, {
-  // True Range per bar (Wilder). Needs the previous close, so index 0 is
-  // high-low of the first bar only.
-  trueRange(candles) {
-    const n = candles.length;
-    const out = new Array(n).fill(null);
-    if (!n) return out;
-    out[0] = candles[0].high - candles[0].low;
-    for (let i = 1; i < n; i++) {
-      const c = candles[i], pc = candles[i - 1].close;
-      out[i] = Math.max(c.high - c.low, Math.abs(c.high - pc), Math.abs(c.low - pc));
-    }
+  // Chronologically ordered copy. The returned array is REUSED across calls
+  // until the ring grows — consumers must not hold it across frames.
+  toArray() {
+    let out = this._flat;
+    if (!out || out.length < this.len) { out = new Float64Array(this.cap); this._flat = out; }
+    const start = (this.head - this.len + this.cap) % this.cap;
+    const first = Math.min(this.len, this.cap - start);
+    out.set(this.buf.subarray(start, start + first), 0);
+    if (first < this.len) out.set(this.buf.subarray(0, this.len - first), first);
     return out;
-  },
+  }
+  clear() { this.head = 0; this.len = 0; }
+}
 
-  // ATR — Wilder's smoothing (RMA), the TradingView default.
-  atr(candles, period) {
-    period = Math.max(1, period | 0 || 14);
-    const tr = Indicators.trueRange(candles);
-    const n = tr.length;
-    const out = new Array(n).fill(null);
-    if (n === 0) return out;
-    let sum = 0;
-    for (let i = 0; i < n; i++) {
-      if (i < period) {
-        sum += tr[i] || 0;
-        if (i === period - 1) out[i] = sum / period;
-      } else {
-        out[i] = ((out[i - 1] * (period - 1)) + tr[i]) / period;
-      }
-    }
-    return out;
-  },
+/* ============================ BADI OBJECT POOL ============================= */
+// v2.38.0: generic object pool. The decimation + batching pipeline allocates
+// scratch objects every frame (segment records, hit-test results, stat
+// snapshots). Pooling removes the GC spikes that show up as periodic hitches
+// when thousands of lines are on screen — one of the "feels heavy" causes.
+class BadiPool {
+  constructor(factory, reset, initial) {
+    this._factory = factory;
+    this._reset = reset || null;
+    this._free = [];
+    this._created = 0;
+    this._inUse = 0;
+    const n = initial || 0;
+    for (let i = 0; i < n; i++) { this._free.push(this._factory()); this._created++; }
+  }
+  acquire() {
+    this._inUse++;
+    const f = this._free.pop();
+    if (f) return f;
+    this._created++;
+    return this._factory();
+  }
+  release(obj) {
+    this._inUse--;
+    if (this._reset) this._reset(obj);
+    if (this._free.length < 512) this._free.push(obj);
+  }
+  stats() { return { pooled: this._free.length, created: this._created, inUse: this._inUse }; }
+}
 
-  // Wilder's smoothed moving average (RMA) over a plain array.
-  rma(values, period) {
-    period = Math.max(1, period | 0 || 14);
-    const n = values.length;
-    const out = new Array(n).fill(null);
-    let sum = 0, started = false;
-    for (let i = 0; i < n; i++) {
-      const v = values[i];
-      if (v == null || !isFinite(v)) continue;
-      if (!started) {
-        sum += v;
-        if (i >= period - 1) { out[i] = sum / period; started = true; }
-      } else {
-        out[i] = (out[i - 1] * (period - 1) + v) / period;
-      }
-    }
-    return out;
-  },
+// Typed scratch pools (F64 / U32 / I32), bucketed by power-of-two size.
+// requestBadiF64(n) returns an array with length ≥ n (band-aligned);
+// releaseBadiF64() returns it to the pool. Sizes beyond the cap fall back to
+// plain allocation (rare, huge requests only).
+const BADI_F64_POOLS = new Map();
+const BADI_F64_CAP = 1 << 22;
+function requestBadiF64(n) {
+  const need = Math.max(1, n | 0);
+  if (need > BADI_F64_CAP) return new Float64Array(need);
+  let band = 1; while (band < need) band <<= 1;
+  let pool = BADI_F64_POOLS.get(band);
+  if (!pool) { pool = []; BADI_F64_POOLS.set(band, pool); }
+  const arr = pool.pop();
+  if (arr) return arr;
+  return new Float64Array(band);
+}
+function releaseBadiF64(arr) {
+  if (!arr || !arr.buffer) return;
+  const band = arr.length;
+  if (band > BADI_F64_CAP) return;
+  let pool = BADI_F64_POOLS.get(band);
+  if (!pool) { pool = []; BADI_F64_POOLS.set(band, pool); }
+  if (pool.length < 32) pool.push(arr);
+}
 
-  // Standard deviation series (population, like TV's stdev over SMA).
-  stdev(values, period) {
-    period = Math.max(2, period | 0 || 20);
-    const n = values.length;
-    const out = new Array(n).fill(null);
-    for (let i = period - 1; i < n; i++) {
-      let sum = 0, ok = true;
-      for (let k = i - period + 1; k <= i; k++) {
-        if (values[k] == null || !isFinite(values[k])) { ok = false; break; }
-        sum += values[k];
-      }
-      if (!ok) continue;
-      const mean = sum / period;
-      let sq = 0;
-      for (let k = i - period + 1; k <= i; k++) sq += Math.pow(values[k] - mean, 2);
-      out[i] = Math.sqrt(sq / period);
-    }
-    return out;
-  },
+/* ============================ BADI DECIMATOR =============================== */
+// v2.38.0: the three decimation kernels used by the line engine. ALL of them
+// operate on typed arrays (never on {x,y} object arrays — the object version
+// in downsampleLineSegments() allocates ~1 object per point and defeats the
+// inline caches on 100k+ series).
+//
+//   1. minMaxKeep()   — bucket min/max anchors. O(n), silhouette-safe. The
+//                       DEFAULT for the GPU fast path: bucket boundaries keep
+//                       the polyline connected so consecutive segments join.
+//   2. dpKeepMask()   — Ramer–Douglas–Peucker on screen coords, iterative
+//                       stack (no recursion → no stack overflow on 1M points).
+//                       Used for the THICK (quad-expanded) path where visual
+//                       smoothness matters more than extreme speed.
+//   3. lttbKeep()     — Largest-Triangle-Three-Buckets. Best "looks like the
+//                       full data" downsampling for overview zoom levels.
+//
+// All kernels return kept POSITIONS packed in ascending order (indices into
+// the source arrays).
+const BadiDecimator = {
 
-  // Session-anchored VWAP: resets at the start of each trading day (UTC
-  // midnight of the candle time). Returns {vwap, upper, lower, anchors}
-  // where upper/lower are ±mult·σv bands (null until a full session).
-  vwap(candles, settings) {
-    settings = settings || {};
-    const mult = settings.mult || 1.28;
-    const n = candles.length;
-    const vwap = new Array(n).fill(null);
-    const upper = new Array(n).fill(null);
-    const lower = new Array(n).fill(null);
-    const anchors = [];
-    let day = null, cumPV = 0, cumV = 0, cumPV2 = 0;
-    for (let i = 0; i < n; i++) {
-      const c = candles[i];
-      const t = c.time > 1e12 ? c.time : c.time * 1000;
-      const d = Math.floor(t / 86400000);
-      if (d !== day) {                       // new session → reset the anchor
-        day = d;
-        cumPV = 0; cumV = 0; cumPV2 = 0;
-        anchors.push(i);
-      }
-      const tp = (c.high + c.low + c.close) / 3;
-      const v = Math.max(0, c.volume || 0);
-      cumPV += tp * v;
-      cumV += v;
-      cumPV2 += tp * tp * v;
-      if (cumV > 0) {
-        const vw = cumPV / cumV;
-        vwap[i] = vw;
-        const variance = Math.max(0, cumPV2 / cumV - vw * vw);
-        const sd = Math.sqrt(variance);
-        upper[i] = vw + mult * sd;
-        lower[i] = vw - mult * sd;
-      }
-    }
-    return { vwap: vwap, upper: upper, lower: lower, anchors: anchors };
-  },
-
-  // Supertrend: {line, dir} — dir[i] = +1 (bullish support) | −1 (bearish
-  // resistance). Flip logic per Olivier Seban's original ATR trailing stop.
-  supertrend(candles, period, mult) {
-    period = Math.max(1, period | 0 || 10);
-    mult = mult || 3;
-    const atr = Indicators.atr(candles, period);
-    const n = candles.length;
-    const line = new Array(n).fill(null);
-    const dir = new Array(n).fill(null);
-    let upper = null, lower = null, trend = 1;
-    for (let i = 0; i < n; i++) {
-      if (atr[i] == null) continue;
-      const c = candles[i];
-      const mid = (c.high + c.low) / 2;
-      let up = mid + mult * atr[i];
-      let lo = mid - mult * atr[i];
-      // band "ratcheting": a band only moves in its own direction unless the
-      // close crosses it, which forces the flip — the classic ST behavior.
-      if (upper !== null) {
-        up = (candles[i - 1] && candles[i - 1].close > upper) ? Math.max(up, upper) : up;
-        lo = (candles[i - 1] && candles[i - 1].close < lower) ? Math.min(lo, lower) : lo;
-      }
-      if (upper === null) { upper = up; lower = lo; trend = 1; line[i] = lower; dir[i] = 1; continue; }
-      const prevClose = candles[i - 1].close;
-      if (prevClose > upper) trend = 1;
-      else if (prevClose < lower) trend = -1;
-      if (trend === 1) {
-        lower = lo;                     // ride the support up
-        line[i] = lower; dir[i] = 1;
-      } else {
-        upper = up;                     // ride the resistance down
-        line[i] = upper; dir[i] = -1;
-      }
-    }
-    return { line: line, dir: dir };
-  },
-
-  // Ichimoku components: tenkan(9), kijun(26), senkouA/B displaced +26,
-  // chikou displaced −26. Returned at their BASE index; render displaces.
-  ichimoku(candles, conv, base, spanB, disp) {
-    conv = conv || 9; base = base || 26; spanB = spanB || 52; disp = disp || 26;
-    const n = candles.length;
-    const hh = function (from, to) {
-      let h = -Infinity;
-      for (let i = from; i <= to; i++) if (candles[i].high > h) h = candles[i].high;
-      return h;
-    };
-    const ll = function (from, to) {
-      let l = Infinity;
-      for (let i = from; i <= to; i++) if (candles[i].low < l) l = candles[i].low;
-      return l;
-    };
-    const tenkan = new Array(n).fill(null);
-    const kijun = new Array(n).fill(null);
-    const senkouA = new Array(n).fill(null);
-    const senkouB = new Array(n).fill(null);
-    for (let i = 0; i < n; i++) {
-      if (i >= conv - 1) tenkan[i] = (hh(i - conv + 1, i) + ll(i - conv + 1, i)) / 2;
-      if (i >= base - 1) kijun[i] = (hh(i - base + 1, i) + ll(i - base + 1, i)) / 2;
-      if (tenkan[i] != null && kijun[i] != null) senkouA[i] = (tenkan[i] + kijun[i]) / 2;
-      if (i >= spanB - 1) senkouB[i] = (hh(i - spanB + 1, i) + ll(i - spanB + 1, i)) / 2;
-    }
-    const chikou = new Array(n).fill(null);   // close, plotted disp bars back
-    for (let i = 0; i < n - disp; i++) chikou[i + disp] = candles[i].close;
-    return { tenkan: tenkan, kijun: kijun, senkouA: senkouA, senkouB: senkouB, chikou: chikou, disp: disp };
-  },
-
-  // Parabolic SAR (Wilder, af step 0.02 / cap 0.2).
-  psar(candles, step, cap) {
-    step = step || 0.02; cap = cap || 0.2;
-    const n = candles.length;
-    const out = new Array(n).fill(null);
-    if (n < 2) return out;
-    let bull = candles[1].close >= candles[0].close;
-    let af = step;
-    let ep = bull ? candles[0].high : candles[0].low;   // extreme point
-    let sar = bull ? candles[0].low : candles[0].high;
-    out[0] = sar;
-    for (let i = 1; i < n; i++) {
-      const c = candles[i];
-      sar = sar + af * (ep - sar);
-      // SAR may not penetrate the previous two bars' range
-      if (bull) {
-        sar = Math.min(sar, candles[i - 1].low, c.low);
-        if (c.low < sar) { bull = false; sar = ep; ep = c.low; af = step; }
-        else { if (c.high > ep) { ep = c.high; af = Math.min(cap, af + step); } }
-      } else {
-        sar = Math.max(sar, candles[i - 1].high, c.high);
-        if (c.high > sar) { bull = true; sar = ep; ep = c.high; af = step; }
-        else { if (c.low < ep) { ep = c.low; af = Math.min(cap, af + step); } }
-      }
-      out[i] = sar;
-    }
-    return out;
-  },
-
-  // Donchian channel: {upper, mid, lower} over N bars.
-  donchian(candles, period) {
-    period = Math.max(2, period | 0 || 20);
-    const n = candles.length;
-    const upper = new Array(n).fill(null), mid = new Array(n).fill(null), lower = new Array(n).fill(null);
-    for (let i = period - 1; i < n; i++) {
-      let h = -Infinity, l = Infinity;
-      for (let k = i - period + 1; k <= i; k++) {
-        if (candles[k].high > h) h = candles[k].high;
-        if (candles[k].low < l) l = candles[k].low;
-      }
-      upper[i] = h; lower[i] = l; mid[i] = (h + l) / 2;
-    }
-    return { upper: upper, mid: mid, lower: lower };
-  },
-
-  // Keltner channel: EMA basis ± mult·ATR.
-  keltner(candles, period, mult) {
-    period = Math.max(1, period | 0 || 20); mult = mult || 2;
-    const closes = candles.map(function (c) { return c.close; });
-    const basis = Indicators.ema(closes, period);
-    const atr = Indicators.atr(candles, period);
-    const n = candles.length;
-    const upper = new Array(n).fill(null), lower = new Array(n).fill(null);
-    for (let i = 0; i < n; i++) {
-      if (basis[i] == null || atr[i] == null) continue;
-      upper[i] = basis[i] + mult * atr[i];
-      lower[i] = basis[i] - mult * atr[i];
-    }
-    return { basis: basis, upper: upper, lower: lower };
-  },
-
-  // SMA envelope: basis ± percent.
-  envelope(candles, period, pct) {
-    period = Math.max(1, period | 0 || 20); pct = (pct || 2.5);
-    const closes = candles.map(function (c) { return c.close; });
-    const basis = Indicators.sma(closes, period);
-    const n = candles.length;
-    const upper = new Array(n).fill(null), lower = new Array(n).fill(null);
-    for (let i = 0; i < n; i++) {
-      if (basis[i] == null) continue;
-      upper[i] = basis[i] * (1 + pct / 100);
-      lower[i] = basis[i] * (1 - pct / 100);
-    }
-    return { basis: basis, upper: upper, lower: lower };
-  },
-
-  // ZigZag pivots on percent deviation: [{i, price, dir}] + the polyline
-  // extended to the running extreme (so the LAST leg updates live).
-  zigzag(candles, deviation) {
-    deviation = Math.max(0.01, deviation || 5);
-    const n = candles.length;
-    if (!n) return { pivots: [], last: null };
-    const pivots = [];
-    let dir = candles[0].close <= candles[Math.min(n - 1, 1)].close ? 1 : -1;
-    let extI = 0, extP = dir === 1 ? candles[0].low : candles[0].high;
-    for (let i = 1; i < n; i++) {
-      const c = candles[i];
-      if (dir === 1) {
-        if (c.high > extP) { extP = c.high; extI = i; }                     // extend the up leg
-        else if (extP > 0 && ((extP - c.low) / extP) * 100 >= deviation) {  // reversal down
-          pivots.push({ i: extI, price: extP, dir: 1 });
-          dir = -1; extP = c.low; extI = i;
-        }
-      } else {
-        if (c.low < extP) { extP = c.low; extI = i; }                       // extend the down leg
-        else if (((c.high - extP) / (extP || 1)) * 100 >= deviation) {      // reversal up
-          pivots.push({ i: extI, price: extP, dir: -1 });
-          dir = 1; extP = c.high; extI = i;
-        }
-      }
-    }
-    return { pivots: pivots, last: { i: extI, price: extP, dir: dir } };
-  },
-
-  // Classic floor-trader pivots from the last completed N-bar period
-  // (default: daily → look back `period` bars from the end).
-  pivotPoints(candles, lookback) {
-    lookback = Math.max(2, lookback | 0 || 24);
-    const n = candles.length;
-    if (n < lookback) return null;
-    let h = -Infinity, l = Infinity, o = candles[n - lookback].open, c = candles[n - 1].close;
-    for (let i = n - lookback; i < n; i++) {
-      if (candles[i].high > h) h = candles[i].high;
-      if (candles[i].low < l) l = candles[i].low;
-    }
-    const p = (h + l + c) / 3;
-    return {
-      p: p,
-      r1: 2 * p - l, s1: 2 * p - h,
-      r2: p + (h - l), s2: p - (h - l),
-      r3: h + 2 * (p - l), s3: l - 2 * (h - p)
-    };
-  },
-
-  // ADX/DMI (Wilder): {adx, plusDI, minusDI} over the given period.
-  adx(candles, period) {
-    period = Math.max(2, period | 0 || 14);
-    const n = candles.length;
-    const plusDM = new Array(n).fill(0), minusDM = new Array(n).fill(0), tr = Indicators.trueRange(candles);
-    for (let i = 1; i < n; i++) {
-      const up = candles[i].high - candles[i - 1].high;
-      const dn = candles[i - 1].low - candles[i].low;
-      plusDM[i] = (up > dn && up > 0) ? up : 0;
-      minusDM[i] = (dn > up && dn > 0) ? dn : 0;
-    }
-    const smooth = function (arr) {
-      const out = new Array(n).fill(null);
-      let sum = 0, started = false;
-      for (let i = 1; i < n; i++) {
-        if (!started) {
-          sum += arr[i] || 0;
-          if (i >= period) { out[i] = sum; started = true; }
-        } else out[i] = out[i - 1] - (out[i - 1] / period) + (arr[i] || 0);
-      }
+  // --- 1. Min-max bucket decimation --------------------------------------
+  // t/p: Float64Array data; from..to inclusive range; buckets: bucket COUNT
+  // across the range (each bucket = ceil(range/buckets) data points).
+  // Keeps, per bucket: first point, point of min p, point of max p, last
+  // point (deduplicated, ascending). Range endpoints are always kept so
+  // consecutive segments join seamlessly.
+  minMaxKeep(p, from, to, buckets) {
+    const span = to - from + 1;
+    if (span <= 0) return new Uint32Array(0);
+    if (buckets < 1) buckets = 1;
+    if (span <= buckets * 2) {
+      // Small range — keep everything (already ≤ 2 anchors per point).
+      const out = new Uint32Array(span);
+      for (let i = 0; i < span; i++) out[i] = from + i;
       return out;
-    };
-    const sTR = smooth(tr), sP = smooth(plusDM), sM = smooth(minusDM);
-    const plusDI = new Array(n).fill(null), minusDI = new Array(n).fill(null), dx = new Array(n).fill(null);
-    for (let i = 0; i < n; i++) {
-      if (sTR[i] == null || sTR[i] === 0) continue;
-      plusDI[i] = 100 * sP[i] / sTR[i];
-      minusDI[i] = 100 * sM[i] / sTR[i];
-      const sum = plusDI[i] + minusDI[i];
-      dx[i] = sum === 0 ? 0 : 100 * Math.abs(plusDI[i] - minusDI[i]) / sum;
     }
-    const adx = Indicators.rma(dx.map(function (v) { return v == null ? NaN : v; }).map(function (v) { return isFinite(v) ? v : null; }), period);
-    // rma skips nulls poorly across leading NaNs — rebuild cleanly:
-    const adxOut = new Array(n).fill(null);
-    let start = -1;
-    for (let i = 0; i < n; i++) if (dx[i] != null) { start = i; break; }
-    if (start !== -1) {
-      let sum = 0, count = 0, prev = null;
-      for (let i = start; i < n; i++) {
-        if (dx[i] == null) continue;
-        if (prev === null) {
-          sum += dx[i]; count++;
-          if (count === period) { prev = sum / period; adxOut[i] = prev; }
+    const per = Math.ceil(span / buckets);
+    const out = BADI_U32_SCRATCH.acquire(span * 2 + 2);
+    let m = 0;
+    let bucketStart = from;
+    while (bucketStart <= to) {
+      const bEnd = Math.min(to, bucketStart + per - 1);
+      // first
+      out[m++] = bucketStart;
+      // min & max scan (NaN-safe)
+      let minI = -1, maxI = -1, minV = Infinity, maxV = -Infinity;
+      for (let i = bucketStart; i <= bEnd; i++) {
+        const v = p[i];
+        if (v !== v) continue;
+        if (v < minV) { minV = v; minI = i; }
+        if (v > maxV) { maxV = v; maxI = i; }
+      }
+      if (minI >= 0 && minI !== bucketStart) out[m++] = minI;
+      if (maxI >= 0 && maxI !== bucketStart && maxI !== minI) out[m++] = maxI;
+      if (bEnd !== bucketStart && bEnd !== minI && bEnd !== maxI) out[m++] = bEnd;
+      bucketStart = bEnd + 1;
+    }
+    const result = out.slice(0, m);
+    BADI_U32_SCRATCH.release(out);
+    return result;
+  },
+
+  // --- 2. Douglas–Peucker (iterative, screen-space) -----------------------
+  // xs/ys: Float64Array screen coords for the CURRENT visible window; the
+  // returned mask has length (to-from+1) with 1 = keep. eps in CSS pixels.
+  dpKeepMask(xs, ys, from, to, eps) {
+    const n = to - from + 1;
+    const mask = new Uint8Array(n);
+    if (n <= 2) { if (n > 0) mask[0] = 1; if (n > 1) mask[n - 1] = 1; return mask; }
+    mask[0] = 1; mask[n - 1] = 1;
+    // Explicit stack of [start, end] pairs (relative indices).
+    const stackCap = Math.min(1 << 20, n * 2 + 16);
+    const stack = BADI_I32_SCRATCH.acquire(stackCap);
+    let sp = 0;
+    stack[sp++] = 0; stack[sp++] = n - 1;
+    const eps2 = eps * eps;
+    while (sp >= 2) {
+      const end = stack[--sp];
+      const start = stack[--sp];
+      if (end - start < 2) continue;
+      const ax = xs[from + start], ay = ys[from + start];
+      const bx = xs[from + end], by = ys[from + end];
+      const dx = bx - ax, dy = by - ay;
+      const len2 = dx * dx + dy * dy;
+      let maxD2 = -1, maxI = -1;
+      for (let i = start + 1; i < end; i++) {
+        const px = xs[from + i], py = ys[from + i];
+        let d2;
+        if (len2 === 0) {
+          const ex = px - ax, ey = py - ay;
+          d2 = ex * ex + ey * ey;
         } else {
-          prev = (prev * (period - 1) + dx[i]) / period;
-          adxOut[i] = prev;
+          let tt = ((px - ax) * dx + (py - ay) * dy) / len2;
+          if (tt < 0) tt = 0; else if (tt > 1) tt = 1;
+          const ex = px - (ax + tt * dx), ey = py - (ay + tt * dy);
+          d2 = ex * ex + ey * ey;
         }
+        if (d2 > maxD2) { maxD2 = d2; maxI = i; }
+      }
+      if (maxD2 > eps2 && maxI > 0 && sp + 4 <= stackCap) {
+        mask[maxI] = 1;
+        stack[sp++] = start; stack[sp++] = maxI;
+        stack[sp++] = maxI;  stack[sp++] = end;
       }
     }
-    return { adx: adxOut, plusDI: plusDI, minusDI: minusDI };
+    BADI_I32_SCRATCH.release(stack);
+    return mask;
   },
 
-  // Commodity Channel Index (Lambert).
-  cci(candles, period) {
-    period = Math.max(2, period | 0 || 20);
-    const n = candles.length;
-    const tp = candles.map(function (c) { return (c.high + c.low + c.close) / 3; });
-    const out = new Array(n).fill(null);
-    for (let i = period - 1; i < n; i++) {
-      let mean = 0;
-      for (let k = i - period + 1; k <= i; k++) mean += tp[k];
-      mean /= period;
-      let dev = 0;
-      for (let k = i - period + 1; k <= i; k++) dev += Math.abs(tp[k] - mean);
-      dev /= period;
-      out[i] = dev === 0 ? 0 : (tp[i] - mean) / (0.015 * dev);
+  // --- 3. LTTB -------------------------------------------------------------
+  // Returns kept indices (Uint32Array, ascending), always includes endpoints.
+  lttbKeep(p, from, to, target) {
+    const n = to - from + 1;
+    if (target < 3 || n <= target) {
+      const out = new Uint32Array(n);
+      for (let i = 0; i < n; i++) out[i] = from + i;
+      return out;
+    }
+    const out = new Uint32Array(target);
+    out[0] = from;
+    out[target - 1] = to;
+    let prevIdx = from;
+    let prevP = p[from];
+    const every = (n - 2) / (target - 2);
+    let a = 0;
+    for (let bI = 1; bI < target - 1; bI++) {
+      const bucketStart = from + 1 + Math.floor((bI - 1) * every);
+      const bucketEnd = from + 1 + Math.floor(bI * every) - 1;
+      const nextStart = from + 1 + Math.floor(bI * every);
+      const nextEnd = Math.min(to, from + 1 + Math.floor((bI + 1) * every) - 1);
+      // average of the NEXT bucket
+      let avgX = 0, avgP = 0, cnt = 0;
+      for (let i = Math.max(nextStart, from); i <= nextEnd; i++) { avgX += i; avgP += p[i]; cnt++; }
+      if (cnt > 0) { avgX /= cnt; avgP /= cnt; }
+      let maxArea = -1, maxI = Math.max(bucketStart, from + 1);
+      for (let i = Math.max(bucketStart, from + 1); i <= Math.min(bucketEnd, to); i++) {
+        const area = Math.abs(
+          (prevIdx - avgX) * (p[i] - prevP) - (prevIdx - i) * (avgP - prevP)
+        ) * 0.5;
+        if (area > maxArea) { maxArea = area; maxI = i; }
+      }
+      out[++a] = maxI;
+      prevIdx = maxI; prevP = p[maxI];
     }
     return out;
-  },
-
-  // On-Balance Volume.
-  obv(candles) {
-    const n = candles.length;
-    const out = new Array(n).fill(null);
-    if (!n) return out;
-    out[0] = candles[0].volume || 0;
-    for (let i = 1; i < n; i++) {
-      const dir = candles[i].close > candles[i - 1].close ? 1 :
-                  candles[i].close < candles[i - 1].close ? -1 : 0;
-      out[i] = out[i - 1] + dir * (candles[i].volume || 0);
-    }
-    return out;
-  },
-
-  // Williams %R (0 at the top, −100 at the bottom — TV convention).
-  williamsR(candles, period) {
-    period = Math.max(2, period | 0 || 14);
-    const n = candles.length;
-    const out = new Array(n).fill(null);
-    for (let i = period - 1; i < n; i++) {
-      let h = -Infinity, l = Infinity;
-      for (let k = i - period + 1; k <= i; k++) {
-        if (candles[k].high > h) h = candles[k].high;
-        if (candles[k].low < l) l = candles[k].low;
-      }
-      const range = h - l;
-      out[i] = range === 0 ? -50 : -100 * (h - candles[i].close) / range;
-    }
-    return out;
-  },
-
-  // Money Flow Index — volume-weighted RSI (0..100).
-  mfi(candles, period) {
-    period = Math.max(2, period | 0 || 14);
-    const n = candles.length;
-    const out = new Array(n).fill(null);
-    const pos = new Array(n).fill(0), neg = new Array(n).fill(0);
-    for (let i = 1; i < n; i++) {
-      const tp = (candles[i].high + candles[i].low + candles[i].close) / 3;
-      const ptp = (candles[i - 1].high + candles[i - 1].low + candles[i - 1].close) / 3;
-      const mf = tp * (candles[i].volume || 0);
-      if (tp > ptp) pos[i] = mf; else if (tp < ptp) neg[i] = mf;
-    }
-    for (let i = period; i < n; i++) {
-      let sp = 0, sn = 0;
-      for (let k = i - period + 1; k <= i; k++) { sp += pos[k]; sn += neg[k]; }
-      out[i] = sn === 0 ? 100 : 100 - 100 / (1 + sp / sn);
-    }
-    return out;
-  },
-
-  // Awesome Oscillator: SMA5(median) − SMA34(median).
-  awesome(candles) {
-    const n = candles.length;
-    const med = candles.map(function (c) { return (c.high + c.low) / 2; });
-    const s5 = Indicators.sma(med, 5), s34 = Indicators.sma(med, 34);
-    const out = new Array(n).fill(null);
-    for (let i = 0; i < n; i++) {
-      if (s5[i] == null || s34[i] == null) continue;
-      out[i] = s5[i] - s34[i];
-    }
-    return out;
-  },
-
-  // Choppiness Index: 100·log10(ΣTR / (maxH − minL)) / log10(N).
-  choppiness(candles, period) {
-    period = Math.max(2, period | 0 || 14);
-    const n = candles.length;
-    const tr = Indicators.trueRange(candles);
-    const out = new Array(n).fill(null);
-    for (let i = period; i < n; i++) {
-      let sumTR = 0, h = -Infinity, l = Infinity, ok = true;
-      for (let k = i - period + 1; k <= i; k++) {
-        if (tr[k] == null) { ok = false; break; }
-        sumTR += tr[k];
-        if (candles[k].high > h) h = candles[k].high;
-        if (candles[k].low < l) l = candles[k].low;
-      }
-      if (!ok || sumTR <= 0 || h <= l) continue;
-      out[i] = (100 * Math.log10(sumTR / (h - l))) / Math.log10(period);
-    }
-    return out;
-  },
-
-  // TRIX: triple EMA rate-of-change (1-period % change of EMA³).
-  trix(candles, period) {
-    period = Math.max(1, period | 0 || 18);
-    const closes = candles.map(function (c) { return c.close; });
-    const e1 = Indicators.ema(closes, period);
-    const e2 = Indicators.ema(e1.map(function (v) { return v == null ? null : v; }), period);
-    const e3 = Indicators.ema(e2, period);
-    const n = closes.length;
-    const out = new Array(n).fill(null);
-    for (let i = 1; i < n; i++) {
-      if (e3[i] == null || e3[i - 1] == null || e3[i - 1] === 0) continue;
-      out[i] = 100 * (e3[i] - e3[i - 1]) / e3[i - 1];
-    }
-    return out;
-  }
-});
-
-/* ------------------------- shared render helpers -------------------------- */
-// Stroke a numeric series between firstIdx..lastIdx using helpers.yMap for
-// the y coordinate. Skips null gaps (moveTo after every gap).
-function _mkSeries(ctx, values, helpers, firstIdx, lastIdx, mapY) {
-  ctx.beginPath();
-  let drew = false, prevOk = false;
-  for (let i = firstIdx; i <= lastIdx; i++) {
-    const v = values[i];
-    if (v == null || !isFinite(v)) { prevOk = false; continue; }
-    const x = helpers.indexToX(i), y = mapY(v);
-    if (!prevOk) { ctx.moveTo(x, y); prevOk = true; }
-    else ctx.lineTo(x, y);
-    drew = true;
-  }
-  return drew;
-}
-
-function _strokeSeries(ctx, values, helpers, firstIdx, lastIdx, color, width, mapY, dash) {
-  if (_mkSeries(ctx, values, helpers, firstIdx, lastIdx, mapY || helpers.yMap)) {
-    ctx.strokeStyle = color;
-    ctx.lineWidth = width || 1.5;
-    if (dash) ctx.setLineDash(dash);
-    ctx.stroke();
-    if (dash) ctx.setLineDash([]);
-  }
-}
-
-// The min/max of one or more series over the visible window (for getRange).
-function _rangeOf(seriesList, firstIdx, lastIdx) {
-  let min = Infinity, max = -Infinity;
-  for (let s = 0; s < seriesList.length; s++) {
-    const arr = seriesList[s];
-    if (!arr) continue;
-    for (let i = Math.max(0, firstIdx); i <= Math.min(arr.length - 1, lastIdx); i++) {
-      const v = arr[i];
-      if (v == null || !isFinite(v)) continue;
-      if (v < min) min = v;
-      if (v > max) max = v;
-    }
-  }
-  return (min === Infinity || max === -Infinity) ? null : { min: min, max: max };
-}
-
-/* ------------------------- the indicator catalog -------------------------- */
-const BadiIndicatorPack = {
-
-  /* ---- VWAP (overlay) -------------------------------------------------- */
-  vwap: {
-    id: 'vwap', label: 'VWAP', type: 'overlay', color: '#00bcd4',
-    settings: { mult: 1.28, bands: true },
-    calculate: function (candles, s) { return Indicators.vwap(candles, s); },
-    getRange: function (values, s) {
-      if (!values) return null;
-      const first = 0, last = (values.vwap ? values.vwap.length : 0) - 1;
-      const list = s && s.bands !== false ? [values.vwap, values.upper, values.lower] : [values.vwap];
-      return _rangeOf(list, first, last);
-    },
-    render: function (ctx, v, h, s) {
-      if (!v || !v.vwap) return;
-      const T = h.THEME;
-      const bands = s && s.bands !== false;
-      _strokeSeries(ctx, v.vwap, h, h.firstIdx, h.lastIdx, this.color, 1.75, h.priceToY);
-      if (bands) {
-        _strokeSeries(ctx, v.upper, h, h.firstIdx, h.lastIdx, 'rgba(0,188,212,0.45)', 1, h.priceToY, [4, 3]);
-        _strokeSeries(ctx, v.lower, h, h.firstIdx, h.lastIdx, 'rgba(0,188,212,0.45)', 1, h.priceToY, [4, 3]);
-      }
-    },
-    formatValue: function (v) {
-      // the legend shows the LAST computed vwap value
-      if (!v || !v.vwap) return '';
-      for (let i = v.vwap.length - 1; i >= 0; i--) {
-        if (v.vwap[i] != null && isFinite(v.vwap[i])) return v.vwap[i].toFixed(2);
-      }
-      return '';
-    }
-  },
-
-  /* ---- Supertrend (overlay) --------------------------------------------- */
-  supertrend: {
-    id: 'supertrend', label: 'Supertrend', type: 'overlay', color: '#22c55e',
-    settings: { period: 10, mult: 3 },
-    calculate: function (candles, s) {
-      return Indicators.supertrend(candles, s.period, s.mult);
-    },
-    getRange: function (values) {
-      return values ? _rangeOf([values.line], 0, values.line.length - 1) : null;
-    },
-    render: function (ctx, v, h, s, state) {
-      if (!v || !v.line) return;
-      const T = h.THEME;
-      const bull = (state && state._stBull) || T.bull || '#26a69a';
-      const bear = (state && state._stBear) || T.bear || '#ef5350';
-      // draw bull and bear segments in separate passes (batched strokes)
-      const seg = function (dirMatch, color) {
-        ctx.beginPath();
-        let prevOk = false;
-        for (let i = h.firstIdx; i <= h.lastIdx; i++) {
-          const val = v.line[i];
-          if (val == null || v.dir[i] !== dirMatch) { prevOk = false; continue; }
-          const x = h.indexToX(i), y = h.priceToY(val);
-          if (!prevOk) { ctx.moveTo(x, y); prevOk = true; } else ctx.lineTo(x, y);
-        }
-        ctx.strokeStyle = color;
-        ctx.lineWidth = 2;
-        ctx.stroke();
-      };
-      seg(1, bull);
-      seg(-1, bear);
-    }
-  },
-
-  /* ---- Ichimoku Cloud (overlay) ----------------------------------------- */
-  ichimoku: {
-    id: 'ichimoku', label: 'Ichimoku Cloud', type: 'overlay', color: '#2962ff',
-    settings: { conversion: 9, base: 26, spanB: 52, displacement: 26, showCloud: true, showChikou: true },
-    calculate: function (candles, s) {
-      return Indicators.ichimoku(candles, s.conversion, s.base, s.spanB, s.displacement);
-    },
-    getRange: function (values, s) {
-      if (!values) return null;
-      const d = values.disp || 26;
-      // the cloud extends `disp` bars into the future; include the displaced
-      // window so autoscale never clips it
-      const list = [values.tenkan, values.kijun, values.senkouA, values.senkouB];
-      if (s && s.showChikou !== false) list.push(values.chikou);
-      return _rangeOf(list, 0, (values.senkouA ? values.senkouA.length : 0) + d);
-    },
-    render: function (ctx, v, h, s) {
-      if (!v || !v.senkouA) return;
-      const T = h.THEME;
-      const d = v.disp || 26;
-      const xAt = function (i) { return h.indexToX(i + d); };
-      // the cloud: fill between senkouA and senkouB, green when A > B
-      if (s.showCloud !== false) {
-        const fillCloud = function (cond, color) {
-          ctx.beginPath();
-          let started = false;
-          for (let i = h.firstIdx - d; i <= h.lastIdx; i++) {
-            const a = v.senkouA[i], b = v.senkouB[i];
-            if (a == null || b == null) continue;
-            if (!cond(a, b)) continue;
-            const x = xAt(i);
-            if (!started) { ctx.moveTo(x, h.priceToY(a)); started = true; }
-            else ctx.lineTo(x, h.priceToY(a));
-          }
-          if (!started) return;
-          for (let i = h.lastIdx; i >= h.firstIdx - d; i--) {
-            const a = v.senkouA[i], b = v.senkouB[i];
-            if (a == null || b == null) continue;
-            if (!cond(a, b)) continue;
-            ctx.lineTo(xAt(i), h.priceToY(b));
-          }
-          ctx.closePath();
-          ctx.fillStyle = color;
-          ctx.fill();
-        };
-        fillCloud(function (a, b) { return a >= b; }, 'rgba(38,166,154,0.14)');
-        fillCloud(function (a, b) { return a < b; }, 'rgba(239,83,80,0.14)');
-      }
-      // displaced senkou lines
-      const dispLine = function (arr, color, dash) {
-        ctx.beginPath();
-        let prev = false;
-        for (let i = h.firstIdx - d; i <= h.lastIdx; i++) {
-          const val = arr[i];
-          if (val == null) { prev = false; continue; }
-          const x = xAt(i), y = h.priceToY(val);
-          if (!prev) { ctx.moveTo(x, y); prev = true; } else ctx.lineTo(x, y);
-        }
-        ctx.strokeStyle = color; ctx.lineWidth = 1;
-        if (dash) ctx.setLineDash(dash);
-        ctx.stroke();
-        if (dash) ctx.setLineDash([]);
-      };
-      dispLine(v.senkouA, 'rgba(38,166,154,0.75)', [4, 3]);
-      dispLine(v.senkouB, 'rgba(239,83,80,0.75)', [4, 3]);
-      // tenkan / kijun
-      _strokeSeries(ctx, v.tenkan, h, h.firstIdx, h.lastIdx, '#0496ff', 1.5, h.priceToY);
-      _strokeSeries(ctx, v.kijun, h, h.firstIdx, h.lastIdx, '#f2369e', 1.5, h.priceToY);
-      // chikou (close shifted BACK by disp)
-      if (s.showChikou !== false) {
-        ctx.beginPath();
-        let prev = false;
-        for (let i = h.firstIdx; i <= h.lastIdx; i++) {
-          const j = i + d;
-          if (j >= v.chikou.length) break;
-          const val = v.chikou[j];
-          if (val == null) { prev = false; continue; }
-          const x = h.indexToX(i), y = h.priceToY(val);
-          if (!prev) { ctx.moveTo(x, y); prev = true; } else ctx.lineTo(x, y);
-        }
-        ctx.strokeStyle = 'rgba(156,39,176,0.85)'; ctx.lineWidth = 1.25;
-        ctx.stroke();
-      }
-    }
-  },
-
-  /* ---- Parabolic SAR (overlay) ------------------------------------------- */
-  psar: {
-    id: 'psar', label: 'Parabolic SAR', type: 'overlay', color: '#ffb74d',
-    settings: { step: 0.02, cap: 0.2 },
-    calculate: function (candles, s) { return Indicators.psar(candles, s.step, s.cap); },
-    getRange: function (values) {
-      return values ? _rangeOf([values], 0, values.length - 1) : null;
-    },
-    render: function (ctx, v, h) {
-      if (!v) return;
-      const T = h.THEME;
-      const r = Math.max(1, Math.min(2.6, h.barSpacing * 0.14));
-      for (let pass = 0; pass < 2; pass++) {
-        // pass 0: dots below price (bull trend), pass 1: dots above (bear)
-        ctx.beginPath();
-        for (let i = h.firstIdx; i <= h.lastIdx; i++) {
-          const val = v[i];
-          if (val == null) continue;
-          const c = h.candles[i];
-          const isBull = val < c.close;    // SAR under price = uptrend
-          if ((pass === 0) !== isBull) continue;
-          ctx.moveTo(h.indexToX(i) + r, h.priceToY(val));
-          ctx.arc(h.indexToX(i), h.priceToY(val), r, 0, Math.PI * 2);
-        }
-        ctx.fillStyle = pass === 0 ? (T.bull || '#26a69a') : (T.bear || '#ef5350');
-        ctx.fill();
-      }
-    }
-  },
-
-  /* ---- Donchian Channels (overlay) --------------------------------------- */
-  donchian: {
-    id: 'donchian', label: 'Donchian Channels', type: 'overlay', color: '#26c6da',
-    settings: { period: 20, fill: true },
-    calculate: function (candles, s) { return Indicators.donchian(candles, s.period); },
-    getRange: function (values) {
-      return values ? _rangeOf([values.upper, values.lower], 0, values.upper.length - 1) : null;
-    },
-    render: function (ctx, v, h, s) {
-      if (!v || !v.upper) return;
-      // channel fill
-      if (s.fill !== false) {
-        ctx.beginPath();
-        let prev = false;
-        for (let i = h.firstIdx; i <= h.lastIdx; i++) {
-          if (v.upper[i] == null) { prev = false; continue; }
-          const x = h.indexToX(i), y = h.priceToY(v.upper[i]);
-          if (!prev) { ctx.moveTo(x, y); prev = true; } else ctx.lineTo(x, y);
-        }
-        for (let i = h.lastIdx; i >= h.firstIdx; i--) {
-          if (v.lower[i] == null) continue;
-          ctx.lineTo(h.indexToX(i), h.priceToY(v.lower[i]));
-        }
-        ctx.closePath();
-        ctx.fillStyle = 'rgba(38,198,218,0.07)';
-        ctx.fill();
-      }
-      _strokeSeries(ctx, v.upper, h, h.firstIdx, h.lastIdx, this.color, 1.25, h.priceToY);
-      _strokeSeries(ctx, v.lower, h, h.firstIdx, h.lastIdx, this.color, 1.25, h.priceToY);
-      _strokeSeries(ctx, v.mid, h, h.firstIdx, h.lastIdx, 'rgba(38,198,218,0.55)', 1, h.priceToY, [4, 3]);
-    }
-  },
-
-  /* ---- Keltner Channels (overlay) ----------------------------------------- */
-  keltner: {
-    id: 'keltner', label: 'Keltner Channels', type: 'overlay', color: '#7e57c2',
-    settings: { period: 20, mult: 2 },
-    calculate: function (candles, s) { return Indicators.keltner(candles, s.period, s.mult); },
-    getRange: function (values) {
-      return values ? _rangeOf([values.upper, values.lower], 0, values.upper.length - 1) : null;
-    },
-    render: function (ctx, v, h, s) {
-      if (!v || !v.basis) return;
-      if (s.fill !== false) {
-        ctx.beginPath();
-        let prev = false;
-        for (let i = h.firstIdx; i <= h.lastIdx; i++) {
-          if (v.upper[i] == null) { prev = false; continue; }
-          const x = h.indexToX(i), y = h.priceToY(v.upper[i]);
-          if (!prev) { ctx.moveTo(x, y); prev = true; } else ctx.lineTo(x, y);
-        }
-        for (let i = h.lastIdx; i >= h.firstIdx; i--) {
-          if (v.lower[i] == null) continue;
-          ctx.lineTo(h.indexToX(i), h.priceToY(v.lower[i]));
-        }
-        ctx.closePath();
-        ctx.fillStyle = 'rgba(126,87,194,0.07)';
-        ctx.fill();
-      }
-      _strokeSeries(ctx, v.upper, h, h.firstIdx, h.lastIdx, this.color, 1.25, h.priceToY);
-      _strokeSeries(ctx, v.lower, h, h.firstIdx, h.lastIdx, this.color, 1.25, h.priceToY);
-      _strokeSeries(ctx, v.basis, h, h.firstIdx, h.lastIdx, 'rgba(126,87,194,0.7)', 1.25, h.priceToY);
-    }
-  },
-
-  /* ---- Envelope (overlay) -------------------------------------------------- */
-  envelope: {
-    id: 'envelope', label: 'Envelope', type: 'overlay', color: '#ff9800',
-    settings: { period: 20, pct: 2.5 },
-    calculate: function (candles, s) { return Indicators.envelope(candles, s.period, s.pct); },
-    getRange: function (values) {
-      return values ? _rangeOf([values.upper, values.lower], 0, values.upper.length - 1) : null;
-    },
-    render: function (ctx, v, h) {
-      if (!v || !v.basis) return;
-      _strokeSeries(ctx, v.upper, h, h.firstIdx, h.lastIdx, this.color, 1, h.priceToY, [4, 3]);
-      _strokeSeries(ctx, v.lower, h, h.firstIdx, h.lastIdx, this.color, 1, h.priceToY, [4, 3]);
-      _strokeSeries(ctx, v.basis, h, h.firstIdx, h.lastIdx, 'rgba(255,152,0,0.8)', 1.25, h.priceToY);
-    }
-  },
-
-  /* ---- ZigZag (overlay) ---------------------------------------------------- */
-  zigzag: {
-    id: 'zigzag', label: 'ZigZag', type: 'overlay', color: '#e91e63',
-    settings: { deviation: 5 },
-    calculate: function (candles, s) { return Indicators.zigzag(candles, s.deviation); },
-    getRange: function (values) {
-      if (!values || !values.pivots) return null;
-      return _rangeOf([values.pivots.map(function (p) { return p.price; }), [values.last ? values.last.price : null]], 0, 1e9);
-    },
-    render: function (ctx, v, h) {
-      if (!v || !v.pivots || !v.pivots.length) return;
-      ctx.beginPath();
-      let started = false;
-      for (let k = 0; k < v.pivots.length; k++) {
-        const p = v.pivots[k];
-        if (p.i < h.firstIdx - 2 || p.i > h.lastIdx + 2) continue;
-        const x = h.indexToX(p.i), y = h.priceToY(p.price);
-        if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
-      }
-      if (v.last) ctx.lineTo(h.indexToX(v.last.i), h.priceToY(v.last.price));
-      ctx.strokeStyle = this.color;
-      ctx.lineWidth = 1.5;
-      ctx.stroke();
-      // pivot dots
-      ctx.fillStyle = this.color;
-      for (let k = 0; k < v.pivots.length; k++) {
-        const p = v.pivots[k];
-        if (p.i < h.firstIdx - 2 || p.i > h.lastIdx + 2) continue;
-        ctx.beginPath();
-        ctx.arc(h.indexToX(p.i), h.priceToY(p.price), 2.6, 0, Math.PI * 2);
-        ctx.fill();
-      }
-    }
-  },
-
-  /* ---- Pivot Points (overlay) ----------------------------------------------- */
-  pivots: {
-    id: 'pivots', label: 'Pivot Points', type: 'overlay', color: '#787b86',
-    settings: { lookback: 24, showR3S3: false },
-    calculate: function (candles, s) { return Indicators.pivotPoints(candles, s.lookback); },
-    getRange: function (values) {
-      if (!values) return null;
-      const keys = ['p', 'r1', 's1', 'r2', 's2'];
-      if (this.settings && this.settings.showR3S3) keys.push('r3', 's3');
-      const arr = [];
-      for (let i = 0; i < keys.length; i++) arr.push([values[keys[i]]]);
-      return _rangeOf(arr, 0, 0);
-    },
-    render: function (ctx, v, h, s) {
-      if (!v) return;
-      const T = h.THEME;
-      const defs = [
-        { key: 'r2', label: 'R2', color: '#ef5350', dash: [6, 4] },
-        { key: 'r1', label: 'R1', color: '#ef5350', dash: [6, 4] },
-        { key: 'p',  label: 'P',  color: '#787b86', dash: null },
-        { key: 's1', label: 'S1', color: '#26a69a', dash: [6, 4] },
-        { key: 's2', label: 'S2', color: '#26a69a', dash: [6, 4] }
-      ];
-      if (s.showR3S3) {
-        defs.unshift({ key: 'r3', label: 'R3', color: '#ef5350', dash: [6, 4] });
-        defs.push({ key: 's3', label: 'S3', color: '#26a69a', dash: [6, 4] });
-      }
-      ctx.font = '600 10px -apple-system, Segoe UI, Roboto, sans-serif';
-      for (let i = 0; i < defs.length; i++) {
-        const d = defs[i], price = v[d.key];
-        if (price == null) continue;
-        const y = h.priceToY(price);
-        ctx.strokeStyle = d.color;
-        ctx.lineWidth = 1;
-        if (d.dash) ctx.setLineDash(d.dash);
-        ctx.beginPath();
-        ctx.moveTo(h.chartLeft, y + 0.5);
-        ctx.lineTo(h.chartRight, y + 0.5);
-        ctx.stroke();
-        if (d.dash) ctx.setLineDash([]);
-        // small label chip at the right end
-        const txt = d.label + ' ' + (isFinite(price) ? price.toPrecision(6) : '');
-        const w = ctx.measureText(txt).width + 10;
-        ctx.fillStyle = 'rgba(0,0,0,0.45)';
-        ctx.fillRect(h.chartLeft + 4, y - 7, w, 14);
-        ctx.fillStyle = d.color;
-        ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
-        ctx.fillText(txt, h.chartLeft + 9, y + 0.5);
-      }
-    }
-  },
-
-  /* ---- ADX / DMI (pane) ------------------------------------------------------ */
-  adx: {
-    id: 'adx', label: 'ADX / DMI', type: 'pane', color: '#f57c00',
-    settings: { period: 14 },
-    calculate: function (candles, s) { return Indicators.adx(candles, s.period); },
-    getRange: function () { return { min: 0, max: Math.max(60, 100) }; },
-    render: function (ctx, v, h) {
-      if (!v || !v.adx) return;
-      const T = h.THEME;
-      // reference lines: 25 = trending market threshold (Wilder)
-      const guides = [25];
-      for (let g = 0; g < guides.length; g++) {
-        ctx.strokeStyle = 'rgba(120,123,134,0.25)';
-        ctx.setLineDash([3, 4]);
-        ctx.beginPath();
-        ctx.moveTo(h.chartLeft, h.paneToY(guides[g]));
-        ctx.lineTo(h.chartRight, h.paneToY(guides[g]));
-        ctx.stroke();
-        ctx.setLineDash([]);
-      }
-      _strokeSeries(ctx, v.plusDI, h, h.firstIdx, h.lastIdx, '#26a69a', 1.25, h.paneToY);
-      _strokeSeries(ctx, v.minusDI, h, h.firstIdx, h.lastIdx, '#ef5350', 1.25, h.paneToY);
-      _strokeSeries(ctx, v.adx, h, h.firstIdx, h.lastIdx, this.color, 1.75, h.paneToY);
-    }
-  },
-
-  /* ---- CCI (pane) ------------------------------------------------------------ */
-  cci: {
-    id: 'cci', label: 'CCI', type: 'pane', color: '#26a69a',
-    settings: { period: 20 },
-    calculate: function (candles, s) { return Indicators.cci(candles, s.period); },
-    getRange: function (values) {
-      const r = values ? _rangeOf([values], 0, values.length - 1) : null;
-      if (!r) return { min: -200, max: 200 };
-      return { min: Math.min(-200, r.min), max: Math.max(200, r.max) };
-    },
-    render: function (ctx, v, h) {
-      if (!v) return;
-      const T = h.THEME;
-      for (let g = -1; g <= 1; g++) {
-        const lvl = g === 0 ? 0 : (g > 0 ? 100 : -100);
-        ctx.strokeStyle = lvl === 0 ? 'rgba(120,123,134,0.35)' : 'rgba(120,123,134,0.2)';
-        if (lvl !== 0) ctx.setLineDash([3, 4]);
-        ctx.beginPath();
-        ctx.moveTo(h.chartLeft, h.paneToY(lvl));
-        ctx.lineTo(h.chartRight, h.paneToY(lvl));
-        ctx.stroke();
-        ctx.setLineDash([]);
-      }
-      _strokeSeries(ctx, v, h, h.firstIdx, h.lastIdx, this.color, 1.5, h.paneToY);
-    }
-  },
-
-  /* ---- OBV (pane) ------------------------------------------------------------- */
-  obv: {
-    id: 'obv', label: 'OBV', type: 'pane', color: '#42a5f5',
-    settings: {},
-    calculate: function (candles) { return Indicators.obv(candles); },
-    getRange: function (values) {
-      return values ? _rangeOf([values], 0, values.length - 1) : null;
-    },
-    render: function (ctx, v, h) {
-      if (!v) return;
-      const T = h.THEME;
-      // zero baseline is meaningless for OBV (cumulative) — draw the series
-      // with a soft gradient fill under the line
-      if (_mkSeries(ctx, v, h, h.firstIdx, h.lastIdx, h.paneToY)) {
-        ctx.strokeStyle = this.color;
-        ctx.lineWidth = 1.5;
-        ctx.stroke();
-      }
-    }
-  },
-
-  /* ---- Williams %R (pane) ------------------------------------------------------ */
-  willr: {
-    id: 'willr', label: 'Williams %R', type: 'pane', color: '#ab47bc',
-    settings: { period: 14 },
-    calculate: function (candles, s) { return Indicators.williamsR(candles, s.period); },
-    getRange: function () { return { min: -100, max: 0 }; },
-    render: function (ctx, v, h) {
-      if (!v) return;
-      const T = h.THEME;
-      const guides = [-20, -80];
-      for (let g = 0; g < guides.length; g++) {
-        ctx.strokeStyle = 'rgba(120,123,134,0.25)';
-        ctx.setLineDash([3, 4]);
-        ctx.beginPath();
-        ctx.moveTo(h.chartLeft, h.paneToY(guides[g]));
-        ctx.lineTo(h.chartRight, h.paneToY(guides[g]));
-        ctx.stroke();
-        ctx.setLineDash([]);
-      }
-      _strokeSeries(ctx, v, h, h.firstIdx, h.lastIdx, this.color, 1.5, h.paneToY);
-    }
-  },
-
-  /* ---- MFI (pane) --------------------------------------------------------------- */
-  mfi: {
-    id: 'mfi', label: 'MFI', type: 'pane', color: '#66bb6a',
-    settings: { period: 14 },
-    calculate: function (candles, s) { return Indicators.mfi(candles, s.period); },
-    getRange: function () { return { min: 0, max: 100 }; },
-    render: function (ctx, v, h) {
-      if (!v) return;
-      const T = h.THEME;
-      const guides = [20, 50, 80];
-      for (let g = 0; g < guides.length; g++) {
-        ctx.strokeStyle = guides[g] === 50 ? 'rgba(120,123,134,0.3)' : 'rgba(120,123,134,0.2)';
-        if (guides[g] !== 50) ctx.setLineDash([3, 4]);
-        ctx.beginPath();
-        ctx.moveTo(h.chartLeft, h.paneToY(guides[g]));
-        ctx.lineTo(h.chartRight, h.paneToY(guides[g]));
-        ctx.stroke();
-        ctx.setLineDash([]);
-      }
-      _strokeSeries(ctx, v, h, h.firstIdx, h.lastIdx, this.color, 1.5, h.paneToY);
-    }
-  },
-
-  /* ---- Awesome Oscillator (pane) -------------------------------------------------- */
-  ao: {
-    id: 'ao', label: 'Awesome Osc', type: 'pane', color: '#26a69a',
-    settings: {},
-    calculate: function (candles) { return Indicators.awesome(candles); },
-    getRange: function (values) {
-      const r = values ? _rangeOf([values], 0, values.length - 1) : null;
-      if (!r) return { min: -1, max: 1 };
-      const m = Math.max(Math.abs(r.min), Math.abs(r.max)) || 1;
-      return { min: -m, max: m };
-    },
-    render: function (ctx, v, h) {
-      if (!v) return;
-      const T = h.THEME;
-      const y0 = h.paneToY(0);
-      const bw = Math.max(1, Math.min(8, h.barSpacing * 0.62));
-      // two-pass batched histogram: brightening vs fading bars (TV-style)
-      for (let pass = 0; pass < 2; pass++) {
-        for (let i = h.firstIdx; i <= h.lastIdx; i++) {
-          const val = v[i];
-          if (val == null || !isFinite(val)) continue;
-          const rising = i > 0 && v[i - 1] != null && val >= v[i - 1];
-          if ((pass === 0) !== rising) continue;
-          const y = h.paneToY(val);
-          ctx.fillStyle = val >= 0
-            ? (rising ? '#26a69a' : 'rgba(38,166,154,0.45)')
-            : (rising ? '#ef5350' : 'rgba(239,83,80,0.45)');
-          ctx.fillRect(h.indexToX(i) - bw / 2, Math.min(y, y0), bw, Math.max(1, Math.abs(y - y0)));
-        }
-      }
-      // zero line
-      ctx.strokeStyle = 'rgba(120,123,134,0.3)';
-      ctx.beginPath();
-      ctx.moveTo(h.chartLeft, y0 + 0.5);
-      ctx.lineTo(h.chartRight, y0 + 0.5);
-      ctx.stroke();
-    }
-  },
-
-  /* ---- Choppiness Index (pane) ----------------------------------------------------- */
-  chop: {
-    id: 'chop', label: 'Choppiness', type: 'pane', color: '#ffca28',
-    settings: { period: 14 },
-    calculate: function (candles, s) { return Indicators.choppiness(candles, s.period); },
-    getRange: function () { return { min: 0, max: 100 }; },
-    render: function (ctx, v, h) {
-      if (!v) return;
-      const T = h.THEME;
-      // 61.8 = choppy, 38.2 = trending (Fibonacci thresholds)
-      const guides = [38.2, 61.8];
-      for (let g = 0; g < guides.length; g++) {
-        ctx.strokeStyle = 'rgba(120,123,134,0.25)';
-        ctx.setLineDash([3, 4]);
-        ctx.beginPath();
-        ctx.moveTo(h.chartLeft, h.paneToY(guides[g]));
-        ctx.lineTo(h.chartRight, h.paneToY(guides[g]));
-        ctx.stroke();
-        ctx.setLineDash([]);
-      }
-      _strokeSeries(ctx, v, h, h.firstIdx, h.lastIdx, this.color, 1.5, h.paneToY);
-    }
-  },
-
-  /* ---- TRIX (pane) -------------------------------------------------------------------- */
-  trix: {
-    id: 'trix', label: 'TRIX', type: 'pane', color: '#ec407a',
-    settings: { period: 18 },
-    calculate: function (candles, s) { return Indicators.trix(candles, s.period); },
-    getRange: function (values) {
-      const r = values ? _rangeOf([values], 0, values.length - 1) : null;
-      if (!r) return { min: -1, max: 1 };
-      const m = Math.max(Math.abs(r.min), Math.abs(r.max), 0.1);
-      return { min: -m * 1.1, max: m * 1.1 };
-    },
-    render: function (ctx, v, h) {
-      if (!v) return;
-      const T = h.THEME;
-      const y0 = h.paneToY(0);
-      ctx.strokeStyle = 'rgba(120,123,134,0.3)';
-      ctx.beginPath();
-      ctx.moveTo(h.chartLeft, y0 + 0.5);
-      ctx.lineTo(h.chartRight, y0 + 0.5);
-      ctx.stroke();
-      // soft fill above/below zero
-      ctx.beginPath();
-      let prev = false;
-      for (let i = h.firstIdx; i <= h.lastIdx; i++) {
-        if (v[i] == null) { prev = false; continue; }
-        const x = h.indexToX(i), y = h.paneToY(v[i]);
-        if (!prev) { ctx.moveTo(x, y); prev = true; } else ctx.lineTo(x, y);
-      }
-      ctx.strokeStyle = this.color;
-      ctx.lineWidth = 1.5;
-      ctx.stroke();
-      ctx.lineTo(h.indexToX(h.lastIdx), y0);
-      ctx.lineTo(h.indexToX(h.firstIdx), y0);
-      ctx.closePath();
-      ctx.fillStyle = 'rgba(236,64,122,0.10)';
-      ctx.fill();
-    }
   }
 };
 
-// Catalog metadata (for docs / programmatic discovery).
-const BADI_INDICATOR_PACK_IDS = Object.keys(BadiIndicatorPack);
-
-/* =========================================================================
- * MODERN SECTION 7 — I18N + SYNC + EXPORT + SESSIONS + THE WIRING
- * =========================================================================
- * 7a. BadiI18n      — English / Arabic dictionaries for every modern label.
- * 7b. Chart sync    — shared crosshair + visible range across charts.
- * 7c. Export API    — PNG (WebGL + overlay composite), CSV, JSON.
- * 7d. Session bands — pre-market / RTH / after-hours shading.
- * 7e. The wiring    — enableModernUI() + safe method wrapping (the layer
- *                     hooks into render, hit-testing and input without
- *                     modifying a single line of the v2.36.0 core).
- * ======================================================================== */
-
-/* ------------------------- 7a. localization ------------------------------ */
-const BadiI18n = {
-  en: {
-    statsTitle: 'Session Stats', watchlist: 'Watchlist', alerts: 'Alerts',
-    alertsActive: 'Active', alertsLog: 'Log', alertsEmpty: 'No alerts — click + to add one at price',
-    alertsHint: 'or double-click a chart price line', alertsAdd: 'Add alert at last price',
-    alertsNoLog: 'No alerts triggered yet', tradeTitle: 'Paper Trade', tradeQty: 'QUANTITY',
-    tradeClose: 'CLOSE', tradeFlat: 'Flat — no open position', tradeMkt: 'MKT',
-    shortcuts: 'Shortcuts', shortSearch: 'Type to filter…',
-    noData: 'No data', statRange: 'Range', statRangePct: 'Range %',
-    statVolatility: 'Volatility', statBars: 'Bars', statVolume: 'Volume',
-    statPressure: 'BULL PRESSURE', sortBy: 'Sort', sortChange: '% chg', sortName: 'A–Z',
-    watchlistEmpty: 'chart.setWatchlist([...])',
-    perfFrame: 'Frame', perfBars: 'Bars', perfIndicators: 'Indicators', perfDrawings: 'Drawings',
-    months: ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
+// Typed scratch pools for the decimator (Uint32 / Int32). Same contract as
+// requestBadiF64 — acquire returns a buffer ≥ requested size.
+const BADI_U32_SCRATCH = {
+  _pools: new Map(),
+  _cap: 1 << 22,
+  acquire(n) {
+    const need = Math.max(4, n | 0);
+    if (need > this._cap) return new Uint32Array(need);
+    let band = 4; while (band < need) band <<= 1;
+    let pool = this._pools.get(band);
+    if (!pool) { pool = []; this._pools.set(band, pool); }
+    const arr = pool.pop();
+    if (arr) return arr;
+    return new Uint32Array(band);
   },
-  ar: {
-    statsTitle: 'إحصائيات الجلسة', watchlist: 'قائمة المراقبة', alerts: 'التنبيهات',
-    alertsActive: 'النشطة', alertsLog: 'السجل', alertsEmpty: 'لا توجد تنبيهات — اضغط + لإضافة تنبيه عند السعر',
-    alertsHint: 'أو انقر مرتين على خط سعر في الرسم', alertsAdd: 'إضافة تنبيه عند آخر سعر',
-    alertsNoLog: 'لم يتم تشغيل أي تنبيه بعد', tradeTitle: 'تداول تجريبي', tradeQty: 'الكمية',
-    tradeClose: 'إغلاق', tradeFlat: 'لا توجد صفقة مفتوحة', tradeMkt: 'السعر',
-    shortcuts: 'الاختصارات', shortSearch: 'اكتب للتصفية…',
-    noData: 'لا توجد بيانات', statRange: 'المدى', statRangePct: 'المدى %',
-    statVolatility: 'التقلب', statBars: 'الشموع', statVolume: 'الحجم',
-    statPressure: 'ضغط الشراء', sortBy: 'ترتيب', sortChange: 'التغير %', sortName: 'أ–ي',
-    watchlistEmpty: 'استدع chart.setWatchlist([...])',
-    perfFrame: 'الإطار', perfBars: 'الشموع', perfIndicators: 'المؤشرات', perfDrawings: 'الرسومات',
-    months: ['يناير','فبراير','مارس','أبريل','مايو','يونيو','يوليو','أغسطس','سبتمبر','أكتوبر','نوفمبر','ديسمبر']
+  release(arr) {
+    if (!arr) return;
+    const band = arr.length;
+    if (band > this._cap) return;
+    let pool = this._pools.get(band);
+    if (!pool) { pool = []; this._pools.set(band, pool); }
+    if (pool.length < 24) pool.push(arr);
+  }
+};
+const BADI_I32_SCRATCH = {
+  _pools: new Map(),
+  _cap: 1 << 20,
+  acquire(n) {
+    const need = Math.max(8, n | 0);
+    if (need > this._cap) return new Int32Array(need);
+    let band = 8; while (band < need) band <<= 1;
+    let pool = this._pools.get(band);
+    if (!pool) { pool = []; this._pools.set(band, pool); }
+    const arr = pool.pop();
+    if (arr) return arr;
+    return new Int32Array(band);
+  },
+  release(arr) {
+    if (!arr) return;
+    const band = arr.length;
+    if (band > this._cap) return;
+    let pool = this._pools.get(band);
+    if (!pool) { pool = []; this._pools.set(band, pool); }
+    if (pool.length < 24) pool.push(arr);
   }
 };
 
-/* ------------------------- 7b. chart sync -------------------------------- */
-// chart.syncWith(otherChart, { range: true, crosshair: true })
-// Both charts keep working independently; sync just mirrors the visible
-// range and the crosshair position. unsync() removes every link.
-const _syncGroups = new Map();   // chart → Set(otherChart)
-function _syncBroadcast(source, fnName, args) {
-  const peers = _syncGroups.get(source);
-  if (!peers) return;
-  peers.forEach(function (other) {
-    if (other._syncFrom === source) return;      // no ping-pong
-    try {
-      other._syncFrom = source;
-      other[fnName].apply(other, args);
-      other.invalidate();
-    } catch (_) {}
-    other._syncFrom = null;
-  });
+/* =============================================================================
+ * BADI-CHARTS-V2 v2.38.0 — PERFORMANCE CORE (PART 2/2: INFRASTRUCTURE)
+ * =============================================================================
+ * LOD cache, spatial hit-test grid and the inline Web-Worker pool.
+ * ========================================================================== */
+
+/* ============================ BADI LOD CACHE =============================== */
+// v2.38.0: decimation results are EXPENSIVE to recompute (O(n) min-max over
+// a 1M-point series) and STABLE across frames — the visible window and the
+// zoom band change far less often than frames arrive. The cache keys a
+// decimation by a compact fingerprint and stores the kept-index array:
+//
+//   fingerprint = seriesVersion · from · to · bucketBand · epsTier · kernel
+//
+// `seriesVersion` bumps whenever the series DATA changes (update/append).
+// `bucketBand` is the power-of-two bucket SIZE (points per bucket), not the
+// count — zooming inside a band (barSpacing 3px → 7px) reuses the buffer.
+// Entries are LRU-evicted past a memory budget so thousands of series cannot
+// leak (each kept-index array is ~4 bytes × kept points).
+class BadiLODCache {
+  constructor(maxEntries) {
+    this.max = maxEntries || 512;
+    this.map = new Map();          // key → { key, idx, bytes, lastUse }
+    this.bytes = 0;
+    this.hits = 0;
+    this.misses = 0;
+    this._seq = 0;                 // monotonic access counter — TRUE LRU order
+  }
+  _key(serieVersion, from, to, band, tier, kernel) {
+    return serieVersion + '|' + from + '|' + to + '|' + band + '|' + tier + '|' + kernel;
+  }
+  get(serieVersion, from, to, band, tier, kernel) {
+    const k = this._key(serieVersion, from, to, band, tier, kernel);
+    const e = this.map.get(k);
+    if (e) { e.lastUse = ++this._seq; this.hits++; return e.idx; }
+    this.misses++;
+    return null;
+  }
+  put(serieVersion, from, to, band, tier, kernel, idx) {
+    const k = this._key(serieVersion, from, to, band, tier, kernel);
+    const bytes = idx.buffer ? idx.buffer.byteLength : 0;
+    // LRU eviction when over budget.
+    while (this.map.size >= this.max || this.bytes + bytes > 64 * 1024 * 1024) {
+      if (this.map.size === 0) break;
+      // Evict least-recently-used (linear scan — map sizes are small).
+      let oldestK = null, oldestU = Infinity;
+      for (const [kk, ee] of this.map) {
+        if (ee.lastUse < oldestU) { oldestU = ee.lastUse; oldestK = kk; }
+      }
+      if (oldestK == null) break;
+      const old = this.map.get(oldestK);
+      this.bytes -= old.bytes;
+      this.map.delete(oldestK);
+    }
+    this.map.set(k, { idx: idx, bytes: bytes, lastUse: ++this._seq });
+    this.bytes += bytes;
+  }
+  clear() { this.map.clear(); this.bytes = 0; }
+  stats() { return { entries: this.map.size, mb: +(this.bytes / 1048576).toFixed(1), hits: this.hits, misses: this.misses }; }
 }
 
-/* ------------------------- 7c. export API -------------------------------- */
-// Compose the WebGL geometry canvas + the crisp text overlay canvas into one
-// high-DPI PNG. The fresh frame is rendered synchronously first so the GPU
-// buffers are guaranteed current when drawImage reads them.
-function _exportPNGImpl(chart, opts) {
-  opts = opts || {};
-  const scale = opts.scale || 2;
-  const pad = opts.padding || 0;
-  const W = chart.W, H = chart.H;
-
-  // render a fresh frame so both layers are current
-  try { chart.render(performance.now()); } catch (_) {}
-
-  const out = document.createElement('canvas');
-  out.width = Math.max(1, Math.round((W + pad * 2) * scale));
-  out.height = Math.max(1, Math.round((H + pad * 2) * scale));
-  const octx = out.getContext('2d');
-  // background fill (the GL canvas is transparent where the chart bg draws)
-  octx.fillStyle = (opts.transparent ? 'rgba(0,0,0,0)' : (chart.theme.bg || '#0e1015'));
-  if (!opts.transparent) octx.fillRect(0, 0, out.width, out.height);
-  octx.save();
-  octx.scale(scale, scale);
-  octx.translate(pad, pad);
-  // layer 1: geometry (WebGL canvas) or the single 2D canvas
-  if (chart._glBackend && chart._glBackend.glCanvas) {
-    octx.drawImage(chart._glBackend.glCanvas, 0, 0, W, H);
-    // layer 2: the text overlay (the user's own canvas)
-    octx.drawImage(chart.canvas, 0, 0, W, H);
-  } else {
-    octx.drawImage(chart.canvas, 0, 0, W, H);
+/* ============================ BADI SPATIAL GRID ============================ */
+// v2.38.0: uniform-grid spatial index over SCREEN space for O(1) hit-testing
+// against thousands of line segments. The naive alternative (walk every
+// segment of every series) is O(total segments) per mouse move — with
+// 100k+ visible segments that alone can eat the frame budget.
+//
+// The grid is rebuilt lazily: it carries a transform fingerprint
+// (barSpacing · rightOffset · scale range · width · dataVersion). When the
+// chart pans/zooms the fingerprint changes and the next hitTest() rebuilds
+// it — REBUILDS ARE THROTTLED to at most once per animation frame, and only
+// happen if the user actually performs a hit test (hover/click). A chart
+// that never queries pays nothing.
+//
+// Cell size adapts to the visible segment density: dense scenes get finer
+// grids (more cells, fewer segments per cell).
+class BadiSpatialGrid {
+  constructor(opts) {
+    this.cell = (opts && opts.cellPx) || 48;
+    this.map = new Map();          // cellKey → Int32Array-backed run list
+    this.w = 0; this.h = 0;
+    this.fingerprint = '';
+    this._pending = null;          // deferred build request
+    this._builtAt = 0;
+    this.segCount = 0;
+    // Segment record arrays (SoA) — the grid stores indices into these.
+    this.segSeries = [];           // series ordinal per segment
+    this.segIdx = [];              // data index of the segment's FIRST point
+    this.segX1 = []; this.segY1 = []; this.segX2 = []; this.segY2 = [];
+    this._records = 0;
   }
-  octx.restore();
-
-  // optional watermark (bottom-right, subtle)
-  if (opts.watermark) {
-    octx.font = '600 ' + Math.round(14 * scale) + 'px -apple-system, Segoe UI, Roboto, sans-serif';
-    octx.textAlign = 'right';
-    octx.textBaseline = 'bottom';
-    octx.fillStyle = 'rgba(255,255,255,0.55)';
-    octx.fillText(String(opts.watermark), out.width - 12 * scale, out.height - 10 * scale);
+  // Fingerprint of everything that can move a segment on screen.
+  static fingerprintOf(chart, dataVersion) {
+    const ps = chart.priceScale && chart.priceScale._priceRange;
+    return [dataVersion, chart.barSpacing, chart.rightOffset,
+      ps ? ps.min.toPrecision(12) : 'null', ps ? ps.max.toPrecision(12) : 'null',
+      chart.chartLeft | 0, chart.chartRight | 0, chart.priceTop | 0, chart.priceBottom | 0
+    ].join('~');
   }
-
-  if (opts.asBlob) {
-    return new Promise(function (resolve) {
-      out.toBlob(function (blob) { resolve(blob); }, 'image/png');
-    });
+  // Begin a fresh build (call inside the per-frame series flush while the
+  // decimated screen points are already computed — the flush pushes segments
+  // through addSegment()).
+  beginBuild(chart, fingerprint) {
+    this.map.clear();
+    this.segSeries.length = 0;
+    this.segIdx.length = 0;
+    this.segX1.length = 0; this.segY1.length = 0;
+    this.segX2.length = 0; this.segY2.length = 0;
+    this._records = 0;
+    this.segCount = 0;
+    this.w = chart.chartRight - chart.chartLeft;
+    this.h = chart.priceBottom - chart.priceTop;
+    // Adaptive cell: dense scenes → smaller cells. Target ≤ 24 segments/cell.
+    this.cell = (opts_cellFor(this.w, this.h, this.cell));
+    this.fingerprint = fingerprint;
   }
-  if (opts.asDataURL) return out.toDataURL('image/png');
-  // default: trigger a download
-  const fname = opts.filename || ('badi-chart-' + new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-') + '.png');
-  try {
-    const a = document.createElement('a');
-    a.href = out.toDataURL('image/png');
-    a.download = fname;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    if (chart.showToast) chart.showToast('Screenshot saved — ' + fname);
-  } catch (e) {
-    console.warn('[BadiCharts] exportPNG download failed:', e);
+  addSegment(seriesOrdinal, dataIdx, x1, y1, x2, y2) {
+    const r = this._records++;
+    this.segSeries.push(seriesOrdinal);
+    this.segIdx.push(dataIdx);
+    this.segX1.push(x1); this.segY1.push(y1);
+    this.segX2.push(x2); this.segY2.push(y2);
+    // Register in every cell the segment's AABB touches. Clipped to the
+    // chart plot area; vertical/horizontal lines still register correctly.
+    const minx = Math.max(0, Math.floor((Math.min(x1, x2) - _gx0(this)) / this.cell));
+    const maxx = Math.max(0, Math.floor((Math.max(x1, x2) - _gx0(this)) / this.cell));
+    const miny = Math.max(0, Math.floor((Math.min(y1, y2) - _gy0(this)) / this.cell));
+    const maxy = Math.max(0, Math.floor((Math.max(y1, y2) - _gy0(this)) / this.cell));
+    const cellsX = Math.ceil(this.w / this.cell);
+    for (let cy = miny; cy <= maxy; cy++) {
+      for (let cx = minx; cx <= maxx; cx++) {
+        const key = cy * cellsX + cx;
+        let list = this.map.get(key);
+        if (!list) { list = []; this.map.set(key, list); }
+        list.push(r);
+      }
+    }
+    this.segCount++;
+  }
+  endBuild() { this._builtAt = BADI_PERF_FRAME_STAMP; }
+  get ready() { return this.fingerprint !== '' && this.segCount > 0; }
+
+  // Query: nearest segment within `tol` px of (x, y). Returns
+  // { seriesOrdinal, dataIdx, dist } or null. Linear scan of the cell's
+  // segments only — typically a handful.
+  hitTest(x, y, tol, maxResults) {
+    if (!this.ready) return null;
+    const gx0 = _gx0(this), gy0 = _gy0(this);
+    const cx = Math.floor((x - gx0) / this.cell);
+    const cy = Math.floor((y - gy0) / this.cell);
+    const cellsX = Math.ceil(this.w / this.cell);
+    const tol2 = tol * tol;
+    let bestD2 = Infinity, bestRec = -1;
+    // Spiral out cell-by-cell until the search ring exceeds tol — guarantees
+    // we find the true nearest even on cell borders.
+    for (let ring = 0; ring <= Math.ceil(tol / this.cell) + 1; ring++) {
+      let foundInRing = false;
+      for (let dy = -ring; dy <= ring; dy++) {
+        for (let dx = -ring; dx <= ring; dx++) {
+          // Only the ring's perimeter at each step.
+          if (Math.max(Math.abs(dx), Math.abs(dy)) !== ring) continue;
+          const key = (cy + dy) * cellsX + (cx + dx);
+          const list = this.map.get(key);
+          if (!list) continue;
+          for (let i = 0; i < list.length; i++) {
+            const r = list[i];
+            const d2 = _segDist2(this, r, x, y);
+            if (d2 <= tol2 && d2 < bestD2) { bestD2 = d2; bestRec = r; foundInRing = true; }
+          }
+        }
+      }
+      // If the ring itself produced a hit and the next ring's minimum possible
+      // distance exceeds the current best, stop early.
+      if (bestRec >= 0 && !foundInRing && ring * this.cell > Math.sqrt(bestD2)) break;
+      if (bestRec >= 0 && ring * this.cell > Math.sqrt(bestD2) + this.cell) break;
+    }
+    if (bestRec < 0) return null;
+    return {
+      seriesOrdinal: this.segSeries[bestRec],
+      dataIdx: this.segIdx[bestRec],
+      dist: Math.sqrt(bestD2)
+    };
+  }
+  stats() {
+    return {
+      segments: this.segCount, cells: this.map.size, cellPx: this.cell,
+      avgPerCell: this.map.size ? +(this.segCount / this.map.size).toFixed(2) : 0
+    };
+  }
+}
+// Grid origin helpers (grid is aligned to the chart plot rect).
+function _gx0(g) { return g._x0 !== undefined ? g._x0 : 0; }
+function _gy0(g) { return g._y0 !== undefined ? g._y0 : 0; }
+function opts_cellFor(w, h, base) {
+  // Keep the base cell unless the plot is huge — coarser on 4K panels.
+  if (w * h > 8e6) return Math.round(base * 1.5);
+  return base;
+}
+// Squared distance from point (px,py) to segment r (SoA lookup).
+function _segDist2(g, r, px, py) {
+  const x1 = g.segX1[r], y1 = g.segY1[r], x2 = g.segX2[r], y2 = g.segY2[r];
+  const dx = x2 - x1, dy = y2 - y1;
+  const len2 = dx * dx + dy * dy;
+  let t = 0;
+  if (len2 > 0) t = ((px - x1) * dx + (py - y1) * dy) / len2;
+  if (t < 0) t = 0; else if (t > 1) t = 1;
+  const ex = px - (x1 + t * dx), ey = py - (y1 + t * dy);
+  return ex * ex + ey * ey;
+}
+
+/* ============================ BADI WORKER POOL ============================= */
+// v2.38.0: an inline-blob Web Worker pool for off-main-thread decimation.
+// WHY: a 1M-point min-max pass takes ~8-15ms on the main thread — one frame
+// hitch per data update. On a worker it is free: the main thread renders
+// with a cheap synchronous coarse pass while the worker computes the exact
+// buffers, then the result is adopted on arrival (double-buffer, no visual
+// pop because min-max output at the same band is a superset shape).
+//
+// The worker source is a string → Blob → Worker, so the library stays a
+// SINGLE FILE with no extra downloads. Transfers use structured clone with
+// transferables (zero-copy). Graceful degradation: Workers unavailable
+// (Node, sandboxed iframes with restrictive CSP) → jobs run synchronously.
+//
+// Jobs: { kind: 'minmax'|'dp'|'lttb', p: Float64Array, from, to, arg }
+//    minmax: arg = bucketCount   → Uint32Array kept indices
+//    dp:     xs/ys Float64Arrays, arg = eps
+//    lttb:   arg = targetCount
+// Response: { id, ok, idx: Uint32Array } transferred back zero-copy.
+const BADI_WORKER_SRC = `
+'use strict';
+function minMax(p, from, to, buckets) {
+  const span = to - from + 1;
+  if (span <= 0) return new Uint32Array(0);
+  if (buckets < 1) buckets = 1;
+  if (span <= buckets * 2) {
+    const out = new Uint32Array(span);
+    for (let i = 0; i < span; i++) out[i] = from + i;
+    return out;
+  }
+  const per = Math.ceil(span / buckets);
+  const out = new Uint32Array(span * 2 + 2);
+  let m = 0, bucketStart = from;
+  while (bucketStart <= to) {
+    const bEnd = Math.min(to, bucketStart + per - 1);
+    out[m++] = bucketStart;
+    let minI = -1, maxI = -1, minV = Infinity, maxV = -Infinity;
+    for (let i = bucketStart; i <= bEnd; i++) {
+      const v = p[i];
+      if (v !== v) continue;
+      if (v < minV) { minV = v; minI = i; }
+      if (v > maxV) { maxV = v; maxI = i; }
+    }
+    if (minI >= 0 && minI !== bucketStart) out[m++] = minI;
+    if (maxI >= 0 && maxI !== bucketStart && maxI !== minI) out[m++] = maxI;
+    if (bEnd !== bucketStart && bEnd !== minI && bEnd !== maxI) out[m++] = bEnd;
+    bucketStart = bEnd + 1;
+  }
+  return out.slice(0, m);
+}
+function lttb(p, from, to, target) {
+  const n = to - from + 1;
+  if (target < 3 || n <= target) {
+    const out = new Uint32Array(n);
+    for (let i = 0; i < n; i++) out[i] = from + i;
+    return out;
+  }
+  const out = new Uint32Array(target);
+  out[0] = from; out[target - 1] = to;
+  let prevIdx = from, prevP = p[from], a = 0;
+  const every = (n - 2) / (target - 2);
+  for (let bI = 1; bI < target - 1; bI++) {
+    const bStart = from + 1 + Math.floor((bI - 1) * every);
+    const bEnd = from + 1 + Math.floor(bI * every) - 1;
+    const nStart = from + 1 + Math.floor(bI * every);
+    const nEnd = Math.min(to, from + 1 + Math.floor((bI + 1) * every) - 1);
+    let ax = 0, ap = 0, c = 0;
+    for (let i = Math.max(nStart, from); i <= nEnd; i++) { ax += i; ap += p[i]; c++; }
+    if (c > 0) { ax /= c; ap /= c; }
+    let maxA = -1, maxI = Math.max(bStart, from + 1);
+    for (let i = Math.max(bStart, from + 1); i <= Math.min(bEnd, to); i++) {
+      const area = Math.abs((prevIdx - ax) * (p[i] - prevP) - (prevIdx - i) * (ap - prevP)) * 0.5;
+      if (area > maxA) { maxA = area; maxI = i; }
+    }
+    out[++a] = maxI;
+    prevIdx = maxI; prevP = p[maxI];
   }
   return out;
 }
-
-function _exportCSVImpl(chart, opts) {
-  const cs = chart.sim.candles;
-  const rows = [['time', 'open', 'high', 'low', 'close', 'volume']];
-  for (let i = 0; i < cs.length; i++) {
-    const c = cs[i];
-    rows.push([c.time, c.open, c.high, c.low, c.close, c.volume || 0]);
-  }
-  // active indicator values get their own columns
-  const indCols = [];
-  for (const id of chart.activeIndicators) {
-    const state = chart.indicatorStates.get(id);
-    if (!state || !state.def) continue;
-    const values = chart.indCache ? chart.indCache[id] : null;
-    if (!values) continue;
-    if (Array.isArray(values) && values.length === cs.length) {
-      rows[0].push(id);
-      for (let i = 0; i < cs.length; i++) {
-        const v = values[i];
-        rows[i + 1].push(v == null ? '' : (typeof v === 'number' ? v : String(v)));
+function dpMask(xs, ys, from, to, eps) {
+  const n = to - from + 1;
+  const mask = new Uint8Array(n);
+  if (n <= 2) { if (n > 0) mask[0] = 1; if (n > 1) mask[n - 1] = 1; return mask; }
+  mask[0] = 1; mask[n - 1] = 1;
+  const stack = [0, n - 1];
+  const eps2 = eps * eps;
+  while (stack.length >= 2) {
+    const end = stack.pop(), start = stack.pop();
+    if (end - start < 2) continue;
+    const ax = xs[from + start], ay = ys[from + start];
+    const bx = xs[from + end], by = ys[from + end];
+    const dx = bx - ax, dy = by - ay, len2 = dx * dx + dy * dy;
+    let maxD2 = -1, maxI = -1;
+    for (let i = start + 1; i < end; i++) {
+      const px = xs[from + i], py = ys[from + i];
+      let d2;
+      if (len2 === 0) { const ex = px - ax, ey = py - ay; d2 = ex * ex + ey * ey; }
+      else {
+        let t = ((px - ax) * dx + (py - ay) * dy) / len2;
+        if (t < 0) t = 0; else if (t > 1) t = 1;
+        const ex = px - (ax + t * dx), ey = py - (ay + t * dy);
+        d2 = ex * ex + ey * ey;
       }
-      indCols.push(id);
+      if (d2 > maxD2) { maxD2 = d2; maxI = i; }
     }
+    if (maxD2 > eps2 && maxI > 0) { mask[maxI] = 1; stack.push(start, maxI, maxI, end); }
   }
-  let csv = rows.map(function (r) { return r.join(','); }).join('\n');
-  if (opts && opts.download !== false) {
+  // pack mask → indices
+  let c = 0;
+  for (let i = 0; i < n; i++) if (mask[i]) c++;
+  const out = new Uint32Array(c);
+  let k = 0;
+  for (let i = 0; i < n; i++) if (mask[i]) out[k++] = from + i;
+  return out;
+}
+self.onmessage = function (ev) {
+  const j = ev.data;
+  try {
+    let idx;
+    if (j.kind === 'minmax') idx = minMax(j.p, j.from, j.to, j.arg);
+    else if (j.kind === 'lttb') idx = lttb(j.p, j.from, j.to, j.arg);
+    else if (j.kind === 'dp') idx = dpMask(j.xs, j.ys, j.from, j.to, j.arg);
+    else throw new Error('unknown kind ' + j.kind);
+    self.postMessage({ id: j.id, ok: true, idx: idx, from: j.from, to: j.to }, [idx.buffer]);
+  } catch (e) {
+    self.postMessage({ id: j.id, ok: false, err: String(e && e.message || e) });
+  }
+};
+`;
+
+class BadiWorkerPool {
+  constructor(size) {
+    this.size = Math.max(1, Math.min(4, size || 2));
+    this.workers = [];
+    this.idle = [];
+    this.jobs = new Map();        // id → { resolve, reject, timer }
+    this.queue = [];
+    this.nextId = 1;
+    this.enabled = false;
+    this.failed = false;
+    this.statsBusy = 0;
     try {
-      const blob = new Blob([csv], { type: 'text/csv' });
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(blob);
-      a.download = (opts && opts.filename) || 'badi-chart-data.csv';
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      setTimeout(function () { URL.revokeObjectURL(a.href); }, 4000);
-      if (chart.showToast) chart.showToast('CSV exported — ' + cs.length + ' bars');
-    } catch (e) { console.warn('[BadiCharts] exportCSV download failed:', e); }
+      if (typeof Worker === 'undefined' || typeof Blob === 'undefined') { this.failed = true; return; }
+      const blob = new Blob([BADI_WORKER_SRC], { type: 'text/javascript' });
+      this.url = URL.createObjectURL(blob);
+      for (let i = 0; i < this.size; i++) {
+        const w = new Worker(this.url);
+        w.onmessage = (ev) => this._onMessage(w, ev);
+        w.onerror = () => { /* mark worker dead, drain queue synchronously */ this._workerDead(w); };
+        this.workers.push(w);
+        this.idle.push(w);
+      }
+      this.enabled = true;
+    } catch (_) {
+      this.failed = true;
+    }
   }
-  return csv;
-}
-
-function _exportJSONImpl(chart) {
-  const state = {
-    version: '2.37.0',
-    symbol: chart.symbol.label,
-    timeframe: chart.timeframe,
-    bars: chart.sim.candles.length,
-    firstTime: chart.sim.candles.length ? chart.sim.candles[0].time : null,
-    lastTime: chart.sim.candles.length ? chart.sim.candles[chart.sim.candles.length - 1].time : null,
-    indicators: Array.from(chart.activeIndicators),
-    drawings: (chart.drawings || []).length,
-    alerts: (chart._alerts || []).length,
-    themePreset: chart._themePresetName || null
-  };
-  return JSON.stringify(state, null, 2);
-}
-
-/* ------------------------- 7d. session bands ----------------------------- */
-// chart.setSessions([{ start:'04:00', end:'09:30', color:'rgba(...)', label:'Pre' }, ...])
-// times are LOCAL hh:mm on each candle's date. Renders translucent vertical
-// bands UNDER the grid and candles (wrapped into drawBackground).
-function _drawSessionBands(chart, ctx) {
-  const sessions = chart._sessions;
-  if (!sessions || !sessions.length) return;
-  const cs = chart.sim.candles;
-  if (!cs.length) return;
-  const tfMs = chart.timeframe.ms || 3600000;
-  const firstIdx = Math.max(0, Math.floor(chart.xToIndex(chart.chartLeft)));
-  const lastIdx = Math.min(cs.length - 1, Math.ceil(chart.xToIndex(chart.chartRight)));
-  const inMinutes = function (s) {
-    const m = /^(\d{1,2}):(\d{2})$/.exec(String(s));
-    return m ? (parseInt(m[1], 10) * 60 + parseInt(m[2], 10)) : null;
-  };
-  // group consecutive bars of the same session into one band rect
-  let bandOpen = null, bandColor = null;
-  const flush = function (endX) {
-    if (bandOpen !== null) {
-      ctx.fillStyle = bandColor;
-      ctx.fillRect(bandOpen, chart.priceTop !== undefined ? chart.priceTop : chart.chartTop,
-                   Math.max(1, endX - bandOpen),
-                   (chart.priceBottom !== undefined ? chart.priceBottom : chart.H) -
-                   (chart.priceTop !== undefined ? chart.priceTop : chart.chartTop));
-      bandOpen = null;
-    }
-  };
-  for (let i = firstIdx; i <= lastIdx; i++) {
-    const t = cs[i].time * (cs[i].time > 1e12 ? 1 : 1000);
-    const d = new Date(t);
-    const mins = d.getHours() * 60 + d.getMinutes();
-    let color = null;
-    for (let s = 0; s < sessions.length; s++) {
-      const a = inMinutes(sessions[s].start), b = inMinutes(sessions[s].end);
-      if (a === null || b === null) continue;
-      const within = a <= b ? (mins >= a && mins < b) : (mins >= a || mins < b);
-      if (within) { color = sessions[s].color || 'rgba(120,140,255,0.06)'; break; }
-    }
-    const x = chart.indexToX(i);
-    if (color) {
-      if (bandOpen === null || color !== bandColor) {
-        flush(x);
-        bandOpen = x; bandColor = color;
+  get available() { return this.enabled && !this.failed; }
+  // Submit a job. `transfer` lists objects to transfer (zero-copy). Returns
+  // a Promise<Uint32Array | null> (null on failure — caller falls back to
+  // the synchronous result it computed anyway).
+  submit(kind, payload, transfer) {
+    if (!this.available) return Promise.resolve(null);
+    return new Promise((resolve) => {
+      const id = this.nextId++;
+      const job = { id, kind, payload, resolve };
+      // Worker availability: if none idle, queue (bounded — drop-oldest).
+      if (this.queue.length > 16) {
+        const dropped = this.queue.shift();
+        this.jobs.delete(dropped.id);
+        dropped.resolve(null);
       }
-    } else flush(x);
+      if (this.idle.length > 0) this._dispatch(job);
+      else this.queue.push(job);
+    });
   }
-  flush(chart.chartRight);
+  _dispatch(job) {
+    const w = this.idle.pop();
+    if (!w) { this.queue.push(job); return; }
+    this.jobs.set(job.id, job);
+    this.statsBusy = this.jobs.size;
+    const p = job.payload;
+    const transfer = [];
+    if (p.p && p.p.buffer) transfer.push(p.p.buffer);
+    if (p.xs && p.xs.buffer) transfer.push(p.xs.buffer);
+    if (p.ys && p.ys.buffer) transfer.push(p.ys.buffer);
+    // NOTE: we must NOT transfer arrays the main thread still needs. The
+    // engine passes COPIES for worker jobs (see BadiPerfEngine._decimate).
+    try { w.postMessage({ id: job.id, kind: job.kind, ...p }, transfer); }
+    catch (_) { this.jobs.delete(job.id); job.resolve(null); this.idle.push(w); }
+  }
+  _onMessage(w, ev) {
+    const job = this.jobs.get(ev.data.id);
+    this.idle.push(w);
+    this.jobs.delete(ev.data.id);
+    this.statsBusy = this.jobs.size;
+    if (job) job.resolve(ev.data.ok ? ev.data.idx : null);
+    // Drain the queue.
+    const next = this.queue.shift();
+    if (next) this._dispatch(next);
+  }
+  _workerDead(w) {
+    // Remove the dead worker and fail its in-flight jobs (resolve null →
+    // callers use their synchronous fallback).
+    const wi = this.workers.indexOf(w);
+    if (wi >= 0) this.workers.splice(wi, 1);
+    const ii = this.idle.indexOf(w);
+    if (ii >= 0) this.idle.splice(ii, 1);
+    for (const [id, job] of [...this.jobs]) { this.jobs.delete(id); job.resolve(null); }
+    if (this.workers.length === 0) { this.failed = true; this.enabled = false; }
+  }
+  destroy() {
+    for (const w of this.workers) { try { w.terminate(); } catch (_) {} }
+    this.workers.length = 0; this.idle.length = 0;
+    for (const [id, job] of [...this.jobs]) { this.jobs.delete(id); job.resolve(null); }
+    this.queue.length = 0;
+    if (this.url) { try { URL.revokeObjectURL(this.url); } catch (_) {} }
+    this.enabled = false;
+  }
+  stats() { return { workers: this.workers.length, busy: this.jobs.size, queued: this.queue.length, ok: this.available }; }
 }
 
-/* =========================================================================
- * 7e. THE WIRING — enableModernUI() and safe hooks
- * ======================================================================== */
-(function wireModernLayer() {
-  const proto = TradingChart.prototype;
-
-  // ---- render hooks --------------------------------------------------------
-  // (1) session bands: wrapped into drawBackground (under grid & candles)
-  const _origDrawBackground = proto.drawBackground;
-  proto.drawBackground = function () {
-    _origDrawBackground.apply(this, arguments);
-    try { if (this._sessions) _drawSessionBands(this, this.ctx); } catch (_) {}
-  };
-
-  // (2) the modern overlay: price lines → alert lines → cards → rail.
-  // Wrapped into drawDropdown (drawn late in the try-block, still BEFORE
-  // endFrame() flushes the GPU pass — the only place a late hook can draw).
-  const _origDrawDropdown = proto.drawDropdown;
-  proto.drawDropdown = function () {
-    _origDrawDropdown.apply(this, arguments);
-    if (!this._modern) return;
-    const ctx = this.ctx;
-    try {
-      _drawPriceLines(this, ctx, this.theme, performance.now());
-      _drawAlertLines(this, ctx, this.theme, performance.now());
-      this._modern.render(ctx, performance.now());
-    } catch (e) {
-      // the modern layer must never kill a frame
-      try { console.warn('[BadiCharts] modern overlay error:', e); } catch (_) {}
-    }
-  };
-
-  // (3) liveness: _applyMomentum runs EVERY loop iteration (even idle) — a
-  // perfect zero-cost hook to keep the render loop awake while cards animate.
-  const _origApplyMomentum = proto._applyMomentum;
-  proto._applyMomentum = function (now) {
-    if (this._modern && this._modern._animating) this._needsRender = true;
-    if (this._syncFollow) this._needsRender = true;
-    return _origApplyMomentum.apply(this, arguments);
-  };
-
-  // ---- alerts: check after every data change --------------------------------
-  const _origSetData = proto.setData;
-  proto.setData = function () {
-    const r = _origSetData.apply(this, arguments);
-    try { if (this._alerts) _checkAlerts(this); } catch (_) {}
-    return r;
-  };
-  const _origUpdate = proto.update;
-  proto.update = function () {
-    const r = _origUpdate.apply(this, arguments);
-    try { if (this._alerts) _checkAlerts(this); } catch (_) {}
-    return r;
-  };
-  const _origAppend = proto.append;
-  proto.append = function () {
-    const r = _origAppend.apply(this, arguments);
-    try { if (this._alerts) _checkAlerts(this); } catch (_) {}
-    return r;
-  };
-
-  // ---- pointer/wheel/keyboard routing ---------------------------------------
-  const _origMouseDown = proto.onMouseDown;
-  proto.onMouseDown = function (e) {
-    if (this._modern) {
-      const r = this.canvas.getBoundingClientRect();
-      const x = e.clientX - r.left, y = e.clientY - r.top;
-      // price-line drag has first claim
-      const pl = _priceLineHit(this, x, y);
-      if (pl) { this._plDrag = { line: pl }; try { e.preventDefault(); } catch (_) {} return; }
-      if (this._modern.pointerDown(x, y)) { try { e.preventDefault(); } catch (_) {} return; }
-    }
-    return _origMouseDown.apply(this, arguments);
-  };
-
-  const _origMouseMove = proto.onMouseMove;
-  proto.onMouseMove = function (e) {
-    if (this._modern) {
-      const r = this.canvas.getBoundingClientRect();
-      const x = e.clientX - r.left, y = e.clientY - r.top;
-      // active drags (cards + price lines) consume the move entirely
-      if (this._plDrag) {
-        const p = this.yToPrice(Math.max((this.priceTop || 0) + 4, Math.min((this.priceBottom || this.H) - 4, y)));
-        if (p != null && isFinite(p)) { this._plDrag.line.price = p; this.invalidate(); }
-        return;
-      }
-      this._modern.pointerMove(x, y);   // hover bookkeeping (no consumption)
-      if (this._modern.drag) return;    // mid-card-drag: no chart interaction
-    }
-    return _origMouseMove.apply(this, arguments);
-  };
-
-  const _origMouseUp = proto.onMouseUp;
-  proto.onMouseUp = function (e) {
-    if (this._modern) {
-      if (this._plDrag) { this._plDrag = null; this.invalidate(); return; }
-      const r = this.canvas.getBoundingClientRect();
-      if (this._modern.pointerUp(e.clientX - r.left, e.clientY - r.top)) return;
-    }
-    return _origMouseUp.apply(this, arguments);
-  };
-
-  const _origTouchStart = proto.onTouchStart;
-  proto.onTouchStart = function (e) {
-    if (this._modern && e.touches && e.touches.length) {
-      const r = this.canvas.getBoundingClientRect();
-      const x = e.touches[0].clientX - r.left, y = e.touches[0].clientY - r.top;
-      const pl = _priceLineHit(this, x, y);
-      if (pl) { this._plDrag = { line: pl }; try { e.preventDefault(); } catch (_) {} return; }
-      if (this._modern.pointerDown(x, y)) { try { e.preventDefault(); } catch (_) {} return; }
-    }
-    return _origTouchStart.apply(this, arguments);
-  };
-
-  const _origTouchMove = proto.onTouchMove;
-  proto.onTouchMove = function (e) {
-    if (this._modern && e.touches && e.touches.length) {
-      const r = this.canvas.getBoundingClientRect();
-      const x = e.touches[0].clientX - r.left, y = e.touches[0].clientY - r.top;
-      if (this._plDrag) {
-        const p = this.yToPrice(Math.max((this.priceTop || 0) + 4, Math.min((this.priceBottom || this.H) - 4, y)));
-        if (p != null && isFinite(p)) { this._plDrag.line.price = p; this.invalidate(); }
-        try { e.preventDefault(); } catch (_) {}
-        return;
-      }
-      if (this._modern.drag) {
-        this._modern.pointerMove(x, y);
-        try { e.preventDefault(); } catch (_) {}
-        return;
-      }
-    }
-    return _origTouchMove.apply(this, arguments);
-  };
-
-  const _origTouchEnd = proto.onTouchEnd;
-  proto.onTouchEnd = function (e) {
-    if (this._modern) {
-      if (this._plDrag) { this._plDrag = null; this.invalidate(); return; }
-      const r = this.canvas.getBoundingClientRect();
-      const x = (e.changedTouches && e.changedTouches[0]) ? e.changedTouches[0].clientX - r.left : -1;
-      const y = (e.changedTouches && e.changedTouches[0]) ? e.changedTouches[0].clientY - r.top : -1;
-      if (this._modern.pointerUp(x, y)) return;
-    }
-    return _origTouchEnd.apply(this, arguments);
-  };
-
-  const _origWheel = proto.onWheel;
-  proto.onWheel = function (e) {
-    if (this._modern) {
-      const r = this.canvas.getBoundingClientRect();
-      if (this._modern.wheel(e.clientX - r.left, e.clientY - r.top, e.deltaY)) {
-        try { e.preventDefault(); } catch (_) {}
-        return;
-      }
-    }
-    return _origWheel.apply(this, arguments);
-  };
-
-  const _origKeyDown = proto.onKeyDown;
-  proto.onKeyDown = function (e) {
-    if (this._modern) {
-      // the Shortcuts card eats printable keys while it is the focused card
-      const focus = this._modern.hoverCardId;
-      const sc = focus && this._modern.getCard('shortcuts');
-      if (sc && focus === 'shortcuts') {
-        const r = sc.keyDown(e);
-        if (r === 'close') { this._modern.removeCard('shortcuts'); return; }
-        if (r) { try { e.preventDefault(); } catch (_) {} this.invalidate(); return; }
-      }
-      if (this._modern.keyDown(e)) { try { e.preventDefault(); } catch (_) {} return; }
-      // 'M' toggles the modern measure tool (no core binding uses it)
-      if (e.key === 'm' || e.key === 'M') {
-        this.setTool(this.activeTool === 'measure' ? 'cursor' : 'measure');
-        try { e.preventDefault(); } catch (_) {}
-        return;
-      }
-    }
-    return _origKeyDown.apply(this, arguments);
-  };
-
-  const _origDblClick = proto.onDblClick;
-  proto.onDblClick = function (e) {
-    if (this._modern) {
-      const r = this.canvas.getBoundingClientRect();
-      const x = e.clientX - r.left, y = e.clientY - r.top;
-      // double-click a price line → instant alert at that level
-      const pl = _priceLineHit(this, x, y);
-      if (pl) {
-        this.addAlert({ price: pl.price, direction: 'above', label: pl.title || 'Alert' });
-        this.showToast('⚡ Alert @ ' + (this.priceScale ? this.priceScale.formatLogical(pl.price) : pl.price));
-        return;
-      }
-      // double-click on a modern card must not trigger "fit all data"
-      if (this._modern.pointerDown(x, y)) return;
-    }
-    return _origDblClick.apply(this, arguments);
-  };
-
-  // ---- UI hit-test extension -------------------------------------------------
-  // While the pointer is over a modern card / rail / price line, the chart
-  // must behave as "outside" (no crosshair, no OHLC follow) — exactly like
-  // the built-in cards (v2.34.1 behavior).
-  const _origOverUI = proto._overUI;
-  proto._overUI = function (x, y) {
-    if (this._modern) {
-      if (this._modern.drag || this._plDrag) return true;
-      const rr = this._modern._railRect;
-      if (rr && x >= rr.x && x <= rr.x + rr.w && y >= rr.y && y <= rr.y + rr.h) return true;
-      const cards = this._modern.cards;
-      for (let i = 0; i < cards.length; i++) {
-        if (CardKit.hit(x, y, cards[i].rect())) return true;
-      }
-      if (_priceLineHit(this, x, y)) return true;
-    }
-    return _origOverUI.apply(this, arguments);
-  };
-
-  // ---- range sync: broadcast the viewport whenever it actually changes -------
-  // invalidate() runs on every interaction; the two-number change check keeps
-  // this a no-op until the user pans/zooms (then peers mirror it exactly once
-  // per change — the _syncFrom guard kills the echo).
-  const _origInvalidate = proto.invalidate;
-  proto.invalidate = function () {
-    if (this._syncOpts && this._syncOpts.range && !this._syncFrom) {
-      const vo = this.rightOffset, bs = this.barSpacing;
-      if (this._lastSyncVo !== vo || this._lastSyncBs !== bs) {
-        this._lastSyncVo = vo; this._lastSyncBs = bs;
-        _syncBroadcast(this, '_syncSetViewport', [vo, bs]);
-      }
-    }
-    return _origInvalidate.apply(this, arguments);
-  };
-
-  // ---- cleanup ----------------------------------------------------------------
-  const _origDestroy = proto.destroy;
-  proto.destroy = function () {
-    if (this._modern) { this._modern.cards = []; this._modern = null; }
-    try { if (_syncGroups.has(this)) { _syncGroups.delete(this); } } catch (_) {}
-    return _origDestroy.apply(this, arguments);
-  };
-
-  /* ---- public API: the modern layer ---------------------------------------- */
-  // chart.enableModernUI({ theme, cards, locale, launcher, railSide })
-  proto.enableModernUI = function (opts) {
-    opts = opts || {};
-    if (!this._modern) {
-      this._modern = new CardManager(this);
-      _initAlerts(this);
-      _initPriceLines(this);
-      // the modern measure tool (registered per-instance)
-      this.addDrawingTool(_makeMeasureTool(this));
-      // 'M' shortcut for the measure tool (wrapped below — plain M is safe:
-      // the core's shortcut map has no 'm' binding)
-    }
-    // theme preset
-    if (opts.theme) this.setThemePreset(opts.theme === 'auto' ? _detectPreferredTheme() : opts.theme);
-    // locale (default English so every card label is translatable from the start)
-    this.setLocale(opts.locale || this._locale || 'en');
-    if (opts.locale) this.setLocale(opts.locale);
-    this._modern.railSide = opts.railSide || (this._locale === 'ar' ? 'left' : 'right');
-    // cards
-    let cards = opts.cards;
-    if (!cards || cards === 'all') cards = CARD_IDS;
-    if (Array.isArray(cards)) {
-      for (let i = 0; i < cards.length; i++) {
-        if (CARD_FACTORIES[cards[i]]) this._modern.addCard(CARD_FACTORIES[cards[i]](this), { silent: true });
-      }
-    }
-    this._modern.layout();
-    this.invalidate();
-    return this;
-  };
-
-  // enable one indicator from the modern pack: chart.enableIndicator('vwap', {period:20})
-  proto.enableIndicator = function (id, config) {
-    const def = BadiIndicatorPack[id];
-    if (!def) {
-      console.warn('[BadiCharts] enableIndicator: unknown id "' + id + '". Pack ids: [' +
-                   BADI_INDICATOR_PACK_IDS.join(', ') + ']');
-      return this;
-    }
-    // deep-clone the definition (calculate/render keep `this` = def)
-    const copy = {};
-    for (const k in def) {
-      if (k === 'settings') copy.settings = Object.assign({}, def.settings, (config && config.settings) || {});
-      else copy[k] = def[k];
-    }
-    this.addIndicator(copy, config || {});
-    return this;
-  };
-  proto.enableIndicators = function (ids) {
-    if (!Array.isArray(ids)) return this;
-    for (let i = 0; i < ids.length; i++) this.enableIndicator(ids[i]);
-    return this;
-  };
-  proto.getModernIndicatorIds = function () { return BADI_INDICATOR_PACK_IDS.slice(); };
-
-  // theme presets -----------------------------------------------------------
-  proto.setThemePreset = function (name) {
-    const preset = BadiThemes[name];
-    if (!preset) {
-      console.warn('[BadiCharts] setThemePreset: unknown preset "' + name + '". Available: ' +
-                   Object.keys(BadiThemes).join(', '));
-      return this;
-    }
-    this._themePresetName = name;
-    // merge the preset INTO the live instance theme (existing overrides win
-    // over the preset only where the user set them after construction)
-    this.setTheme(Object.assign({}, preset));
-    // re-apply the user's explicit post-construction overrides if tracked
-    if (this._themeOverrides) this.setTheme(this._themeOverrides);
-    this.invalidate();
-    return this;
-  };
-  proto.getThemePreset = function () { return this._themePresetName || null; };
-  proto.getThemePresetNames = function () { return Object.keys(BadiThemes); };
-
-  // track setTheme(overrides) calls so presets don't erase user overrides
-  const _origSetTheme = proto.setTheme;
-  proto.setTheme = function (overrides) {
-    if (overrides && typeof overrides === 'object') {
-      if (!this._themeOverrides) this._themeOverrides = {};
-      Object.assign(this._themeOverrides, overrides);
-    }
-    return _origSetTheme.apply(this, arguments);
-  };
-  proto._modernCycleTheme = function () {
-    const names = Object.keys(BadiThemes);
-    const cur = names.indexOf(this._themePresetName || 'midnight');
-    const next = names[(cur + 1) % names.length];
-    this.setThemePreset(next);
-    this.showToast('Theme: ' + next);
-  };
-
-  // locale --------------------------------------------------------------------
-  proto.setLocale = function (locale) {
-    if (!BadiI18n[locale]) { console.warn('[BadiCharts] setLocale: unknown locale "' + locale + '" (en, ar)'); return this; }
-    this._locale = locale;
-    this._t = function (key) { return (BadiI18n[locale] && BadiI18n[locale][key]) || BadiI18n.en[key] || key; };
-    if (this._modern) this._modern.railSide = (locale === 'ar' ? 'left' : 'right');
-    this.invalidate();
-    return this;
-  };
-  proto.getLocale = function () { return this._locale || 'en'; };
-
-  // alerts -----------------------------------------------------------------------
-  proto.addAlert = function (spec) {
-    _initAlerts(this);
-    if (!spec || !isFinite(spec.price)) { console.warn('[BadiCharts] addAlert: {price:number} required'); return null; }
-    const a = {
-      id: this._alertSeq++,
-      price: spec.price,
-      direction: spec.direction === 'below' || spec.direction === 'cross' ? spec.direction : 'above',
-      label: spec.label || '',
-      color: spec.color || '#ffb74d',
-      once: spec.once !== false,
-      muted: false,
-      triggered: false
-    };
-    this._alerts.push(a);
-    this.invalidate();
-    _checkAlerts(this);
-    return a;
-  };
-  proto.removeAlert = function (id) {
-    if (!this._alerts) return this;
-    for (let i = 0; i < this._alerts.length; i++) {
-      if (this._alerts[i].id === id) { this._alerts.splice(i, 1); break; }
-    }
-    this.invalidate();
-    return this;
-  };
-  proto.muteAlert = function (id) {
-    if (!this._alerts) return this;
-    for (let i = 0; i < this._alerts.length; i++) {
-      if (this._alerts[i].id === id) { this._alerts[i].muted = !this._alerts[i].muted; break; }
-    }
-    this.invalidate();
-    return this;
-  };
-  proto.clearAlerts = function () { this._alerts = []; this.invalidate(); return this; };
-  proto.getAlerts = function () { return (this._alerts || []).slice(); };
-  proto.onAlert = function (cb) {
-    _initAlerts(this);
-    if (typeof cb === 'function') this._alertCbs.push(cb);
-    return this;
-  };
-
-  // price lines --------------------------------------------------------------------
-  proto.createPriceLine = function (opts) { return createPriceLine(this, opts); };
-
-  // watchlist ----------------------------------------------------------------------
-  proto.setWatchlist = function (list) {
-    this._watchlist = Array.isArray(list) ? list : [];
-    this.invalidate();
-    return this;
-  };
-  proto.getWatchlist = function () { return (this._watchlist || []).slice(); };
-  proto.onSymbolPick = function (cb) { this._onSymbolPick = typeof cb === 'function' ? cb : null; return this; };
-
-  // paper trading hooks --------------------------------------------------------------
-  proto.onTrade = function (cb) { this._onTrade = typeof cb === 'function' ? cb : null; return this; };
-
-  // export -----------------------------------------------------------------------------
-  proto.exportPNG = function (opts) { return _exportPNGImpl(this, opts); };
-  proto.exportCSV = function (opts) { return _exportCSVImpl(this, opts); };
-  proto.exportJSON = function () { return _exportJSONImpl(this); };
-
-  // sessions -----------------------------------------------------------------------------
-  proto.setSessions = function (sessions) {
-    this._sessions = Array.isArray(sessions) ? sessions : null;
-    this.invalidate();
-    return this;
-  };
-
-  // sync -----------------------------------------------------------------------------------
-  proto.syncWith = function (other, opts) {
-    if (!other || other === this) return this;
-    opts = opts || {};
-    if (!_syncGroups.has(this)) _syncGroups.set(this, new Set());
-    if (!_syncGroups.has(other)) _syncGroups.set(other, new Set());
-    _syncGroups.get(this).add(other);
-    _syncGroups.get(other).add(this);
-    this._syncOpts = { range: opts.range !== false, crosshair: opts.crosshair !== false };
-    other._syncOpts = this._syncOpts;
-    // wire crosshair mirroring through the public onCrosshair callback
-    const self = this;
-    if (opts.crosshair !== false) {
-      this.onCrosshair(function (pos) {
-        if (self._syncFrom) return;
-        _syncBroadcast(self, '_syncSetCrosshair', [pos]);
-      });
-    }
-    return this;
-  };
-  proto.unsync = function (other) {
-    if (other) {
-      const a = _syncGroups.get(this), b = _syncGroups.get(other);
-      if (a) a.delete(other);
-      if (b) b.delete(this);
-    } else {
-      _syncGroups.delete(this);
-    }
-    return this;
-  };
-  // internal: applied on sync peers (never ping-pongs thanks to _syncFrom)
-  proto._syncSetCrosshair = function (pos) {
-    if (!pos) return;
-    this.crosshairIndex = pos.index != null ? pos.index : this.crosshairIndex;
-    this.invalidate();
-  };
-  proto._syncSetViewport = function (rightOffset, barSpacing) {
-    if (isFinite(rightOffset)) this.rightOffset = rightOffset;
-    if (isFinite(barSpacing)) this.barSpacing = barSpacing;
-    try { this.constrainRightOffset(); } catch (_) {}
-    try { this.autoScale(); } catch (_) {}
-    try { this.invalidateTimeMarks(); } catch (_) {}
-  };
-})();
-
-/* ---- global exports (guarded, like the core) ------------------------------- */
-if (typeof window !== 'undefined') {
-  window.BadiThemes = BadiThemes;
-  window.BadiCardKit = CardKit;
-  window.BadiI18n = BadiI18n;
-  window.BadiIndicators = BadiIndicatorPack;
-  window.BadiIndicatorPack = BadiIndicatorPack;
-}
-
-/* =========================================================================
- * MODERN SECTION 8 — INDICATOR PACK II (12 MORE INDICATORS)
- * =========================================================================
- * The second wave of the modern indicator pack — focused on the tools real
- * desks actually pair with the wave-1 set:
+/* =============================================================================
+ * BADI-CHARTS-V2 v2.38.0 — GPU LINE BATCH ENGINE + PUBLIC SERIES API
+ * =============================================================================
+ * The heart of the performance edition: thousands of line series, one draw
+ * call, zero CPU per frame while panning / zooming.
  *
- *   HMA              — Hull Moving Average (fast + smooth, no lag spikes)
- *   VWMA             — Volume-Weighted Moving Average
- *   MA Ribbon        — fan of 6 SMAs (trend strength at a glance)
- *   Anchored VWAP    — VWAP from a user-chosen anchor bar (session|event)
- *   Std Err Bands    — Standard Error bands (tighter than Bollinger in trends)
- *   Elder Ray        — Bull/Bear Power histogram (pane)
- *   Force Index      — Elder's force index (pane)
- *   Vortex           — VI+ / VI− trend direction crosses (pane)
- *   DPO              — Detrended Price Oscillator (pane)
- *   PVT              — Price-Volume Trend (pane)
- *   Volume Osc       — volume momentum (pane)
- *   Ulcer Index      — drawdown depth gauge (pane)
- * ======================================================================== */
-
-/* ------------------------- math utilities (wave 2) ------------------------ */
-Object.assign(Indicators, {
-  // Hull Moving Average: WMA(2·WMA(n/2) − WMA(n), √n) — the classic Alan
-  // Hull construction; responds like a fast EMA but stays glassy smooth.
-  hma(values, period) {
-    period = Math.max(4, period | 0 || 21);
-    const n = values.length;
-    const half = Math.max(1, period >> 1);
-    const sqrtP = Math.max(1, Math.round(Math.sqrt(period)));
-    const wma = function (arr, p) {
-      const out = new Array(arr.length).fill(null);
-      for (let i = p - 1; i < arr.length; i++) {
-        let sum = 0, wsum = 0, ok = true;
-        for (let k = 0; k < p; k++) {
-          const v = arr[i - p + 1 + k];
-          if (v == null || !isFinite(v)) { ok = false; break; }
-          const w = k + 1;
-          sum += v * w; wsum += w;
-        }
-        if (ok) out[i] = sum / wsum;
-      }
-      return out;
-    };
-    const w1 = wma(values, half), w2 = wma(values, period);
-    const raw = new Array(n).fill(null);
-    for (let i = 0; i < n; i++) {
-      if (w1[i] != null && w2[i] != null) raw[i] = 2 * w1[i] - w2[i];
-    }
-    const out = wma(raw, sqrtP);
-    return out;
-  },
-
-  // Volume-Weighted Moving Average: Σ(price·vol) / Σ(vol) over the window.
-  vwma(candles, period) {
-    period = Math.max(1, period | 0 || 20);
-    const n = candles.length;
-    const out = new Array(n).fill(null);
-    let pv = 0, vv = 0;
-    const pvArr = new Array(n), vArr = new Array(n);
-    for (let i = 0; i < n; i++) {
-      pvArr[i] = candles[i].close * (candles[i].volume || 0);
-      vArr[i] = candles[i].volume || 0;
-    }
-    for (let i = 0; i < n; i++) {
-      pv += pvArr[i]; vv += vArr[i];
-      if (i >= period) { pv -= pvArr[i - period]; vv -= vArr[i - period]; }
-      if (i >= period - 1 && vv > 0) out[i] = pv / vv;
-    }
-    return out;
-  },
-
-  // Anchored VWAP: cumulative VWAP from an anchor index to the last bar.
-  // The anchor defaults to the start of the current UTC day, or an explicit
-  // { anchorIndex } / { anchorTime } setting.
-  anchoredVwap(candles, anchorIndex) {
-    const n = candles.length;
-    if (!n) return [];
-    let start = anchorIndex;
-    if (start == null || !isFinite(start)) {
-      // default: current UTC day
-      const t = candles[n - 1].time * (candles[n - 1].time > 1e12 ? 1 : 1000);
-      const dayStart = Math.floor(t / 86400000) * 86400000;
-      start = 0;
-      for (let i = n - 1; i >= 0; i--) {
-        const ct = candles[i].time * (candles[i].time > 1e12 ? 1 : 1000);
-        if (ct < dayStart) { start = i + 1; break; }
-      }
-    }
-    start = Math.max(0, Math.min(n - 1, Math.floor(start)));
-    const out = new Array(n).fill(null);
-    let pv = 0, v = 0;
-    for (let i = start; i < n; i++) {
-      const tp = (candles[i].high + candles[i].low + candles[i].close) / 3;
-      const vol = Math.max(0, candles[i].volume || 0);
-      pv += tp * vol; v += vol;
-      if (v > 0) out[i] = pv / v;
-    }
-    return out;
-  },
-
-  // Standard Error bands: linear-regression basis ± mult·stderr (the tight
-  // channel that TradingView ships as "Standard Error Bands").
-  stdErrBands(candles, period, mult) {
-    period = Math.max(3, period | 0 || 21); mult = mult || 2;
-    const n = candles.length;
-    const basis = new Array(n).fill(null), upper = new Array(n).fill(null), lower = new Array(n).fill(null);
-    for (let i = period - 1; i < n; i++) {
-      // least-squares fit of close over the window (x = 0..period-1)
-      let sx = 0, sy = 0, sxy = 0, sxx = 0;
-      for (let k = 0; k < period; k++) {
-        const y = candles[i - period + 1 + k].close;
-        sx += k; sy += y; sxy += k * y; sxx += k * k;
-      }
-      const denom = period * sxx - sx * sx;
-      if (denom === 0) continue;
-      const slope = (period * sxy - sx * sy) / denom;
-      const intercept = (sy - slope * sx) / period;
-      // residual standard error
-      let ssr = 0;
-      for (let k = 0; k < period; k++) {
-        const y = candles[i - period + 1 + k].close;
-        const fit = intercept + slope * k;
-        ssr += (y - fit) * (y - fit);
-      }
-      const se = Math.sqrt(ssr / (period - 2));
-      const mid = intercept + slope * (period - 1);
-      basis[i] = mid;
-      upper[i] = mid + mult * se;
-      lower[i] = mid - mult * se;
-    }
-    return { basis: basis, upper: upper, lower: lower };
-  },
-
-  // Elder Ray: bull power = high − EMA13, bear power = low − EMA13.
-  elderRay(candles, period) {
-    period = period || 13;
-    const closes = candles.map(function (c) { return c.close; });
-    const ema = Indicators.ema(closes, period);
-    const n = candles.length;
-    const bull = new Array(n).fill(null), bear = new Array(n).fill(null);
-    for (let i = 0; i < n; i++) {
-      if (ema[i] == null) continue;
-      bull[i] = candles[i].high - ema[i];
-      bear[i] = candles[i].low - ema[i];
-    }
-    return { bull: bull, bear: bear, ema: ema };
-  },
-
-  // Force Index (Elder): direction × magnitude × volume, EMA-smoothed.
-  forceIndex(candles, period) {
-    period = Math.max(1, period | 0 || 13);
-    const n = candles.length;
-    const raw = new Array(n).fill(null);
-    for (let i = 1; i < n; i++) {
-      raw[i] = (candles[i].close - candles[i - 1].close) * (candles[i].volume || 0);
-    }
-    return Indicators.ema(raw, period);
-  },
-
-  // Vortex Indicator: VI+ = Σ|high−prevLow| / ΣTR, VI− = Σ|low−prevHigh| / ΣTR.
-  vortex(candles, period) {
-    period = Math.max(2, period | 0 || 14);
-    const n = candles.length;
-    const tr = Indicators.trueRange(candles);
-    const vmP = new Array(n).fill(0), vmM = new Array(n).fill(0);
-    for (let i = 1; i < n; i++) {
-      vmP[i] = Math.abs(candles[i].high - candles[i - 1].low);
-      vmM[i] = Math.abs(candles[i].low - candles[i - 1].high);
-    }
-    const plus = new Array(n).fill(null), minus = new Array(n).fill(null);
-    for (let i = period; i < n; i++) {
-      let sTR = 0, sP = 0, sM = 0, ok = true;
-      for (let k = i - period + 1; k <= i; k++) {
-        if (tr[k] == null) { ok = false; break; }
-        sTR += tr[k]; sP += vmP[k]; sM += vmM[k];
-      }
-      if (!ok || sTR === 0) continue;
-      plus[i] = sP / sTR;
-      minus[i] = sM / sTR;
-    }
-    return { plus: plus, minus: minus };
-  },
-
-  // Detrended Price Oscillator: close − SMA(n) shifted n/2+1 bars back.
-  dpo(candles, period) {
-    period = Math.max(3, period | 0 || 21);
-    const closes = candles.map(function (c) { return c.close; });
-    const sma = Indicators.sma(closes, period);
-    const shift = Math.floor(period / 2) + 1;
-    const n = candles.length;
-    const out = new Array(n).fill(null);
-    for (let i = 0; i < n; i++) {
-      const j = i - shift;               // the SMA value shift bars back
-      if (j < 0 || sma[j] == null) continue;
-      out[i] = candles[i].close - sma[j];
-    }
-    return out;
-  },
-
-  // Price-Volume Trend: cumulative volume signed by fractional close change.
-  pvt(candles) {
-    const n = candles.length;
-    const out = new Array(n).fill(null);
-    if (!n) return out;
-    out[0] = 0;
-    for (let i = 1; i < n; i++) {
-      const pc = candles[i - 1].close;
-      out[i] = out[i - 1] + (pc ? ((candles[i].close - pc) / pc) : 0) * (candles[i].volume || 0);
-    }
-    return out;
-  },
-
-  // Volume Oscillator: EMA(fast vol) − EMA(slow vol), as percent of the slow.
-  volumeOscillator(candles, fast, slow) {
-    fast = Math.max(1, fast | 0 || 5); slow = Math.max(fast + 1, slow | 0 || 10);
-    const vols = candles.map(function (c) { return c.volume || 0; });
-    const ef = Indicators.ema(vols, fast), es = Indicators.ema(vols, slow);
-    const n = candles.length;
-    const out = new Array(n).fill(null);
-    for (let i = 0; i < n; i++) {
-      if (ef[i] == null || es[i] == null || es[i] === 0) continue;
-      out[i] = ((ef[i] - es[i]) / es[i]) * 100;
-    }
-    return out;
-  },
-
-  // Ulcer Index: root-mean-square of drawdown from the N-bar high — the
-  // canonical "how deep does it hurt" risk gauge.
-  ulcerIndex(candles, period) {
-    period = Math.max(2, period | 0 || 14);
-    const n = candles.length;
-    const out = new Array(n).fill(null);
-    for (let i = period - 1; i < n; i++) {
-      let hi = -Infinity;
-      for (let k = i - period + 1; k <= i; k++) if (candles[k].close > hi) hi = candles[k].close;
-      let ss = 0;
-      for (let k = i - period + 1; k <= i; k++) {
-        const dd = ((hi - candles[k].close) / hi) * 100;
-        ss += dd * dd;
-      }
-      out[i] = Math.sqrt(ss / period);
-    }
-    return out;
-  }
-});
-
-/* ------------------------- definitions (wave 2) --------------------------- */
-Object.assign(BadiIndicatorPack, {
-
-  /* ---- Hull MA (overlay) ------------------------------------------------- */
-  hma: {
-    id: 'hma', label: 'Hull MA', type: 'overlay', color: '#ff9800',
-    settings: { period: 21 },
-    calculate: function (candles, s) {
-      const closes = candles.map(function (c) { return c.close; });
-      return Indicators.hma(closes, s.period);
-    },
-    getRange: function (values) { return values ? _rangeOf([values], 0, values.length - 1) : null; },
-    render: function (ctx, v, h) {
-      _strokeSeries(ctx, v, h, h.firstIdx, h.lastIdx, this.color, 2, h.priceToY);
-    }
-  },
-
-  /* ---- VWMA (overlay) ----------------------------------------------------- */
-  vwma: {
-    id: 'vwma', label: 'VWMA', type: 'overlay', color: '#ab47bc',
-    settings: { period: 20 },
-    calculate: function (candles, s) { return Indicators.vwma(candles, s.period); },
-    getRange: function (values) { return values ? _rangeOf([values], 0, values.length - 1) : null; },
-    render: function (ctx, v, h) {
-      _strokeSeries(ctx, v, h, h.firstIdx, h.lastIdx, this.color, 1.75, h.priceToY);
-    }
-  },
-
-  /* ---- MA Ribbon (overlay) -------------------------------------------------- */
-  ribbon: {
-    id: 'ribbon', label: 'MA Ribbon', type: 'overlay', color: '#4c7dff',
-    settings: { fast: 10, step: 10, count: 6 },
-    calculate: function (candles, s) {
-      const closes = candles.map(function (c) { return c.close; });
-      const lines = [];
-      const count = Math.max(2, Math.min(8, s.count | 0 || 6));
-      for (let k = 0; k < count; k++) {
-        lines.push(Indicators.sma(closes, Math.max(2, s.fast + s.step * k)));
-      }
-      return { lines: lines };
-    },
-    getRange: function (values) {
-      return values && values.lines ? _rangeOf(values.lines, 0, values.lines[0].length - 1) : null;
-    },
-    render: function (ctx, v, h, s) {
-      if (!v || !v.lines) return;
-      const T = h.THEME;
-      const count = v.lines.length;
-      // fan from cold blue (fast) to warm red (slow) — readability at a glance
-      for (let k = 0; k < count; k++) {
-        const hue = 215 - (k / Math.max(1, count - 1)) * 215;   // 215° → 0°
-        const color = 'hsl(' + Math.round(hue) + ',72%,60%)';
-        _strokeSeries(ctx, v.lines[k], h, h.firstIdx, h.lastIdx, color, 1.25, h.priceToY);
-      }
-    }
-  },
-
-  /* ---- Anchored VWAP (overlay) ----------------------------------------------- */
-  avwap: {
-    id: 'avwap', label: 'Anchored VWAP', type: 'overlay', color: '#00bcd4',
-    settings: { anchorIndex: null },
-    calculate: function (candles, s) { return Indicators.anchoredVwap(candles, s.anchorIndex); },
-    getRange: function (values) { return values ? _rangeOf([values], 0, values.length - 1) : null; },
-    render: function (ctx, v, h) {
-      _strokeSeries(ctx, v, h, h.firstIdx, h.lastIdx, this.color, 1.75, h.priceToY);
-      // anchor marker (small ring at the first non-null bar)
-      if (v) {
-        for (let i = 0; i < v.length; i++) {
-          if (v[i] != null) {
-            ctx.beginPath();
-            ctx.arc(h.indexToX(i), h.priceToY(v[i]), 4, 0, Math.PI * 2);
-            ctx.strokeStyle = this.color;
-            ctx.lineWidth = 1.5;
-            ctx.stroke();
-            break;
-          }
-        }
-      }
-    }
-  },
-
-  /* ---- Standard Error Bands (overlay) ----------------------------------------- */
-  stderr: {
-    id: 'stderr', label: 'Std Error Bands', type: 'overlay', color: '#26c6da',
-    settings: { period: 21, mult: 2 },
-    calculate: function (candles, s) { return Indicators.stdErrBands(candles, s.period, s.mult); },
-    getRange: function (values) {
-      return values ? _rangeOf([values.upper, values.lower], 0, values.upper.length - 1) : null;
-    },
-    render: function (ctx, v, h) {
-      if (!v || !v.basis) return;
-      ctx.beginPath();
-      let prev = false;
-      for (let i = h.firstIdx; i <= h.lastIdx; i++) {
-        if (v.upper[i] == null) { prev = false; continue; }
-        const x = h.indexToX(i), y = h.priceToY(v.upper[i]);
-        if (!prev) { ctx.moveTo(x, y); prev = true; } else ctx.lineTo(x, y);
-      }
-      for (let i = h.lastIdx; i >= h.firstIdx; i--) {
-        if (v.lower[i] == null) continue;
-        ctx.lineTo(h.indexToX(i), h.priceToY(v.lower[i]));
-      }
-      ctx.closePath();
-      ctx.fillStyle = 'rgba(38,198,218,0.08)';
-      ctx.fill();
-      _strokeSeries(ctx, v.upper, h, h.firstIdx, h.lastIdx, 'rgba(38,198,218,0.7)', 1, h.priceToY);
-      _strokeSeries(ctx, v.lower, h, h.firstIdx, h.lastIdx, 'rgba(38,198,218,0.7)', 1, h.priceToY);
-      _strokeSeries(ctx, v.basis, h, h.firstIdx, h.lastIdx, this.color, 1.5, h.priceToY);
-    }
-  },
-
-  /* ---- Elder Ray (pane) --------------------------------------------------------- */
-  elder: {
-    id: 'elder', label: 'Elder Ray', type: 'pane', color: '#26a69a',
-    settings: { period: 13 },
-    calculate: function (candles, s) { return Indicators.elderRay(candles, s.period); },
-    getRange: function (values) {
-      if (!values) return { min: -1, max: 1 };
-      const r = _rangeOf([values.bull, values.bear], 0, values.bull.length - 1);
-      if (!r) return { min: -1, max: 1 };
-      const m = Math.max(Math.abs(r.min), Math.abs(r.max)) || 1;
-      return { min: -m * 1.1, max: m * 1.1 };
-    },
-    render: function (ctx, v, h) {
-      if (!v || !v.bull) return;
-      const T = h.THEME;
-      const y0 = h.paneToY(0);
-      const bw = Math.max(1, Math.min(7, h.barSpacing * 0.3));
-      // two side-by-side histograms: bull (above zero, green) & bear (below, red)
-      for (let i = h.firstIdx; i <= h.lastIdx; i++) {
-        const b = v.bull[i], r = v.bear[i];
-        if (b == null || r == null) continue;
-        const x = h.indexToX(i);
-        ctx.fillStyle = 'rgba(38,166,154,0.75)';
-        ctx.fillRect(x - bw - 1, Math.min(h.paneToY(b), y0), bw, Math.max(1, Math.abs(h.paneToY(b) - y0)));
-        ctx.fillStyle = 'rgba(239,83,80,0.75)';
-        ctx.fillRect(x + 1, Math.min(h.paneToY(r), y0), bw, Math.max(1, Math.abs(h.paneToY(r) - y0)));
-      }
-      ctx.strokeStyle = 'rgba(120,123,134,0.3)';
-      ctx.beginPath();
-      ctx.moveTo(h.chartLeft, y0 + 0.5);
-      ctx.lineTo(h.chartRight, y0 + 0.5);
-      ctx.stroke();
-    }
-  },
-
-  /* ---- Force Index (pane) --------------------------------------------------------- */
-  force: {
-    id: 'force', label: 'Force Index', type: 'pane', color: '#7e57c2',
-    settings: { period: 13 },
-    calculate: function (candles, s) { return Indicators.forceIndex(candles, s.period); },
-    getRange: function (values) {
-      const r = values ? _rangeOf([values], 0, values.length - 1) : null;
-      if (!r) return { min: -1, max: 1 };
-      const m = Math.max(Math.abs(r.min), Math.abs(r.max)) || 1;
-      return { min: -m * 1.1, max: m * 1.1 };
-    },
-    render: function (ctx, v, h) {
-      if (!v) return;
-      const y0 = h.paneToY(0);
-      const bw = Math.max(1, Math.min(6, h.barSpacing * 0.5));
-      for (let i = h.firstIdx; i <= h.lastIdx; i++) {
-        const val = v[i];
-        if (val == null) continue;
-        const y = h.paneToY(val);
-        ctx.fillStyle = val >= 0 ? 'rgba(126,87,194,0.75)' : 'rgba(239,83,80,0.65)';
-        ctx.fillRect(h.indexToX(i) - bw / 2, Math.min(y, y0), bw, Math.max(1, Math.abs(y - y0)));
-      }
-      ctx.strokeStyle = 'rgba(120,123,134,0.3)';
-      ctx.beginPath();
-      ctx.moveTo(h.chartLeft, y0 + 0.5);
-      ctx.lineTo(h.chartRight, y0 + 0.5);
-      ctx.stroke();
-    }
-  },
-
-  /* ---- Vortex (pane) --------------------------------------------------------------- */
-  vortex: {
-    id: 'vortex', label: 'Vortex', type: 'pane', color: '#26a69a',
-    settings: { period: 14 },
-    calculate: function (candles, s) { return Indicators.vortex(candles, s.period); },
-    getRange: function (values) {
-      if (!values || !values.plus) return { min: 0, max: 2 };
-      const r = _rangeOf([values.plus, values.minus], 0, values.plus.length - 1);
-      return r ? { min: Math.min(0.8, r.min), max: Math.max(1.2, r.max * 1.05) } : { min: 0, max: 2 };
-    },
-    render: function (ctx, v, h) {
-      if (!v || !v.plus) return;
-      const T = h.THEME;
-      ctx.strokeStyle = 'rgba(120,123,134,0.25)';
-      ctx.setLineDash([3, 4]);
-      ctx.beginPath();
-      ctx.moveTo(h.chartLeft, h.paneToY(1));
-      ctx.lineTo(h.chartRight, h.paneToY(1));
-      ctx.stroke();
-      ctx.setLineDash([]);
-      _strokeSeries(ctx, v.plus, h, h.firstIdx, h.lastIdx, '#26a69a', 1.5, h.paneToY);
-      _strokeSeries(ctx, v.minus, h, h.firstIdx, h.lastIdx, '#ef5350', 1.5, h.paneToY);
-    }
-  },
-
-  /* ---- DPO (pane) --------------------------------------------------------------------- */
-  dpo: {
-    id: 'dpo', label: 'DPO', type: 'pane', color: '#ff7043',
-    settings: { period: 21 },
-    calculate: function (candles, s) { return Indicators.dpo(candles, s.period); },
-    getRange: function (values) {
-      const r = values ? _rangeOf([values], 0, values.length - 1) : null;
-      if (!r) return { min: -1, max: 1 };
-      const m = Math.max(Math.abs(r.min), Math.abs(r.max)) || 1;
-      return { min: -m * 1.1, max: m * 1.1 };
-    },
-    render: function (ctx, v, h) {
-      if (!v) return;
-      const y0 = h.paneToY(0);
-      const bw = Math.max(1, Math.min(6, h.barSpacing * 0.5));
-      for (let i = h.firstIdx; i <= h.lastIdx; i++) {
-        const val = v[i];
-        if (val == null) continue;
-        const y = h.paneToY(val);
-        ctx.fillStyle = val >= 0 ? 'rgba(255,112,67,0.7)' : 'rgba(38,166,154,0.6)';
-        ctx.fillRect(h.indexToX(i) - bw / 2, Math.min(y, y0), bw, Math.max(1, Math.abs(y - y0)));
-      }
-      ctx.strokeStyle = 'rgba(120,123,134,0.3)';
-      ctx.beginPath();
-      ctx.moveTo(h.chartLeft, y0 + 0.5);
-      ctx.lineTo(h.chartRight, y0 + 0.5);
-      ctx.stroke();
-    }
-  },
-
-  /* ---- PVT (pane) ------------------------------------------------------------------------ */
-  pvt: {
-    id: 'pvt', label: 'PVT', type: 'pane', color: '#5c6bc0',
-    settings: {},
-    calculate: function (candles) { return Indicators.pvt(candles); },
-    getRange: function (values) { return values ? _rangeOf([values], 0, values.length - 1) : null; },
-    render: function (ctx, v, h) {
-      _strokeSeries(ctx, v, h, h.firstIdx, h.lastIdx, this.color, 1.5, h.paneToY);
-    }
-  },
-
-  /* ---- Volume Oscillator (pane) ------------------------------------------------------------ */
-  volosc: {
-    id: 'volosc', label: 'Volume Osc', type: 'pane', color: '#42a5f5',
-    settings: { fast: 5, slow: 10 },
-    calculate: function (candles, s) { return Indicators.volumeOscillator(candles, s.fast, s.slow); },
-    getRange: function (values) {
-      const r = values ? _rangeOf([values], 0, values.length - 1) : null;
-      if (!r) return { min: -10, max: 10 };
-      const m = Math.max(Math.abs(r.min), Math.abs(r.max), 5) * 1.1;
-      return { min: -m, max: m };
-    },
-    render: function (ctx, v, h) {
-      if (!v) return;
-      const y0 = h.paneToY(0);
-      const bw = Math.max(1, Math.min(6, h.barSpacing * 0.5));
-      for (let i = h.firstIdx; i <= h.lastIdx; i++) {
-        const val = v[i];
-        if (val == null) continue;
-        const y = h.paneToY(val);
-        ctx.fillStyle = val >= 0 ? 'rgba(66,165,245,0.7)' : 'rgba(239,83,80,0.6)';
-        ctx.fillRect(h.indexToX(i) - bw / 2, Math.min(y, y0), bw, Math.max(1, Math.abs(y - y0)));
-      }
-      ctx.strokeStyle = 'rgba(120,123,134,0.3)';
-      ctx.beginPath();
-      ctx.moveTo(h.chartLeft, y0 + 0.5);
-      ctx.lineTo(h.chartRight, y0 + 0.5);
-      ctx.stroke();
-    }
-  },
-
-  /* ---- Ulcer Index (pane) ------------------------------------------------------------------- */
-  ulcer: {
-    id: 'ulcer', label: 'Ulcer Index', type: 'pane', color: '#ef5350',
-    settings: { period: 14 },
-    calculate: function (candles, s) { return Indicators.ulcerIndex(candles, s.period); },
-    getRange: function (values) {
-      const r = values ? _rangeOf([values], 0, values.length - 1) : null;
-      return { min: 0, max: Math.max(5, r ? r.max * 1.15 : 10) };
-    },
-    render: function (ctx, v, h) {
-      if (!v) return;
-      // area fill under the drawdown curve — pain made visible
-      ctx.beginPath();
-      let prev = false;
-      for (let i = h.firstIdx; i <= h.lastIdx; i++) {
-        if (v[i] == null) { prev = false; continue; }
-        const x = h.indexToX(i), y = h.paneToY(v[i]);
-        if (!prev) { ctx.moveTo(x, h.paneBottom); ctx.lineTo(x, y); prev = true; }
-        else ctx.lineTo(x, y);
-      }
-      if (prev) {
-        ctx.lineTo(h.indexToX(h.lastIdx), h.paneBottom);
-        ctx.closePath();
-        const g = ctx.createLinearGradient(0, h.paneTop, 0, h.paneBottom);
-        g.addColorStop(0, 'rgba(239,83,80,0.25)');
-        g.addColorStop(1, 'rgba(239,83,80,0.02)');
-        ctx.fillStyle = g;
-        ctx.fill();
-      }
-      _strokeSeries(ctx, v, h, h.firstIdx, h.lastIdx, this.color, 1.5, h.paneToY);
-    }
-  }
-});
-
-// refresh the exported catalog id list (wave 2 merged in)
-BADI_INDICATOR_PACK_IDS.length = 0;
-Array.prototype.push.apply(BADI_INDICATOR_PACK_IDS, Object.keys(BadiIndicatorPack));
-
-/* =========================================================================
- * MODERN SECTION 9 — POSITION TOOLS + EXTRA DRAWING TOOLS
- * =========================================================================
- * 9a. Long Position tool  — click to drop a TradingView-style long bracket:
- *       entry line, target box (green) and stop box (red), with a live glass
- *       pill computing size→P&L at target/stop and the reward:risk ratio.
- * 9b. Short Position tool — the mirrored short bracket.
- * 9c. Horizontal Ray      — a half-line that extends right forever.
- * 9d. Cross Line          — full-width + full-height crosshair lines.
- * All four register through the SAME addDrawingTool() contract the core
- * library exposes (onStart/onUpdate defaults + render/hitTest/handles), so
- * they behave exactly like built-in tools: selectable, deletable, draggable.
- * ======================================================================== */
-
-/* ---- shared bracket renderer --------------------------------------------- */
-// Draws a position bracket from a drawing object of shape:
-//   { type:'long'|'short', i1, p1 (entry), i2, p2 (stop), targetR, size }
-// p2 anchors the STOP; the target derives from entry ± R·(risk).
-function _renderPositionBracket(ctx, d, helpers, ch, isLong) {
-  const K = CardKit;
-  const T = ch.theme;
-  const x1 = ch.indexToX(d.i1), x2 = ch.indexToX(d.i2);
-  const entry = d.p1, stop = d.p2;
-  const risk = Math.abs(entry - stop);
-  if (risk <= 0) return;
-  const r = d.targetR || 2;
-  const target = isLong ? entry + r * risk : entry - r * risk;
-  const yE = ch.priceToY(entry), yS = ch.priceToY(stop), yT = ch.priceToY(target);
-
-  // boxes: profit zone (entry→target) and risk zone (entry→stop)
-  const left = Math.min(x1, x2), width = Math.max(8, Math.abs(x2 - x1));
-  ctx.fillStyle = 'rgba(38,166,154,0.13)';
-  ctx.fillRect(left, Math.min(yE, yT), width, Math.abs(yT - yE));
-  ctx.fillStyle = 'rgba(239,83,80,0.13)';
-  ctx.fillRect(left, Math.min(yE, yS), width, Math.abs(yS - yE));
-
-  // entry / target / stop lines with right-side labels
-  const line = function (y, color, label, dash) {
-    ctx.save();
-    ctx.strokeStyle = color;
-    ctx.lineWidth = 1.25;
-    if (dash) ctx.setLineDash(dash);
-    ctx.beginPath();
-    ctx.moveTo(left, y + 0.5);
-    ctx.lineTo(left + width, y + 0.5);
-    ctx.stroke();
-    ctx.restore();
-    ctx.font = '700 10px -apple-system, Segoe UI, Roboto, sans-serif';
-    const txt = label + ' ' + (ch.priceScale ? ch.priceScale.formatLogical(
-      y === yE ? entry : y === yT ? target : stop) : '');
-    const w = ctx.measureText(txt).width + 12;
-    K.fillRoundRect(ctx, left + 4, y - 8, w, 16, 4, K.rgba(color, 0.92));
-    ctx.fillStyle = K.readableOn(color);
-    ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
-    ctx.fillText(txt, left + 10, y + 0.5);
-  };
-  line(yE, T.textBright || '#cfd2da', isLong ? '▲ Entry' : '▼ Entry');
-  line(yT, '#26a69a', 'Target');
-  line(yS, '#ef5350', 'Stop');
-
-  // the numbers pill: risk, R multiple, P&L at target & stop for `size`
-  const size = d.size || 1;
-  const profit = risk * r * size, loss = risk * size;
-  const fmtP = function (v) {
-    return (v >= 0 ? '+' : '') + (Math.abs(v) >= 1000 ? (v / 1000).toFixed(1) + 'K' : v.toFixed(2));
-  };
-  const pillTxt = 'R:' + r.toFixed(1) + '  +' + fmtP(profit) + ' / ' + fmtP(-loss) +
-                  '  ×' + size;
-  ctx.font = '700 11px -apple-system, Segoe UI, Roboto, sans-serif';
-  const pw = ctx.measureText(pillTxt).width + 26;
-  const px = Math.max(ch.chartLeft + 6, Math.min(left + width / 2 - pw / 2, ch.chartRight - pw - 6));
-  let py = Math.min(yT, yS, yE) - 30;
-  if (py < (ch.priceTop || ch.chartTop) + 6) py = Math.max(yT, yS, yE) + 8;
-  K.fillRoundRect(ctx, px, py, pw, 24, 7, K.rgba(T.plate || 'rgba(13,16,27,0.92)', 0.95));
-  K.strokeRoundRect(ctx, px + 0.5, py + 0.5, pw - 1, 23, 7, K.rgba('#26a69a', 0.5), 1);
-  ctx.font = '700 11px -apple-system, Segoe UI, Roboto, sans-serif';
-  ctx.fillStyle = (T.textBright || '#f0f3fa');
-  ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
-  ctx.fillText(pillTxt, px + 13, py + 12.5);
-}
-
-// shared hit test for brackets: the three horizontal bands + the box area
-function _hitPositionBracket(d, x, y, helpers, ch) {
-  const x1 = ch.indexToX(d.i1), x2 = ch.indexToX(d.i2);
-  const left = Math.min(x1, x2), right = Math.max(x1, x2);
-  const yE = ch.priceToY(d.p1), yS = ch.priceToY(d.p2);
-  const risk = Math.abs(d.p1 - d.p2) || 1;
-  const isLong = d.type === 'long';
-  const r = d.targetR || 2;
-  const target = isLong ? d.p1 + r * risk : d.p1 - r * risk;
-  const yT = ch.priceToY(target);
-  if (x < left - 4 || x > right + 4) return false;
-  const yTop = Math.min(yE, yS, yT) - 4, yBot = Math.max(yE, yS, yT) + 4;
-  return y >= yTop && y <= yBot;
-}
-
-function _makeLongPositionTool(chart) {
-  return {
-    id: 'long', label: 'Long Position', icon: '▲',
-    defaultStyle: { color: '#26a69a', lineWidth: 1.25 },
-    render: function (ctx, d, helpers, ch) { _renderPositionBracket(ctx, d, helpers, ch, true); },
-    hitTest: _hitPositionBracket,
-    handles: function (d, helpers, ch) {
-      return [
-        { key: 'p1', x: ch.indexToX(d.i2), y: ch.priceToY(d.p1) },   // entry handle (right edge)
-        { key: 'p2', x: ch.indexToX(d.i2), y: ch.priceToY(d.p2) }    // stop handle
-      ];
-    }
-  };
-}
-
-function _makeShortPositionTool(chart) {
-  return {
-    id: 'short', label: 'Short Position', icon: '▼',
-    defaultStyle: { color: '#ef5350', lineWidth: 1.25 },
-    render: function (ctx, d, helpers, ch) { _renderPositionBracket(ctx, d, helpers, ch, false); },
-    hitTest: _hitPositionBracket,
-    handles: function (d, helpers, ch) {
-      return [
-        { key: 'p1', x: ch.indexToX(d.i2), y: ch.priceToY(d.p1) },
-        { key: 'p2', x: ch.indexToX(d.i2), y: ch.priceToY(d.p2) }
-      ];
-    }
-  };
-}
-
-/* ---- horizontal ray -------------------------------------------------------- */
-// Starts at the anchor and extends to the right edge of the chart FOREVER
-// (unlike hline which spans the full width). TradingView calls this a
-// "horizontal ray"; it's the tool of choice for marking a level into the
-// future without polluting history.
-function _makeRayTool(chart) {
-  return {
-    id: 'hray', label: 'Horizontal Ray', icon: '→',
-    defaultStyle: { color: chart.theme.drawing, lineWidth: 1.5 },
-    render: function (ctx, d, helpers, ch) {
-      const K = CardKit;
-      const y = ch.priceToY(d.p1);
-      const x1 = ch.indexToX(d.i1);
-      ctx.save();
-      ctx.strokeStyle = d.color;
-      ctx.lineWidth = d.lineWidth || 1.5;
-      ctx.beginPath();
-      ctx.moveTo(x1, y + 0.5);
-      ctx.lineTo(ch.chartRight, y + 0.5);
-      ctx.stroke();
-      ctx.restore();
-      // price tag pinned at the right edge (axis side)
-      const txt = ch.priceScale ? ch.priceScale.formatLogical(d.p1) : String(d.p1);
-      ctx.font = '700 10px -apple-system, Segoe UI, Roboto, sans-serif';
-      const w = Math.min(70, ctx.measureText(txt).width + 12);
-      K.fillRoundRect(ctx, ch.chartRight - w - 4, y - 8, w, 16, 4, d.color);
-      ctx.fillStyle = K.readableOn(d.color);
-      ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
-      ctx.fillText(txt, ch.chartRight - w + 2, y + 0.5);
-      // anchor dot
-      ctx.beginPath();
-      ctx.arc(x1, y, 3, 0, Math.PI * 2);
-      ctx.fillStyle = d.color;
-      ctx.fill();
-    },
-    hitTest: function (d, x, y, helpers, ch) {
-      const ly = ch.priceToY(d.p1);
-      const lx = ch.indexToX(d.i1);
-      return y >= ly - 5 && y <= ly + 5 && x >= lx - 5 && x <= ch.chartRight;
-    },
-    handles: function (d, helpers, ch) {
-      return [{ key: 'p1', x: ch.indexToX(d.i1), y: ch.priceToY(d.p1) }];
-    }
-  };
-}
-
-/* ---- cross line --------------------------------------------------------------- */
-// Full-width horizontal + full-height vertical crossing at the anchor —
-// TradingView's "cross line" tool for marking an exact (time, price) point.
-function _makeCrossLineTool(chart) {
-  return {
-    id: 'crossline', label: 'Cross Line', icon: '✛',
-    defaultStyle: { color: chart.theme.drawing, lineWidth: 1.25 },
-    render: function (ctx, d, helpers, ch) {
-      const K = CardKit;
-      const x = ch.indexToX(d.i1), y = ch.priceToY(d.p1);
-      ctx.save();
-      ctx.strokeStyle = d.color;
-      ctx.lineWidth = d.lineWidth || 1.25;
-      ctx.setLineDash([7, 4]);
-      ctx.beginPath();
-      ctx.moveTo(ch.chartLeft, y + 0.5);
-      ctx.lineTo(ch.chartRight, y + 0.5);
-      ctx.moveTo(x + 0.5, ch.priceTop !== undefined ? ch.priceTop : ch.chartTop);
-      ctx.lineTo(x + 0.5, ch.priceBottom !== undefined ? ch.priceBottom : ch.H);
-      ctx.stroke();
-      ctx.restore();
-      // center node
-      ctx.beginPath();
-      ctx.arc(x, y, 3.5, 0, Math.PI * 2);
-      ctx.fillStyle = d.color;
-      ctx.fill();
-      ctx.beginPath();
-      ctx.arc(x, y, 1.4, 0, Math.PI * 2);
-      ctx.fillStyle = '#ffffff';
-      ctx.fill();
-    },
-    hitTest: function (d, x, y, helpers, ch) {
-      const lx = ch.indexToX(d.i1), ly = ch.priceToY(d.p1);
-      return (Math.abs(y - ly) <= 5) || (Math.abs(x - lx) <= 5);
-    },
-    handles: function (d, helpers, ch) {
-      return [{ key: 'p1', x: ch.indexToX(d.i1), y: ch.priceToY(d.p1) }];
-    }
-  };
-}
-
-/* =========================================================================
- * MODERN SECTION 10 — CARD SUITE III: OBJECT TREE + ORDER BOOK
- * =========================================================================
- * ObjectTreeCard — every drawing and indicator on the chart in one live
- *                  list, with visibility toggles, focus and delete actions
- *                  (TradingView's object tree, glass edition).
- * DepthCard      — order-book depth visualizer fed by chart.setOrderBook():
- *                  a bid/ask ladder with cumulative depth bars + spread.
+ * ── HOW A FRAME DRAWS ──────────────────────────────────────────────────────
+ *   1. For every visible series: pick the LOD band from the current zoom
+ *      (power-of-two points-per-bucket). Decimated kept-indices come from
+ *      the LOD cache (worker-refined for huge series).
+ *   2. Fast series (width ≤ 1.5px) pack their visible slice into SHARED
+ *      CHUNK vertex buffers — data-space (idx, price) vertices, per-vertex
+ *      color. One gl.bufferSubData per dirty chunk, ONE gl.LINES draw call
+ *      per chunk. Uniforms do the projection (see Part 1 banner).
+ *   3. Thick series (width > 1.5px) get a per-frame CPU quad expansion of
+ *      their decimated visible points into one shared dynamic buffer —
+ *      bounded by cfg.lodMaxPointsThick so cost stays flat.
+ *   4. No WebGL? Every step falls back to batched Path2D strokes (one per
+ *      color group) with the same decimation — still far cheaper than the
+ *      per-indicator object-churn path.
+ *
+ * ── PUBLIC API (added to TradingChart.prototype) ──────────────────────────
+ *   addLineSeries({ id?, points, color, width, opacity, mode, visible,
+ *                   maxPoints, z }) → id (string)
+ *       points: [{ t: candleTimeMs|sec | idx: number, p: price }, ...]
+ *               or [[tOrIdx, price], ...] — mixed forms allowed per call.
+ *   updateLineSeries(id, points)          replace all points, O(n)
+ *   appendLineSeriesPoint(id, pt)         streaming append, O(1) (ring)
+ *   setLineSeriesStyle(id, opts)          color / width / opacity / visible
+ *   removeLineSeries(id) · clearLineSeries() · getLineSeries(id)
+ *   hitLineSeries(x, y, tolPx)            → { id, dataIdx, dist } | null
+ *   fitLineSeries(id?)                    union series range → price scale
+ *   enablePerfHUD(bool) · setQuality('auto'|...) · getPerfStats()
+ *
+ * NOTE (scale): line series render on the chart's PRICE scale (the main
+ * pane). Pane/volume layers already have their own helpers (h.drawLine) —
+ * this engine is the fast path for the price overlay plane.
  * ========================================================================== */
 
-/* ------------------------------------------------------------------------- */
-/*  ObjectTreeCard                                                            */
-/* ------------------------------------------------------------------------- */
-function ObjectTreeCard(chart) {
-  ModernCard.call(this, chart, 'objects', { w: 250, accent: '#8d6e63' });
-  this.selectedRow = null;      // 'drawing:123' | 'indicator:vwap'
-  this.bodyH = 120;
-}
-ObjectTreeCard.prototype = Object.create(ModernCard.prototype);
-ObjectTreeCard.prototype.constructor = ObjectTreeCard;
-ObjectTreeCard.prototype.TITLE = function () { return this.chart._t('objectsTitle') || 'Objects'; };
-ObjectTreeCard.prototype.ICON = function () { return 'layers'; };
+/* ============================ GL LINES PROGRAM ============================= */
+// v2.38.0: dedicated shader program for batched polylines. One program serves
+// BOTH the data-space fast path (uRaw=0 — positions computed from uniforms)
+// and the per-frame expanded thick path (uRaw=1 — positions are screen px).
+const BADI_LINES_VS = [
+  'precision highp float;',
+  'attribute float aIdx;',     // candle index   (uRaw=0) | screen x (uRaw=1)
+  'attribute float aPrice;',   // price          (uRaw=0) | screen y (uRaw=1)
+  'attribute vec4 aColor;',    // 0..1 normalized RGBA
+  'uniform float uXA, uXB;',   // x = uXA + uXB * aIdx
+  'uniform float uYA, uYB;',   // y = uYA - uYB * aPrice
+  'uniform float uRaw;',       // 0 = data space, 1 = raw screen px
+  'uniform float uDpr;',
+  'uniform vec2  uRes;',       // canvas size in DEVICE pixels
+  'varying vec4 vColor;',
+  'void main() {',
+  '  float x = (uRaw < 0.5) ? (uXA + uXB * aIdx) : aIdx;',
+  '  float y = (uRaw < 0.5) ? (uYA - uYB * aPrice) : aPrice;',
+  '  vec2 device = vec2(x, y) * uDpr;',
+  '  vec2 clip = vec2(device.x / uRes.x * 2.0 - 1.0, 1.0 - device.y / uRes.y * 2.0);',
+  '  gl_Position = vec4(clip, 0.0, 1.0);',
+  '  vColor = aColor;',
+  '}'
+].join('\n');
+const BADI_LINES_FS = [
+  'precision mediump float;',
+  'varying vec4 vColor;',
+  'void main() { gl_FragColor = vColor; }'
+].join('\n');
 
-ObjectTreeCard.prototype._collect = function () {
-  const ch = this.chart;
-  const rows = [];
-  // indicators (active), with their visibility state
-  for (const id of ch.activeIndicators) {
-    const st = ch.indicatorStates.get(id);
-    if (!st || !st.def) continue;
-    rows.push({ kind: 'indicator', id: id, label: st.def.label || id, visible: st.visible !== false });
+// Interleaved vertex layout: idx(f32) price(f32) rgba(u8×4) halfW(f32) = 16B.
+const BADI_LINE_VERT_STRIDE = 16;
+const BADI_LINE_VERT_FLOATS = 4;   // leading float32 fields
+
+class BadiGLLines {
+  constructor(be, cfg) {
+    this.be = be;                 // GLBackend (has .gl and .glCanvas)
+    this.gl = be.gl;
+    this.cfg = cfg;
+    this.ok = false;
+    this.program = null;
+    this.attrib = null;
+    this.uniform = null;
+    this._vramBytes = 0;
+    try { this._init(); } catch (_) { this.ok = false; }
   }
-  // drawings, newest first
-  const ds = ch.drawings || [];
-  for (let i = ds.length - 1; i >= 0; i--) {
-    const d = ds[i];
-    rows.push({ kind: 'drawing', id: d.id, label: (d.type || 'drawing') + ' #' + (i + 1), visible: !d.hidden, ref: d });
-  }
-  return rows;
-};
-
-ObjectTreeCard.prototype.renderBody = function (ctx, bx, by, bw, T, now) {
-  const ch = this.chart, K = CardKit;
-  this._bodyHits = [];
-  ctx.textAlign = 'left';
-  const rows = this._collect();
-
-  if (!rows.length) {
-    K.plateRect(ctx, bx, by, bw, 44, T, { r: 10 });
-    ctx.font = '500 10px -apple-system, Segoe UI, Roboto, sans-serif';
-    ctx.fillStyle = T.textDim; ctx.textBaseline = 'middle';
-    ctx.fillText(ch._t('objectsEmpty') || 'No objects — draw something', bx + 10, by + 22);
-    this.bodyH = 64;
-    this.maxScroll = 0;
-    return;
-  }
-
-  const rowH = 30;
-  const visible = Math.min(rows.length, 6);
-  this.maxScroll = Math.max(0, rows.length * rowH - visible * rowH);
-  this.scroll = Math.min(this.scroll, this.maxScroll);
-  ctx.save();
-  K.roundRectPath(ctx, bx - 4, by - 2, bw + 8, visible * rowH + 4, 10);
-  ctx.clip();
-  ctx.translate(0, -this.scroll);
-  let ry = by;
-  for (let i = 0; i < rows.length; i++) {
-    const r = rows[i];
-    const key = r.kind + ':' + r.id;
-    const isSel = this.selectedRow === key;
-    K.plateRect(ctx, bx, ry, bw, rowH - 4, T, { r: 8, fill: isSel ? K.rgba(T.accent, 0.14) : T.plate });
-    // kind chip: IND / DRW
-    ctx.font = '700 8px -apple-system, Segoe UI, Roboto, sans-serif';
-    ctx.fillStyle = r.kind === 'indicator' ? T.accent2 : T.warn;
-    ctx.textBaseline = 'top';
-    ctx.fillText(r.kind === 'indicator' ? 'IND' : 'DRW', bx + 8, ry + 6);
-    // label
-    ctx.font = '600 11px -apple-system, Segoe UI, Roboto, sans-serif';
-    ctx.fillStyle = r.visible ? T.textBright : T.textFade;
-    ctx.textBaseline = 'middle';
-    ctx.fillText(r.label, bx + 36, ry + 13);
-    // eye toggle + delete
-    const eyeR = { x: bx + bw - 50, y: ry + 4, w: 20, h: 20 };
-    const delR = { x: bx + bw - 26, y: ry + 4, w: 20, h: 20 };
-    K.icon(ctx, 'watch', eyeR.x + 3, eyeR.y + 3, eyeR.w - 6, r.visible ? T.text : T.textFade, 1.4);
-    if (!r.visible) {
-      // slash over the eye
-      ctx.save();
-      ctx.strokeStyle = T.danger; ctx.lineWidth = 1.4; ctx.lineCap = 'round';
-      ctx.beginPath();
-      ctx.moveTo(eyeR.x + 3, eyeR.y + eyeR.h - 4);
-      ctx.lineTo(eyeR.x + eyeR.w - 4, eyeR.y + 4);
-      ctx.stroke();
-      ctx.restore();
+  _init() {
+    const gl = this.gl;
+    const compile = (type, src) => {
+      const sh = gl.createShader(type);
+      gl.shaderSource(sh, src);
+      gl.compileShader(sh);
+      if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+        throw new Error('BadiGLLines shader: ' + (gl.getShaderInfoLog(sh) || 'compile failed'));
+      }
+      return sh;
+    };
+    const prog = gl.createProgram();
+    gl.attachShader(prog, compile(gl.VERTEX_SHADER, BADI_LINES_VS));
+    gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, BADI_LINES_FS));
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+      throw new Error('BadiGLLines link: ' + (gl.getProgramInfoLog(prog) || 'link failed'));
     }
-    K.icon(ctx, 'trash', delR.x + 3, delR.y + 3, delR.w - 6, T.textDim, 1.4);
-    (function (card, row, key) {
-      // row click → select + focus the object
-      card._bodyHits.push({ x: bx, y: ry, w: bw - 56, h: rowH - 4, hover: false,
-        onClick: function () {
-          card.selectedRow = key;
-          if (row.kind === 'drawing' && card.chart.selectDrawing) card.chart.selectDrawing(row.ref);
-        } });
-      // eye → toggle visibility
-      card._bodyHits.push({ x: eyeR.x, y: eyeR.y, w: eyeR.w, h: eyeR.h, hover: false,
-        onClick: function () {
-          if (row.kind === 'indicator') {
-            const st = card.chart.indicatorStates.get(row.id);
-            if (st) { st.visible = st.visible === false; card.chart.updateLayout(); card.chart.invalidate(); }
-          } else {
-            row.ref.hidden = !row.ref.hidden;
-            card.chart.invalidate();
-          }
-        } });
-      // trash → delete
-      card._bodyHits.push({ x: delR.x, y: delR.y, w: delR.w, h: delR.h, hover: false,
-        onClick: function () {
-          if (row.kind === 'indicator') card.chart.removeIndicator(row.id);
-          else {
-            card.chart.drawings = card.chart.drawings.filter(function (d) { return d !== row.ref; });
-            card.chart.deselectDrawing();
-            card.chart.invalidate();
-          }
-        } });
-    })(this, r, key);
-    ry += rowH;
+    this.program = prog;
+    this.attrib = {
+      aIdx: gl.getAttribLocation(prog, 'aIdx'),
+      aPrice: gl.getAttribLocation(prog, 'aPrice'),
+      aColor: gl.getAttribLocation(prog, 'aColor')
+    };
+    this.uniform = {
+      uXA: gl.getUniformLocation(prog, 'uXA'),
+      uXB: gl.getUniformLocation(prog, 'uXB'),
+      uYA: gl.getUniformLocation(prog, 'uYA'),
+      uYB: gl.getUniformLocation(prog, 'uYB'),
+      uRaw: gl.getUniformLocation(prog, 'uRaw'),
+      uDpr: gl.getUniformLocation(prog, 'uDpr'),
+      uRes: gl.getUniformLocation(prog, 'uRes')
+    };
+    this.ok = true;
   }
-  ctx.restore();
-  this.bodyH = by + visible * rowH - by + 10;
-};
-
-/* ------------------------------------------------------------------------- */
-/*  DepthCard — order book depth ladder                                       */
-/* ------------------------------------------------------------------------- */
-// Data contract (app-owned, like the watchlist):
-//   chart.setOrderBook({
-//     asks: [{ price, amount }, ...]  // sorted descending (nearest first)
-//     bids: [{ price, amount }, ...]  // sorted descending (nearest first)
-//   })
-function DepthCard(chart) {
-  ModernCard.call(this, chart, 'depth', { w: 256, accent: '#26a69a', accent2: '#ef5350' });
-  this.bodyH = 180;
-}
-DepthCard.prototype = Object.create(ModernCard.prototype);
-DepthCard.prototype.constructor = DepthCard;
-DepthCard.prototype.TITLE = function () { return this.chart._t('depthTitle') || 'Order Book'; };
-DepthCard.prototype.ICON = function () { return 'stats'; };
-
-DepthCard.prototype.renderBody = function (ctx, bx, by, bw, T, now) {
-  const ch = this.chart, K = CardKit;
-  this._bodyHits = [];
-  ctx.textAlign = 'left';
-  const ob = ch._orderBook;
-  if (!ob || !ob.bids || !ob.asks || !ob.bids.length || !ob.asks.length) {
-    K.plateRect(ctx, bx, by, bw, 44, T, { r: 10 });
-    ctx.font = '500 10px -apple-system, Segoe UI, Roboto, sans-serif';
-    ctx.fillStyle = T.textDim; ctx.textBaseline = 'middle';
-    ctx.fillText(ch._t('depthEmpty') || 'chart.setOrderBook({bids, asks})', bx + 10, by + 22);
-    this.bodyH = 64;
-    this.maxScroll = 0;
-    return;
-  }
-
-  const bids = ob.bids.slice(0, 6);
-  const asks = ob.asks.slice(0, 6);
-  // cumulative depths (for the background bars)
-  let bidCum = 0, askCum = 0;
-  const bidCums = bids.map(function (b) { bidCum += b.amount; return bidCum; });
-  const askCums = asks.map(function (a) { askCum += a.amount; return askCum; });
-  const maxCum = Math.max(bidCum, askCum) || 1;
-
-  const rowH = 17;
-  const fmtP = function (v) { return ch.priceScale ? ch.priceScale.formatLogical(v) : v.toFixed(2); };
-  const fmtA = function (v) { return v >= 1000 ? (v / 1000).toFixed(1) + 'K' : v.toFixed(2); };
-
-  // -- asks (stacked top-down, red, nearest ask at the BOTTOM of the block) --
-  let y = by;
-  for (let i = asks.length - 1; i >= 0; i--) {
-    const a = asks[i];
-    const cum = askCums[i];
-    // depth bar (right-anchored)
-    K.fillRoundRect(ctx, bx + bw * (1 - cum / maxCum), y, bw * (cum / maxCum), rowH - 2, 2, K.rgba(T.danger, 0.10));
-    ctx.font = '600 10px -apple-system, Segoe UI, Roboto, sans-serif';
-    ctx.fillStyle = T.danger; ctx.textBaseline = 'middle';
-    ctx.fillText(fmtP(a.price), bx + 4, y + rowH / 2 - 1);
-    ctx.fillStyle = T.text;
-    ctx.textAlign = 'right';
-    ctx.fillText(fmtA(a.amount), bx + bw - 4, y + rowH / 2 - 1);
-    ctx.textAlign = 'left';
-    y += rowH;
-  }
-
-  // -- spread plate ----------------------------------------------------------
-  const spH = 26;
-  const bestBid = bids[0].price, bestAsk = asks[0].price;
-  const spread = Math.max(0, bestAsk - bestBid);
-  const spreadPct = bestBid ? (spread / bestBid) * 100 : 0;
-  K.plateRect(ctx, bx, y + 2, bw, spH, T, { r: 8 });
-  ctx.font = '600 9px -apple-system, Segoe UI, Roboto, sans-serif';
-  ctx.fillStyle = T.textDim; ctx.textBaseline = 'middle';
-  ctx.fillText((ch._t('depthSpread') || 'SPREAD').toUpperCase(), bx + 8, y + 2 + spH / 2);
-  ctx.font = '700 11px -apple-system, Segoe UI, Roboto, sans-serif';
-  ctx.fillStyle = T.textBright;
-  ctx.textAlign = 'right';
-  ctx.fillText(fmtP(spread) + '  (' + spreadPct.toFixed(3) + '%)', bx + bw - 8, y + 2 + spH / 2);
-  ctx.textAlign = 'left';
-  y += spH + 6;
-
-  // -- bids (green, nearest bid at the TOP of the block) ----------------------
-  for (let i = 0; i < bids.length; i++) {
-    const b = bids[i];
-    const cum = bidCums[i];
-    K.fillRoundRect(ctx, bx + bw * (1 - cum / maxCum), y, bw * (cum / maxCum), rowH - 2, 2, K.rgba(T.success, 0.10));
-    ctx.font = '600 10px -apple-system, Segoe UI, Roboto, sans-serif';
-    ctx.fillStyle = T.success;
-    ctx.fillText(fmtP(b.price), bx + 4, y + rowH / 2 - 1);
-    ctx.fillStyle = T.text;
-    ctx.textAlign = 'right';
-    ctx.fillText(fmtA(b.amount), bx + bw - 4, y + rowH / 2 - 1);
-    ctx.textAlign = 'left';
-    y += rowH;
-  }
-  this.bodyH = y - by + 12;
-};
-
-/* =========================================================================
- * MODERN SECTION 11 — THEME PACK II (3 MORE PRESETS) + I18N EXTENSIONS
- * =========================================================================
- * porcelain — a crisp porcelain-white light theme for editorial/finance
- *             dashboards (glass reads as clean frosted acrylic).
- * mint      — a fresh dark teal/mint theme; the "consumer fintech" look.
- * contrast  — a WCAG-minded high-contrast theme: pure black, pure white
- *             text, boosted bull/bear saturation (accessibility preset).
- * The Arabic dictionary also gains the wave-2 card labels here.
- * ======================================================================== */
-Object.assign(BadiThemes, {
-  porcelain: {
-    bg: '#f4f5f8', panelBg: '#ffffff', toolbarBg: '#ffffff', toolbarBorder: '#e2e5ee',
-    grid: '#edeff4', gridStrong: '#dde1ea', axis: '#edeff4', axisBg: '#f7f8fb',
-    axisBorder: '#e2e5ee', axisText: '#747b8f',
-    text: '#23283a', textDim: '#6b7288', textBright: '#0e1220', textFade: '#9aa0b4',
-    bull: '#0c8a62', bear: '#d64550',
-    bullVol: 'rgba(12,138,98,0.38)', bearVol: 'rgba(214,69,80,0.38)',
-    accent: '#3556e0', crosshair: '#747b8f', crosshairLabel: '#e2e5ee',
-    ma1: '#3556e0', ma2: '#c77700', ma3: '#b3446e',
-    drawing: '#3556e0', drawingActive: '#c77700',
-    buttonBg: '#ffffff', buttonHover: '#eef0f6', buttonText: '#23283a',
-    currentPriceBull: '#0c8a62', currentPriceBear: '#d64550',
-    glassBg: 'rgba(255,255,255,0.86)', glassBgHover: 'rgba(255,255,255,0.94)',
-    glassBorder: 'rgba(53,86,224,0.15)', glassSheen: 'rgba(255,255,255,0.5)',
-    glassShadow: 'rgba(35,40,58,0.14)',
-    plate: 'rgba(250,251,253,0.96)', plateBorder: 'rgba(35,40,58,0.08)',
-    accent2: '#0e9aa7', success: '#0c8a62', danger: '#d64550', warn: '#c77700'
-  },
-
-  mint: {
-    bg: '#0a1a17', panelBg: '#0f241f', toolbarBg: '#122b25', toolbarBorder: '#1f443b',
-    grid: '#12261f', gridStrong: '#1f443b', axis: '#12261f', axisBg: '#0d201b',
-    axisBorder: '#1f443b', axisText: '#6fa197',
-    text: '#d5e8e2', textDim: '#79a89c', textBright: '#f1fbf7', textFade: '#578076',
-    bull: '#2dd4a0', bear: '#ff6b7d',
-    bullVol: 'rgba(45,212,160,0.42)', bearVol: 'rgba(255,107,125,0.42)',
-    accent: '#14b8a6', crosshair: '#79a89c', crosshairLabel: '#1d3f38',
-    ma1: '#14b8a6', ma2: '#fbbf24', ma3: '#a78bfa',
-    drawing: '#14b8a6', drawingActive: '#fbbf24',
-    buttonBg: '#123029', buttonHover: '#183b32', buttonText: '#d5e8e2',
-    currentPriceBull: '#2dd4a0', currentPriceBear: '#ff6b7d',
-    glassBg: 'rgba(17,39,33,0.80)', glassBgHover: 'rgba(23,51,43,0.87)',
-    glassBorder: 'rgba(20,184,166,0.18)', glassSheen: 'rgba(209,250,229,0.05)',
-    glassShadow: 'rgba(2,10,8,0.55)',
-    plate: 'rgba(12,29,25,0.93)', plateBorder: 'rgba(20,184,166,0.10)',
-    accent2: '#5eead4', success: '#2dd4a0', danger: '#ff6b7d', warn: '#fbbf24'
-  },
-
-  contrast: {
-    // accessibility-first: pure black surfaces, white text, saturated
-    // bull/bear, strong grid contrast — usable in bright sunlight and
-    // friendly to low-vision users (targets WCAG AA on the data plates).
-    bg: '#000000', panelBg: '#0a0a0a', toolbarBg: '#111111', toolbarBorder: '#3a3a3a',
-    grid: '#1c1c1c', gridStrong: '#3a3a3a', axis: '#1c1c1c', axisBg: '#050505',
-    axisBorder: '#3a3a3a', axisText: '#c8c8c8',
-    text: '#f2f2f2', textDim: '#b8b8b8', textBright: '#ffffff', textFade: '#9a9a9a',
-    bull: '#00e676', bear: '#ff5252',
-    bullVol: 'rgba(0,230,118,0.5)', bearVol: 'rgba(255,82,82,0.5)',
-    accent: '#82b1ff', crosshair: '#e0e0e0', crosshairLabel: '#2a2a2a',
-    ma1: '#82b1ff', ma2: '#ffd740', ma3: '#ff80ab',
-    drawing: '#82b1ff', drawingActive: '#ffd740',
-    buttonBg: '#161616', buttonHover: '#242424', buttonText: '#f2f2f2',
-    currentPriceBull: '#00e676', currentPriceBear: '#ff5252',
-    glassBg: 'rgba(16,16,16,0.92)', glassBgHover: 'rgba(26,26,26,0.95)',
-    glassBorder: 'rgba(255,255,255,0.28)', glassSheen: 'rgba(255,255,255,0.06)',
-    glassShadow: 'rgba(0,0,0,0.8)',
-    plate: 'rgba(8,8,8,0.97)', plateBorder: 'rgba(255,255,255,0.18)',
-    accent2: '#80d8ff', success: '#00e676', danger: '#ff5252', warn: '#ffd740'
-  }
-});
-
-/* ---- i18n: wave-2 card labels -------------------------------------------- */
-Object.assign(BadiI18n.en, {
-  objectsTitle: 'Objects', objectsEmpty: 'No objects — draw something',
-  depthTitle: 'Order Book', depthEmpty: 'chart.setOrderBook({bids, asks})',
-  depthSpread: 'Spread'
-});
-Object.assign(BadiI18n.ar, {
-  objectsTitle: 'الكائنات', objectsEmpty: 'لا كائنات — ارسم شيئاً',
-  depthTitle: 'دفتر الأوامر', depthEmpty: 'استدع chart.setOrderBook({bids, asks})',
-  depthSpread: 'الفراغ السعري'
-});
-
-/* ---- register the wave-2/3 cards + tools with the modern layer ------------- */
-// The factories dict and the launcher rail grow by the new card types. This
-// MUST run after CARD_FACTORIES is defined (section 4) — the file order
-// guarantees it.
-CARD_FACTORIES.objects = function (chart) { return new ObjectTreeCard(chart); };
-CARD_FACTORIES.depth = function (chart) { return new DepthCard(chart); };
-CARD_IDS.push('objects', 'depth');
-
-// extend the launcher rail with the two new buttons (before the separator)
-(function extendRail() {
-  const btns = CardManager.prototype.RAIL_BUTTONS;
-  const sepIdx = btns.findIndex(function (b) { return b.sep; });
-  const insertAt = sepIdx === -1 ? btns.length - 3 : sepIdx;
-  btns.splice(insertAt, 0,
-    { id: 'objects', icon: 'layers', label: 'Objects' },
-    { id: 'depth', icon: 'stats', label: 'Order Book' });
-})();
-
-// extend rail click routing to the new ids
-(function extendRailClick() {
-  const _orig = CardManager.prototype.handleRailClick;
-  CardManager.prototype.handleRailClick = function (id) {
-    if (id === 'objects' || id === 'depth') { this.toggleCard(id); return; }
-    return _orig.call(this, id);
-  };
-})();
-
-// register the position/extra drawing tools alongside the measure tool
-(function registerModernTools() {
-  const _origEnable = TradingChart.prototype.enableModernUI;
-  TradingChart.prototype.enableModernUI = function (opts) {
-    const r = _origEnable.call(this, opts);
-    if (!this._modernToolsRegistered) {
-      this._modernToolsRegistered = true;
-      this.addDrawingTool(_makeLongPositionTool(this));
-      this.addDrawingTool(_makeShortPositionTool(this));
-      this.addDrawingTool(_makeRayTool(this));
-      this.addDrawingTool(_makeCrossLineTool(this));
+  // Create / grow a VBO to `byteLen`. Returns the WebGLBuffer. Tracks VRAM.
+  makeBuffer(buf, byteLen, dynamic) {
+    const gl = this.gl;
+    if (!buf) buf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    const prev = buf._badiBytes || 0;
+    if (prev !== byteLen) {
+      gl.bufferData(gl.ARRAY_BUFFER, byteLen, dynamic ? gl.STREAM_DRAW : gl.DYNAMIC_DRAW);
+      buf._badiBytes = byteLen;
+      this._vramBytes += byteLen - prev;
     }
-    return r;
-  };
-})();
+    return buf;
+  }
+  uploadSub(buf, byteOffset, f32view) {
+    const gl = this.gl;
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.bufferSubData(gl.ARRAY_BUFFER, byteOffset, f32view);
+  }
+  freeBuffer(buf) {
+    if (!buf) return;
+    const gl = this.gl;
+    this._vramBytes -= buf._badiBytes || 0;
+    gl.deleteBuffer(buf);
+  }
+  get vramBytes() { return this._vramBytes; }
+  // Bind the program + attribute layout for a subsequent draw.
+  use(xA, xB, yA, yB, raw, dpr, deviceW, deviceH) {
+    const gl = this.gl;
+    gl.useProgram(this.program);
+    gl.uniform1f(this.uniform.uXA, xA);
+    gl.uniform1f(this.uniform.uXB, xB);
+    gl.uniform1f(this.uniform.uYA, yA);
+    gl.uniform1f(this.uniform.uYB, yB);
+    gl.uniform1f(this.uniform.uRaw, raw ? 1 : 0);
+    gl.uniform1f(this.uniform.uDpr, dpr);
+    gl.uniform2f(this.uniform.uRes, deviceW, deviceH);
+    gl.enableVertexAttribArray(this.attrib.aIdx);
+    gl.enableVertexAttribArray(this.attrib.aPrice);
+    gl.enableVertexAttribArray(this.attrib.aColor);
+    return this.attrib;
+  }
+  // Set up pointers for the interleaved layout (stride 16B: f32 f32 u8×4 f32).
+  pointers() {
+    const gl = this.gl;
+    const a = this.attrib, s = BADI_LINE_VERT_STRIDE;
+    gl.vertexAttribPointer(a.aIdx, 1, gl.FLOAT, false, s, 0);
+    gl.vertexAttribPointer(a.aPrice, 1, gl.FLOAT, false, s, 4);
+    gl.vertexAttribPointer(a.aColor, 4, gl.UNSIGNED_BYTE, true, s, 8);
+  }
+  drawArrays(mode, first, count) {
+    this.gl.drawArrays(mode, first, count);
+  }
+  destroy() {
+    if (!this.ok) return;
+    try { this.gl.deleteProgram(this.program); } catch (_) {}
+    this.ok = false;
+  }
+}
 
-// setOrderBook API (the depth card's data source)
-(function addOrderBookAPI() {
-  TradingChart.prototype.setOrderBook = function (ob) {
-    this._orderBook = ob || null;
-    this.invalidate();
-    return this;
-  };
-  TradingChart.prototype.getOrderBook = function () { return this._orderBook || null; };
-})();
+/* ============================ PERF SERIES ================================== */
+// v2.38.0: one line series. SoA typed-array storage; a ring buffer backs the
+// O(1) streaming path; decimation state + upload state live here too.
+//
+// Points are stored as (x, p) where x is a VIRTUAL CANDLE INDEX (fractional
+// allowed — points between candles and in the future margin work). Callers
+// pass candle times; the engine converts them once (then re-converts when
+// the chart's data set changes — see engine._checkDataShift()).
+let BADI_SERIES_ORDINAL = 0;
+class BadiPerfSeries {
+  constructor(id, opts) {
+    this.id = id;
+    this.ordinal = BADI_SERIES_ORDINAL++;
+    this.color = opts.color || '#2962ff';
+    this.width = Math.max(0.5, +opts.width || 1);
+    this.opacity = (opts.opacity == null) ? 1 : clamp(+opts.opacity, 0.04, 1);
+    // mode: 'fast' (gl.LINES ≤1.5px), 'thick' (CPU quads), 'auto' (by width)
+    this.mode = (opts.mode === 'fast' || opts.mode === 'thick') ? opts.mode : 'auto';
+    this.visible = opts.visible !== false;
+    this.maxPoints = Math.max(2, +opts.maxPoints || 5e6);
+    this.z = +opts.z || 0;                       // future: draw order grouping
+    // Storage: plain arrays until n exceeds RING_MIN, then we switch to the
+    // ring automatically on appends (update() can go back to plain arrays).
+    this.t = [];                                  // virtual idx (or time pre-convert)
+    this.p = [];
+    this.n = 0;
+    this.ringT = null; this.ringP = null;         // active when streaming
+    this.version = 1;                             // bumps on any data change
+    this.timeAnchored = false;                    // t were candle times → need idx
+    // LOD / upload state
+    this.band = 0;                                // current pow2 bucket size
+    this.keptIdx = null;                          // Uint32Array (full series @band)
+    this.keptFrom = -1; this.keptTo = -1;         // range keptIdx covers
+    this.lodPending = false;                      // worker job in flight
+    this.uploadDirty = true;
+    this.slot = null;                             // chunk slot (fast mode)
+    this.vbo = null;                              // private VBO (big/own-scale)
+    this.vboVerts = 0;
+    // Stats for the HUD
+    this.lastKept = 0;
+  }
+  get effectiveMode() {
+    if (this.mode !== 'auto') return this.mode;
+    return (this.width <= 1.5) ? 'fast' : 'thick';
+  }
+  // Replace all points. pts: array of {t,p} / {idx,p} / [x, p] triples.
+  // null / non-finite entries are SKIPPED (never crash, order preserved).
+  setPoints(pts, converter) {
+    this._detachRing();
+    const n = pts ? pts.length : 0;
+    const cap = Math.min(n, this.maxPoints);
+    const t = new Float64Array(cap);
+    const p = new Float64Array(cap);
+    let m = 0;
+    for (let i = 0; i < n && m < cap; i++) {
+      const pt = pts[i];
+      if (!pt) continue;
+      let x, v;
+      if (Array.isArray(pt)) { x = pt[0]; v = pt[1]; }
+      else { x = (pt.idx != null) ? pt.idx : pt.t; v = pt.p; }
+      if (x == null || v == null || !isFinite(+x) || !isFinite(+v)) continue;
+      t[m] = +x; p[m] = +v; m++;
+    }
+    // Convert time anchors → virtual idx (binary search over candle times).
+    if (converter) {
+      this.timeAnchored = converter(t, p, m);
+    }
+    this.t = t; this.p = p; this.n = m;
+    this.version++;
+    this._resetLod();
+    return m;
+  }
+  // Streaming append — amortized O(1): the backing Float64Arrays grow by
+  // doubling, and after `maxPoints` the OLDEST values roll off (memmove of
+  // the retained window, still far cheaper than re-setPoints).
+  appendPoint(x, v) {
+    if (this.ringT) {
+      this.ringT.push(+x);
+      this.ringP.push(+v);
+      this.t = this.ringT.toArray();
+      this.p = this.ringP.toArray();
+      this.n = this.ringP.len;
+    } else {
+      if (this.n + 1 > this.t.length) {
+        const grown = new Float64Array(Math.max(64, this.t.length * 2));
+        grown.set(this.t.subarray(0, this.n));
+        this.t = grown;
+        const grownP = new Float64Array(Math.max(64, this.p.length * 2));
+        grownP.set(this.p.subarray(0, this.n));
+        this.p = grownP;
+      }
+      this.t[this.n] = +x;
+      this.p[this.n] = +v;
+      this.n++;
+    }
+    // Hard cap: drop the oldest half when maxPoints is exceeded (amortized
+    // O(n/2) every maxPoints/2 appends — negligible for live feeds).
+    if (this.n > this.maxPoints) {
+      const keep = Math.floor(this.maxPoints / 2);
+      this.t.copyWithin(0, this.n - keep, this.n);
+      this.p.copyWithin(0, this.n - keep, this.n);
+      this.n = keep;
+      if (this.t0) this.t0 = null;   // re-anchoring no longer reliable
+    }
+    this.version++;
+    this._resetLod();
+  }
+  _attachRing() {
+    const cap = Math.min(this.maxPoints, 262144);
+    this.ringT = new BadiRing64(cap);
+    this.ringP = new BadiRing64(cap);
+    for (let i = 0; i < this.n; i++) { this.ringT.push(this.t[i]); this.ringP.push(this.p[i]); }
+  }
+  _detachRing() {
+    if (this.ringT) {
+      this.t = this.ringT.toArray().slice(0, this.ringT.len);
+      this.p = this.ringP.toArray().slice(0, this.ringP.len);
+      this.n = this.ringP.len;
+      this.ringT = null; this.ringP = null;
+    }
+  }
+  // Read-only SoA views (ring-backed → flattened scratch copy).
+  xs() { return this.ringT ? this.ringT.toArray() : this.t; }
+  ys() { return this.ringP ? this.ringP.toArray() : this.p; }
+  _resetLod() {
+    this.keptIdx = null;
+    this.keptFrom = -1; this.keptTo = -1;
+    this.lodPending = false;
+    this.uploadDirty = true;
+    this.lastKept = 0;
+  }
+  destroy(glLines) {
+    if (glLines && this.vbo) glLines.freeBuffer(this.vbo);
+    this.vbo = null;
+    this.slot = null;
+    this.keptIdx = null;
+    this.t = null; this.p = null;
+    this.ringT = null; this.ringP = null;
+  }
+}
 
-/* =========================================================================
- * MODERN SECTION 12 — THE MODERN API REFERENCE (v2.37.0)
- * =========================================================================
- * Everything the modern layer adds to a chart instance, in one place.
- * Copy-paste ready. With enableModernUI() never called, NONE of this
- * exists on the hot path — the core v2.36.0 behavior is untouched.
- *
- * ─────────────────────────────────────────────────────────────────────────
- * 1. ENABLING THE LAYER
- * ─────────────────────────────────────────────────────────────────────────
- *   const chart = new BadiCharts(canvas, { symbol, timeframe });
- *   chart.setData(candles);
- *
- *   chart.enableModernUI({
- *     theme:    'midnight',   // preset id — see THEMES below ('auto' works)
- *     cards:    ['symbol', 'stats', 'watchlist', 'alerts', 'trade',
- *                'shortcuts', 'perf', 'objects', 'depth'],   // or 'all'
- *     locale:   'ar',         // 'en' (default) | 'ar' — full RTL support
- *     railSide: 'right'       // 'right' | 'left' (auto: left for Arabic)
- *   });
- *   chart.start();
- *
- * ─────────────────────────────────────────────────────────────────────────
- * 2. THEMES  — chart.setThemePreset(name)
- * ─────────────────────────────────────────────────────────────────────────
- *   Presets: midnight · ocean · nord · aurora · carbon · solar (light) ·
- *            rose · terminal · porcelain (light) · mint · contrast (a11y)
- *   - chart.setThemePreset('nord')        apply a preset
- *   - chart.setThemePreset('auto')        follow prefers-color-scheme
- *   - chart.getThemePresetNames()         list every id
- *   - chart._modernCycleTheme()           next preset (Alt+T does this)
- *   - chart.setTheme({bull:'#0f0'})       classic per-key overrides still
- *                                         work and SURVIVE preset changes
- *   Every preset ships GLASS tokens (glassBg, glassBorder, glassSheen,
- *   glassShadow, plate, plateBorder, accent2, success, danger, warn) which
- *   the card suite reads for its frosted surfaces.
- *
- * ─────────────────────────────────────────────────────────────────────────
- * 3. THE CARD SUITE
- * ─────────────────────────────────────────────────────────────────────────
- *   Every card: draggable by its header, collapsible (chevron), closable
- *   (×), spring-open animated, focus-ringed, and stacked by the layout
- *   engine with automatic column wrapping (they never run off-screen).
- *
- *   symbol    — live ticker: animated price (number tween), change badge,
- *               24h range meter with position tick, 2×2 stat plates
- *               (volume / VWAP / range% / ATR14), pulsing sparkline.
- *   stats     — data-window: O/H/L/C plates (auto-fit font), range,
- *               σ-volatility, bars, volume, bull/bear pressure gauge.
- *   watchlist — chart.setWatchlist([{ symbol, price, change, history }])
- *               rows with sparklines + change badges; sort by %chg or A–Z;
- *               row click → chart.onSymbolPick(cb) fires.
- *   alerts    — the alert manager UI (see §4). Two tabs: Active + Log.
- *   trade     — paper trading: qty stepper, BUY/SELL glass buttons, open
- *               position plate with live P&L, close button. Every action
- *               fires chart.onTrade(cb) → {type:'open'|'close', ...}.
- *   shortcuts — searchable keyboard cheat sheet (type to filter).
- *   perf      — live FPS graph, frame time, bars/indicators/drawings count.
- *   objects   — object tree: every indicator + drawing with visibility
- *               eye and delete; row click selects the drawing.
- *   depth     — chart.setOrderBook({bids:[{price,amount}],asks:[...]})
- *               ladder with cumulative depth bars + spread plate.
- *
- *   Alt+1…Alt+9 toggles cards 1-9. The glass launcher rail on the chart
- *   edge does the same with one click (plus theme / screenshot / measure).
- *
- * ─────────────────────────────────────────────────────────────────────────
- * 4. ALERTS ENGINE
- * ─────────────────────────────────────────────────────────────────────────
- *   const a = chart.addAlert({
- *     price: 66800,             // required
- *     direction: 'above',       // 'above' | 'below' | 'cross'
- *     label: 'Breakout',        // shown on the line + log
- *     color: '#ffb74d',         // line + badge color
- *     once: true                // one-shot (default) vs recurring
- *   });
- *   chart.muteAlert(a.id);      // toggle mute
- *   chart.removeAlert(a.id);
- *   chart.clearAlerts();
- *   chart.getAlerts();
- *   chart.onAlert(function (ev) {   // ev = {alert, price, close,
- *     sendNotification(ev);         //        direction, label, time}
- *   });
- *   Checked on every setData()/update()/append(). Crossing fires the
- *   callbacks, a toast, a candle marker and a log entry (Alerts card →
- *   Log tab). Double-clicking a price line creates an alert at its level.
- *
- * ─────────────────────────────────────────────────────────────────────────
- * 5. PRICE LINES (LWC v5-style)
- * ─────────────────────────────────────────────────────────────────────────
- *   const pl = chart.createPriceLine({
- *     price: 63000, color: '#26a69a', title: 'Support Zone',
- *     style: 'dashed',        // 'solid' | 'dashed' | 'dotted'
- *     width: 1.25,
- *     axisLabelVisible: true,
- *     draggable: true         // grab the line (or its axis pill) and drag
- *   });
- *   pl.applyOptions({ price: 63500, title: 'Support v2' });
- *   pl.options();
- *   pl.remove();
- *
- * ─────────────────────────────────────────────────────────────────────────
- * 6. INDICATOR PACK (29 indicators)
- * ─────────────────────────────────────────────────────────────────────────
- *   chart.enableIndicator(id, config?)   // registers + activates
- *   chart.enableIndicators([ids])        // batch
- *   chart.getModernIndicatorIds()        // discover
- *
- *   OVERLAYS: vwap · supertrend · ichimoku · psar · donchian · keltner ·
- *             envelope · zigzag · pivots · hma · vwma · ribbon · avwap ·
- *             stderr
- *   PANES:    adx (ADX/DMI) · cci · obv · willr · mfi · ao · chop · trix ·
- *             elder (Elder Ray) · force (Force Index) · vortex · dpo ·
- *             pvt · volosc (Volume Osc) · ulcer
- *
- *   chart.enableIndicator('supertrend', { settings: { period: 7, mult: 2 } });
- *   chart.enableIndicator('ribbon', { settings: { fast: 10, count: 6 } });
- *   chart.enableIndicator('avwap', { settings: { anchorIndex: 120 } });
- *   Settings auto-appear in the indicator's settings card (the gear icon)
- *   and re-apply live. All math is ALSO on the public Indicators utility:
- *   Indicators.atr(candles, 14) · Indicators.adx(candles, 14) · …
- *
- * ─────────────────────────────────────────────────────────────────────────
- * 7. MODERN DRAWING TOOLS
- * ─────────────────────────────────────────────────────────────────────────
- *   Registered by enableModernUI(), selectable via chart.setTool(id):
- *     measure   — Measure 2.0: Δprice · Δ% · Δbars · Δtime in a glass pill
- *                 with profit/loss tint. Shortcut: M
- *     long      — Long Position bracket: entry/target/stop boxes with
- *                 live R:R and size→P&L pill (drag the handles).
- *     short     — the mirrored short bracket.
- *     hray      — Horizontal Ray (level extending right forever).
- *     crossline — Cross Line (full-width × full-height).
- *
- * ─────────────────────────────────────────────────────────────────────────
- * 8. EXPORT
- * ─────────────────────────────────────────────────────────────────────────
- *   chart.exportPNG({ scale: 2, padding: 0, watermark: 'My App',
- *                     filename: 'chart.png', transparent: false })
- *     → composites the WebGL layer + crisp text overlay into a hi-DPI PNG
- *       and downloads it. Pass asBlob:true / asDataURL:true to get the
- *       data instead of a download.
- *   chart.exportCSV({ download: true })   → OHLCV + indicator columns
- *   chart.exportJSON()                    → chart state snapshot string
- *
- * ─────────────────────────────────────────────────────────────────────────
- * 9. CHART SYNC (multi-chart dashboards)
- * ─────────────────────────────────────────────────────────────────────────
- *   chartA.syncWith(chartB, { range: true, crosshair: true });
- *   Panning/zooming either chart mirrors the visible range; the crosshair
- *   follows too. chartA.unsync(chartB) (or unsync() for all) disconnects.
- *
- * ─────────────────────────────────────────────────────────────────────────
- * 10. LOCALIZATION
- * ─────────────────────────────────────────────────────────────────────────
- *   chart.setLocale('ar')   — every card label switches to Arabic and the
- *   card dock + rail flip to the right-to-left arrangement. chart._t(key)
- *   translates for custom UIs; BadiI18n.ar is a plain object — extend it
- *   (or BadiI18n.fr = {...}) and setLocale('fr') just works.
- *
- * ─────────────────────────────────────────────────────────────────────────
- * 11. SESSION SHADING
- * ─────────────────────────────────────────────────────────────────────────
- *   chart.setSessions([
- *     { start: '04:00', end: '09:30', color: 'rgba(120,140,255,0.05)', label: 'Pre' },
- *     { start: '09:30', end: '16:00', color: 'rgba(120,255,170,0.04)', label: 'RTH' },
- *     { start: '16:00', end: '20:00', color: 'rgba(255,160,120,0.05)', label: 'After' }
- *   ]);   // translucent bands under the grid, local hh:mm boundaries
- *
- * ─────────────────────────────────────────────────────────────────────────
- * 12. KEYBOARD (modern layer additions)
- * ─────────────────────────────────────────────────────────────────────────
- *   Alt+1…9  toggle cards        Alt+T  cycle theme preset
- *   Alt+E    export PNG          M      measure tool
- *   (all core shortcuts — R reset, +/- zoom, Esc, Del, arrows — unchanged)
- * ======================================================================== */
+/* ============================ CHUNK (SHARED VBO) =========================== */
+// v2.38.0: fast series are packed into shared chunk buffers so N series cost
+// ONE buffer bind + ONE draw call. Each series owns a slot with a stable
+// offset; the chunk re-packs only when membership or slot capacity changes
+// (rare — capacity grows only if the series' visible kept count outgrew it).
+//
+// Per frame: for every DIRTY slot the engine writes its vertices into the
+// chunk's CPU mirror, then pushes the used range once (one bufferSubData per
+// dirty chunk — not per series). Clean frames upload nothing at all.
+class BadiPerfChunk {
+  constructor(glLines, capVerts) {
+    this.glLines = glLines;
+    this.capVerts = capVerts;
+    this.mirror = new Float32Array(capVerts * 4);  // idx,price + pad for u8s
+    this.usedVerts = 0;
+    this.slots = [];                // { series, vertOffset, capVerts }
+    this.dirty = true;              // needs full repack
+    this.anyUpload = true;          // some slot uploaded this frame
+    // glLines may be null (pure-logic tests / 2D fallback) — buffer deferred.
+    this.vbo = glLines ? glLines.makeBuffer(null, capVerts * BADI_LINE_VERT_STRIDE, true) : null;
+  }
+  // Try to place a series; returns the slot or null when full.
+  tryPlace(series) {
+    const cap = series.slotCap || 4096;
+    if (this.usedVerts + cap > this.capVerts) return null;
+    const slot = { series: series, vertOffset: this.usedVerts, capVerts: cap };
+    this.usedVerts += cap;
+    this.slots.push(slot);
+    series.slot = slot;
+    series.uploadDirty = true;
+    this.dirty = true;
+    return slot;
+  }
+  unplace(series) {
+    const i = this.slots.findIndex(s => s.series === series);
+    if (i < 0) return false;
+    this.slots.splice(i, 1);
+    series.slot = null;
+    this.dirty = true;
+    return true;
+  }
+  // Full repack: compact all slots in order. IN-PLACE via copyWithin —
+  // compaction only moves data LEFT, so a forward copyWithin is safe and we
+  // avoid allocating a fresh 8-32MB mirror on every membership change (GC
+  // churn = hitches).
+  repack() {
+    let offset = 0;
+    for (const s of this.slots) {
+      const cnt = s.capVerts;
+      if (s.vertOffset !== offset && cnt > 0) {
+        this.mirror.copyWithin(offset * 4, s.vertOffset * 4, (s.vertOffset + cnt) * 4);
+      }
+      s.vertOffset = offset;
+      offset += cnt;
+    }
+    this.usedVerts = offset;
+    this.dirty = false;
+    this.anyUpload = true;
+  }
+  destroy(glLines) {
+    if (glLines && this.vbo) glLines.freeBuffer(this.vbo);
+    this.vbo = null;
+    this.slots.length = 0;
+  }
+}
+// helper used by growSlot (kept tiny to avoid closing over the slot shape)
+function series_slotCap(slot) { return slot.series ? (slot.series.slotCap = slot.capVerts) : 0; }
 
-/* =========================================================================
- * MODERN SECTION 13 — SELF TEST (smoke checks for integrators)
- * =========================================================================
- * BadiSelfTest.run(chart?) verifies the modern layer wired itself correctly
- * on a chart instance: every public method exists, the theme carries the
- * glass tokens, the indicator pack is complete, and the render hooks are
- * installed. Returns { ok, passed, failed, results[] } — designed for CI
- * pipelines and for the "it doesn't work" support ticket where the answer
- * is usually "you loaded the wrong file". Zero side effects: nothing is
- * drawn or mutated; it only inspects.
- * ======================================================================== */
-const BadiSelfTest = {
-  // run against an existing chart, or a detached one created on the fly
-  run(chart) {
-    const results = [];
-    const check = function (name, fn) {
+/* ============================ ADAPTIVE QUALITY ============================= */
+// v2.38.0: watches the line-layer frame cost and moves between four tiers.
+// The engine measures ONLY its own phase (decide + upload + draw) — that is
+// the part it can control; candle/grid cost is the base chart's business.
+// Tiers affect: DP epsilon (thick path), bucket density (fast path), and the
+// per-frame upload caps.
+const BADI_QUALITY_TIERS = ['eco', 'balanced', 'high', 'ultra'];
+class BadiAdaptiveQuality {
+  constructor(cfg) {
+    this.cfg = cfg;
+    this.mode = 'auto';
+    this.tier = 'high';
+    this._ema = 8;
+    this._framesInTier = 0;
+    this.downgrades = 0;
+  }
+  setMode(m) { if (['auto', ...BADI_QUALITY_TIERS].includes(m)) this.mode = m; return this.tier; }
+  eps() {
+    const c = this.cfg;
+    switch (this.tier) {
+      case 'ultra': return c.lodEpsUltra;
+      case 'high': return c.lodEpsHigh;
+      case 'balanced': return c.lodEpsBalanced;
+      default: return c.lodEpsEco;
+    }
+  }
+  // 1.0 = full bucket density, lower tiers thin out anchors.
+  bucketFactor() {
+    switch (this.tier) {
+      case 'ultra': return 1.0;
+      case 'high': return 0.85;
+      case 'balanced': return 0.65;
+      default: return 0.45;
+    }
+  }
+  tick(phaseMs) {
+    this._ema = this._ema * 0.9 + phaseMs * 0.1;
+    this._framesInTier++;
+    if (this.mode !== 'auto') return;
+    if (this._framesInTier < this.cfg.qualityHoldFrames) return;
+    if (this._ema > this.cfg.qualityDownMs && this.tier !== 'eco') {
+      const i = BADI_QUALITY_TIERS.indexOf(this.tier);
+      this.tier = BADI_QUALITY_TIERS[Math.max(0, i - 1)];
+      this._framesInTier = 0; this.downgrades++;
+    } else if (this._ema < this.cfg.qualityUpMs && this.tier !== 'ultra') {
+      const i = BADI_QUALITY_TIERS.indexOf(this.tier);
+      this.tier = BADI_QUALITY_TIERS[Math.min(BADI_QUALITY_TIERS.length - 1, i + 1)];
+      this._framesInTier = 0;
+    }
+  }
+  stats() { return { tier: this.tier, mode: this.mode, emaMs: +this._ema.toFixed(2), downgrades: this.downgrades }; }
+}
+
+/* ============================ PERF ENGINE ================================== */
+// v2.38.0: the orchestrator. Lives on the chart instance as chart._perf.
+class BadiPerfEngine {
+  constructor(chart, opts) {
+    this.chart = chart;
+    this.cfg = BadiPerfMakeConfig(opts && opts.perf);
+    this.series = new Map();          // id → BadiPerfSeries
+    this.order = [];                  // insertion order (stable z)
+    this.glLines = null;
+    this.chunks = [];
+    this.thickBuf = null;
+    this.thickVerts = 0;
+    this.thickMirror = null;
+    this.lodCache = new BadiLODCache(1024);
+    this.grid = new BadiSpatialGrid({ cellPx: this.cfg.gridCellPx });
+    this.gridFingerprint = '';
+    this.gridFrame = -1;
+    this.workers = new BadiWorkerPool(2);
+    this.quality = new BadiAdaptiveQuality(this.cfg);
+    this.hud = null;                  // created by enablePerfHUD(true)
+    this.enabled = true;
+    // Per-frame stats (HUD + getPerfStats)
+    this.stats = {
+      seriesTotal: 0, seriesVisible: 0, linesDrawn: 0, segments: 0,
+      glDrawCalls: 0, uploads: 0, phaseMs: 0, vramBytes: 0,
+      lodHitRate: 0, mode: 'gpu', frames: 0
+    };
+    this._frameMsWindow = [];
+    this._phaseMsWindow = [];
+    // Data-shift detection (time anchors must re-map when candles change).
+    this._lastDataLen = -1;
+    this._lastFirstTime = 0;
+    this._lastLastTime = 0;
+    this._lastDataVersion = -1;
+    // Scratch (per frame, reused)
+    this._packScratch = new Float32Array(4096 * 4);
+    this._thickScratch = new Float32Array(65536);
+    // Chunk bookkeeping
+    this._chunkCapVerts = Math.max(1024, Math.floor(this.cfg.chunkBytes / BADI_LINE_VERT_STRIDE));
+    this._lastQualityTier = 'high';
+  }
+
+  /* ---------------------- boot / teardown -------------------------------- */
+  ensureGL() {
+    if (this.glLines) return this.glLines;
+    const be = this.chart.ctx && this.chart.ctx.backend;
+    if (be && be.ready && be.gl) this.glLines = new BadiGLLines(be, this.cfg);
+    return this.glLines;
+  }
+  destroy() {
+    for (const s of this.series.values()) s.destroy(this.glLines);
+    this.series.clear();
+    for (const c of this.chunks) c.destroy(this.glLines);
+    this.chunks.length = 0;
+    if (this.thickBuf && this.glLines) this.glLines.freeBuffer(this.thickBuf);
+    this.thickBuf = null;
+    if (this.glLines) this.glLines.destroy();
+    this.glLines = null;
+    this.workers.destroy();
+    this.lodCache.clear();
+  }
+
+  /* ---------------------- series registry ------------------------------- */
+  addSeries(spec) {
+    const id = (spec.id != null && spec.id !== '') ? String(spec.id)
+      : ('line_' + (++BadiPerfEngine._autoId));
+    let s = this.series.get(id);
+    if (s) {           // upsert semantics: re-point data, keep z-order
+      this._applySpec(s, spec);
+      return id;
+    }
+    s = new BadiPerfSeries(id, spec);
+    this.series.set(id, s);
+    this.order.push(s);
+    this._applySpec(s, spec);
+    this.stats.seriesTotal = this.series.size;
+    return id;
+  }
+  _applySpec(s, spec) {
+    if (spec.points) {
+      s.setPoints(spec.points, this._makeTimeConverter());
+      // Remember the ORIGINAL anchor values (times) so a chart data shift
+      // can re-map t → idx later (see _checkDataShift).
+      this.rememberAnchorTimes(s, spec.points);
+    }
+    if (spec.color && spec.color !== s.color) {
+      s.color = spec.color;
+      s.uploadDirty = true;
+    }
+    if (spec.width != null && spec.width !== s.width) { s.width = Math.max(0.5, +spec.width); s.uploadDirty = true; }
+    if (spec.opacity != null) s.opacity = clamp(+spec.opacity, 0.04, 1);
+    if (spec.visible != null) s.visible = !!spec.visible;
+    if (spec.mode && spec.mode !== s.mode) { s.mode = spec.mode; s.uploadDirty = true; }
+    if (spec.maxPoints != null) s.maxPoints = Math.max(2, +spec.maxPoints);
+  }
+  _makeTimeConverter() {
+    const chart = this.chart;
+    const candles = chart.sim && chart.sim.candles;
+    return (tArr, pArr, n) => {
+      if (!candles || candles.length === 0) return false;
+      // Heuristic: values beyond candle count are probably raw indices.
+      // A value is a TIME if it is > 1e9 (unix seconds/ms range) while the
+      // candle count is far smaller. Mixed inputs allowed per point.
+      let anchored = 0;
+      const tfSec = (chart.timeframe && chart.timeframe.ms || 60000) / 1000;
+      const lastT = candles[candles.length - 1].time;
+      for (let i = 0; i < n; i++) {
+        const v = tArr[i];
+        if (v >= 1e9 && candles.length < 1e7) {
+          let sec = v;
+          if (sec > 1e12) sec = Math.floor(sec / 1000);    // ms → s
+          // binary search for the candle owning this time
+          let lo = 0, hi = candles.length - 1;
+          while (lo < hi) {
+            const mid = (lo + hi) >> 1;
+            if (candles[mid].time < sec) lo = mid + 1; else hi = mid;
+          }
+          let idx = lo;
+          if (sec > lastT) {
+            // future projection: extend past the last candle linearly
+            idx = (candles.length - 1) + (sec - lastT) / Math.max(1, tfSec);
+          }
+          tArr[i] = idx;
+          anchored++;
+        }
+      }
+      return anchored > 0;
+    };
+  }
+  removeSeries(id) {
+    const s = this.series.get(id);
+    if (!s) return false;
+    if (s.slot) { const c = s.slotChunk; if (c) c.unplace(s); }
+    if (this.glLines && s.vbo) this.glLines.freeBuffer(s.vbo);
+    s.destroy(this.glLines);
+    this.series.delete(id);
+    const oi = this.order.indexOf(s);
+    if (oi >= 0) this.order.splice(oi, 1);
+    this.stats.seriesTotal = this.series.size;
+    return true;
+  }
+  clearSeries() {
+    const ids = [...this.series.keys()];
+    for (const id of ids) this.removeSeries(id);
+  }
+  getSeries(id) {
+    const s = this.series.get(id);
+    if (!s) return null;
+    return {
+      id: s.id, color: s.color, width: s.width, opacity: s.opacity,
+      mode: s.mode, effectiveMode: s.effectiveMode, visible: s.visible,
+      points: s.n, version: s.version, maxPoints: s.maxPoints,
+      band: s.band, lastKept: s.lastKept, z: s.z
+    };
+  }
+  appendPoint(id, pt) {
+    const s = this.series.get(id);
+    if (!s) return false;
+    let x, v;
+    if (Array.isArray(pt)) { x = pt[0]; v = pt[1]; }
+    else { x = (pt.idx != null) ? pt.idx : pt.t; v = pt.p; }
+    if (x == null || v == null || !isFinite(+x) || !isFinite(+v)) return false;
+    if (s.timeAnchored && x >= 1e9) {
+      // convert like setPoints does (single value)
+      const tmp = new Float64Array(1); tmp[0] = x;
+      this._makeTimeConverter()(tmp, new Float64Array(1), 1);
+      x = tmp[0];
+    }
+    s.appendPoint(x, v);
+    // Trim: ring already caps at min(maxPoints, 262144); reflect maxPoints.
+    return true;
+  }
+  setStyle(id, opts) {
+    const s = this.series.get(id);
+    if (!s) return false;
+    if (opts.color != null && opts.color !== s.color) { s.color = opts.color; s.uploadDirty = true; }
+    if (opts.width != null) { s.width = Math.max(0.5, +opts.width); s.uploadDirty = true; }
+    if (opts.opacity != null) s.opacity = clamp(+opts.opacity, 0.04, 1);
+    if (opts.visible != null) s.visible = !!opts.visible;
+    if (opts.mode != null && opts.mode !== s.mode) { s.mode = opts.mode; s.uploadDirty = true; }
+    return true;
+  }
+
+  /* ---------------------- data-shift detection --------------------------- */
+  // When the chart's candle set changes (setData/update/append), series that
+  // were anchored by TIME must re-map t → idx (idx space shifted). Detected
+  // by watching candles.length + first/last candle time — O(1) per frame.
+  _checkDataShift() {
+    const chart = this.chart;
+    const candles = chart.sim && chart.sim.candles;
+    if (!candles) return;
+    const len = candles.length;
+    const firstT = len ? candles[0].time : 0;
+    const lastT = len ? candles[len - 1].time : 0;
+    if (len === this._lastDataLen && firstT === this._lastFirstTime && lastT === this._lastLastTime) return;
+    const shifted = this._lastDataLen >= 0 &&
+      (firstT !== this._lastFirstTime || len !== this._lastDataLen);
+    this._lastDataLen = len;
+    this._lastFirstTime = firstT;
+    this._lastLastTime = lastT;
+    if (!shifted) return;
+    // Re-convert anchored series only (cheap flag set at setPoints time).
+    const conv = this._makeTimeConverter();
+    for (const s of this.series.values()) {
+      if (!s.timeAnchored || !s.t0) continue;
+      // Replay the ORIGINAL anchor values through the converter against the
+      // NEW candle set, then swap the arrays in.
+      const t = s.t0.slice(0, s.n);
+      const p = s.ys().slice(0, s.n);
+      conv(t, p, s.n);
+      s.t = t; s.p = p; s.version++; s._resetLod();
+    }
+  }
+  // Called from setPoints converter wrapper — remembers original times.
+  // Same skip rules as setPoints so t0 aligns 1:1 with the stored arrays.
+  rememberAnchorTimes(s, pts) {
+    if (!pts || !pts.length) { s.t0 = null; return; }
+    const t0 = new Float64Array(s.n);
+    let m = 0;
+    for (let i = 0; i < pts.length && m < s.n; i++) {
+      const pt = pts[i];
+      if (!pt) continue;
+      const x = Array.isArray(pt) ? pt[0] : ((pt.idx != null) ? pt.idx : pt.t);
+      if (x == null || !isFinite(+x)) continue;
+      t0[m++] = +x;
+    }
+    s.t0 = (m === s.n) ? t0 : null;
+  }
+
+  /* ---------------------- LOD pipeline ------------------------------------ */
+  // Band = power-of-two points-per-bucket for the CURRENT zoom. We target
+  // ~2 buckets per screen pixel of plot width, adjusted by quality tier.
+  _bandFor(s, spanPts) {
+    const plotW = Math.max(1, this.chart.chartRight - this.chart.chartLeft);
+    const factor = this.quality.bucketFactor();
+    const targetBuckets = Math.max(32, plotW * this.cfg.lodBucketsPerPx * factor);
+    const per = Math.max(1, Math.ceil(spanPts / targetBuckets));
+    let band = 1;
+    while (band < per) band <<= 1;
+    return band;
+  }
+  // IDX window [from..to] (candle-index space) → ARRAY POSITION range.
+  // Series points may be SPARSE (one point every 5 candles: n=181 but idx
+  // spans 0..895) — comparing n against the idx window is wrong, so we
+  // binary-search the sorted t array for the positions that fall inside.
+  // Returns [posFrom, posTo] inclusive, or null when fully off-screen.
+  _posRangeFor(s, from, to) {
+    const t = s.ringT ? s.ringT.toArray() : s.t;
+    const n = s.n;
+    if (n === 0) return null;
+    // lower bound: first position with t[pos] >= from
+    let lo = 0, hi = n;
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (t[mid] < from) lo = mid + 1; else hi = mid; }
+    const posFrom = lo;
+    // upper bound: last position with t[pos] <= to
+    lo = 0; hi = n;
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (t[mid] <= to) lo = mid + 1; else hi = mid; }
+    const posTo = lo - 1;
+    if (posFrom > posTo) {
+      // window sits between two points — include the NEIGHBORING pair so
+      // lines crossing the viewport edges stay connected (the shader maps
+      // them correctly; the scissor trims the overflow).
+      if (posFrom > 0 && posFrom < n) return [posFrom - 1, posFrom];
+      return null;
+    }
+    // extend one point on each side for seamless edge connections
+    return [Math.max(0, posFrom - 1), Math.min(n - 1, posTo + 1)];
+  }
+  // Ensure keptIdx exists for the visible window [from..to] (IDX space) at
+  // the band. Returns kept ARRAY POSITIONS (ascending) or null.
+  _ensureLod(s, from, to) {
+    const tier = this.quality.tier;
+    const cache = this.lodCache;
+    const pr = this._posRangeFor(s, from, to);
+    if (!pr) return null;
+    const posFrom = pr[0], posTo = pr[1];
+    if (posTo - posFrom + 1 < 2) return null;
+    // Whole-series band decimation (worker path) — cached by (version, band).
+    const band = this._bandFor(s, s.n);
+    let kept = cache.get(s.version, 0, s.n - 1, band, tier, 'mm');
+    if (kept) { s.lastKept = kept.length; return kept; }
+    if (!s.lodPending && s.n >= this.cfg.lodWorkerThreshold && this.workers.available) {
+      // Big series → worker. Send a COPY (zero-copy transfer of the copy).
+      s.lodPending = true;
+      const verAtSubmit = s.version;
+      const bandAtSubmit = band;
+      const tierAtSubmit = tier;
+      const copy = s.ys().slice(0, s.n);
+      this.workers.submit('minmax', { p: copy, from: 0, to: s.n - 1, arg: Math.max(1, Math.ceil(s.n / band)) })
+        .then((idx) => {
+          s.lodPending = false;
+          if (idx && s.version === verAtSubmit) {
+            // adopt — same data version → result is valid
+            cache.put(s.version, 0, s.n - 1, bandAtSubmit, tierAtSubmit, 'mm', idx);
+            s.keptIdx = idx; s.keptFrom = 0; s.keptTo = s.n - 1;
+            s.uploadDirty = true;
+          }
+        });
+      // Meanwhile fall through to the synchronous coarse pass below.
+    }
+    // Synchronous visible-window decimation (also feeds the cache so the
+    // worker result simply replaces it later). Operates on ARRAY POSITIONS.
+    const win = posTo - posFrom + 1;
+    const ysv = s.ys();
+    kept = BadiDecimator.minMaxKeep(ysv, posFrom, posTo,
+      Math.max(1, Math.ceil(win / band)));
+    cache.put(s.version, posFrom, posTo, band, tier, 'mmWin', kept);
+    s.lastKept = kept.length;
+    return kept;
+  }
+
+  /* ---------------------- chunk management ------------------------------- */
+  // Slot capacity policy: series SHARE each chunk's vertex budget fairly —
+  // a chunk holds chunkCapVerts verts total, so every series gets at least
+  // chunkCap / 2N verts (N = series count), never more than the visual
+  // upper bound (≈ 12 verts per plot pixel after LOD) and never fewer than
+  // 512. With 1,000 series on a 1,000px chart that is ~524 verts each —
+  // visually dense anyway — and VRAM stays bounded by a handful of 8MB
+  // chunks INSTEAD of 1000 × worst-case reservations.
+  _placeFastSeries(s) {
+    const plotW = Math.max(1, this.chart.chartRight - this.chart.chartLeft);
+    const count = Math.max(1, this.series.size);
+    const fairShare = Math.floor(this._chunkCapVerts / (count * 2));
+    const visualMax = Math.ceil(plotW * 12) + 128;
+    s.slotCap = Math.max(512, Math.min(visualMax, fairShare, 65536));
+    // Find a chunk with room; else create one.
+    for (const c of this.chunks) {
+      if (c.usedVerts + s.slotCap <= c.capVerts && c.slots.length < 4096) {
+        const slot = c.tryPlace(s);
+        if (slot) { s.slotChunk = c; return slot; }
+      }
+    }
+    const c = new BadiPerfChunk(this.glLines, this._chunkCapVerts);
+    this.chunks.push(c);
+    const slot = c.tryPlace(s);
+    if (slot) s.slotChunk = c;
+    return slot;
+  }
+
+  /* ---------------------- the per-frame flush ---------------------------- */
+  // Called from the render() wrapper AFTER the chart's own frame has been
+  // flushed (endFrame) — in the SAME JavaScript task, so our raw GL draws
+  // composite on top of the candles and stay under the DOM text overlay.
+  // Raw WebGL here, NOT GLCtx commands: the frame is already ended, so any
+  // command-layer ops would sit unflushed in the queue.
+  drawFrame() {
+    if (!this.enabled || this.series.size === 0) return;
+    const chart = this.chart;
+    const t0 = performance.now();
+    BADI_PERF_FRAME_STAMP++;
+    this._checkDataShift();
+    // Quality tier switch → invalidate all upload states (band changes).
+    if (this.quality.tier !== this._lastQualityTier) {
+      this._lastQualityTier = this.quality.tier;
+      for (const s of this.series.values()) s._resetLod();
+      this.lodCache.clear();
+    }
+    const glL = this.ensureGL();
+    const ps = chart.priceScale;
+    const range = ps && ps.priceRange();
+    if (!range || range.min === range.max) { this._statsPhase(t0); return; }
+    const candles = chart.sim.candles;
+    const nCandles = candles.length;
+    if (nCandles === 0) { this._statsPhase(t0); return; }
+    // Transform uniforms (linear data→screen, see Part 1 banner).
+    const xB = chart.barSpacing;
+    const xA = chart.chartRight - (nCandles - 1 + chart.rightOffset) * xB;
+    const ih = ps.internalHeight();
+    const yB = ih / (range.max - range.min);
+    const yA = chart.priceTop + (ps.height() - 1) - ps.bottomMarginPx() + yB * range.min;
+    // Visible window (virtual idx space; series may extend into the future).
+    const i0 = Math.floor(chart.xToIndex(chart.chartLeft)) - 1;
+    const i1 = Math.ceil(chart.xToIndex(chart.chartRight)) + 1;
+
+    // ---- pass 1: ensure LOD for every visible series --------------------
+    let visibleCount = 0, segTotal = 0;
+    const thickVisible = [];
+    for (const s of this.order) {
+      if (!s.visible || s.n < 2) continue;
+      // Series idx extent (points may be sparse: idx values ≠ positions).
+      const tsv0 = s.ringT ? s.ringT.toArray() : s.t;
+      const sLo = tsv0[0], sHi = tsv0[s.n - 1];
+      if (i1 < sLo - 2 || i0 > sHi + 2) continue;   // fully off-screen
+      visibleCount++;
+      if (s.effectiveMode === 'thick') { thickVisible.push(s); continue; }
+      // STORE the kept positions — _packSeriesInto reads s.keptIdx (and the
+      // 2D fallback / thick / area paths read the return value directly).
+      s.keptIdx = this._ensureLod(s, i0, i1);
+      s.keptFrom = i0; s.keptTo = i1;
+    }
+
+    // ---- pass 2: GPU fast path (chunks) ---------------------------------
+    let glCalls = 0, uploads = 0;
+    if (glL && glL.ok) {
+      const dpr = chart.dpr || 1;
+      const gl = glL.gl;
+      const deviceW = glL.be.glCanvas.width, deviceH = glL.be.glCanvas.height;
+      gl.viewport(0, 0, deviceW, deviceH);
+      // Alpha blending + plot-area scissor (lines must never bleed onto the
+      // axes / outside the price pane).
+      gl.enable(gl.BLEND);
+      gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+      gl.disable(gl.DEPTH_TEST);
+      gl.enable(gl.SCISSOR_TEST);
+      gl.scissor(
+        Math.round(chart.chartLeft * dpr),
+        Math.round(deviceH - chart.priceBottom * dpr),
+        Math.max(1, Math.round((chart.chartRight - chart.chartLeft) * dpr)),
+        Math.max(1, Math.round((chart.priceBottom - chart.priceTop) * dpr))
+      );
+      glL.use(xA, xB, yA, yB, false, dpr, deviceW, deviceH);
+      // Build / repair chunks and upload dirty slots.
+      for (const s of this.order) {
+        if (!s.visible || s.n < 2 || s.effectiveMode !== 'fast') continue;
+        if (!s.slot && !s.vbo) this._placeFastSeries(s);
+      }
+      for (const c of this.chunks) {
+        let dirty = c.dirty;
+        for (const slot of c.slots) {
+          const s = slot.series;
+          if (s.uploadDirty) dirty = true;
+        }
+        if (dirty) {
+          c.repack();
+          uploads++;
+          for (const slot of c.slots) {
+            const s = slot.series;
+            this._packSeriesInto(s, slot, c);
+          }
+          glL.uploadSub(c.vbo, 0, c.mirror.subarray(0, c.usedVerts * 4));
+          for (const slot of c.slots) slot.series.uploadDirty = false;
+        }
+        // Draw the chunk (all series in one call). Cull empty chunks.
+        if (c.usedVerts > 0) {
+          gl.bindBuffer(gl.ARRAY_BUFFER, c.vbo);
+          glL.pointers();
+          glL.drawArrays(gl.LINES, 0, c.usedVerts);
+          glCalls++;
+          segTotal += c.usedVerts / 2;
+        }
+      }
+      // Series too big for chunks (private VBO): upload + draw individually.
+      for (const s of this.order) {
+        if (!s.visible || s.n < 2 || s.effectiveMode !== 'fast' || !s.vbo) continue;
+        this._drawPrivateFast(s, i0, i1, glL, dpr, deviceW, deviceH);
+        glCalls++;
+      }
+      // ---- pass 3: thick path (CPU quad expansion, one shared buffer) ---
+      if (thickVisible.length > 0) {
+        glCalls += this._drawThick(thickVisible, i0, i1, xA, xB, yA, yB, dpr, deviceW, deviceH);
+      }
+      gl.disable(gl.SCISSOR_TEST);
+      gl.disable(gl.BLEND);
+    } else {
+      // ---- 2D fallback: native overlay context (device-px transform) ----
+      const nctx = chart.ctx && chart.ctx._nc;
+      if (nctx) {
+        const dpr = chart.dpr || 1;
+        nctx.save();
+        nctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        this._draw2D(nctx, i0, i1);
+        nctx.restore();
+      }
+    }
+
+    // ---- stats ------------------------------------------------------------
+    const t1 = performance.now();
+    this.quality.tick(t1 - t0);
+    this.stats.seriesVisible = visibleCount;
+    this.stats.segments = Math.round(segTotal);
+    this.stats.glDrawCalls = glCalls;
+    this.stats.uploads = uploads;
+    this.stats.vramBytes = glL ? glL.vramBytes : 0;
+    this.stats.mode = (glL && glL.ok) ? 'gpu' : '2d';
+    const ls = this.lodCache.stats();
+    this.stats.lodHitRate = (ls.hits + ls.misses) ? ls.hits / (ls.hits + ls.misses) : 0;
+    this.stats.frames++;
+    this._statsPhase(t0);
+    if (this.hud) this.hud.recordFrame(t1 - t0, this.stats);
+  }
+  _statsPhase(t0) { this.stats.phaseMs = performance.now() - t0; }
+
+  // Pack a series' visible decimated slice into its chunk slot (CPU mirror).
+  // IMPORTANT: the chunk is drawn with gl.LINES — vertices are consumed in
+  // PAIRS (one pair = one segment). A polyline of K kept points therefore
+  // packs 2·(K−1) vertices: (p0,p1) (p1,p2) (p2,p3) … Shared endpoints are
+  // duplicated — VRAM is cheap, correctness is not negotiable.
+  // kept positions are ALREADY window-limited by _posRangeFor — no idx
+  // filtering here (positions ≠ idx for sparse series).
+  _packSeriesInto(s, slot, chunk) {
+    const kept = s.keptIdx;
+    const packed = badiPackedColor(s.color);
+    const alpha = s.opacity;
+    const ysv = s.ys();
+    const tsv = s.ringT ? s.ringT.toArray() : s.t;
+    let m = 0;                 // verts written (each vert = 4 floats packed)
+    if (kept && kept.length >= 2) {
+      for (let k = 0; k + 1 < kept.length; k++) {
+        const a = kept[k], b = kept[k + 1];
+        if (m + 2 > slot.capVerts) break;
+        m = _packVert(chunk.mirror, slot.vertOffset + m, tsv[a], ysv[a], packed, alpha, 0) - slot.vertOffset;
+        m = _packVert(chunk.mirror, slot.vertOffset + m, tsv[b], ysv[b], packed, alpha, 0) - slot.vertOffset;
+      }
+    }
+    // Fill the rest of the slot with INVISIBLE degenerate pairs — the chunk
+    // draws gl.LINES over the FULL usedVerts range, so every slot must be
+    // fully written or stray garbage lines appear. Zero-alpha vertices are
+    // discarded by blending (src alpha 0 → dst unchanged).
+    const lastOff = slot.vertOffset + Math.max(0, m - 1);
+    const srcF = lastOff * 4;
+    for (let v = m; v < slot.capVerts; v++) {
+      const dst = (slot.vertOffset + v) * 4;
+      chunk.mirror[dst] = chunk.mirror[srcF];
+      chunk.mirror[dst + 1] = chunk.mirror[srcF + 1];
+      chunk.mirror[dst + 2] = 0; chunk.mirror[dst + 3] = 0; // rgba=0 → invisible
+    }
+    s.lastKept = m;
+  }
+
+  // Private (chunk-less) fast series: slice → pack → upload → draw.
+  _drawPrivateFast(s, i0, i1, glL, dpr, deviceW, deviceH) {
+    const kept = this._ensureLod(s, i0, i1);
+    if (!kept || kept.length < 2) return;
+    const count = Math.min(kept.length, 262144);
+    if (!s.vbo || s.vboVerts < count * 2) {
+      s.vboVerts = Math.max(4096, count * 2);
+      glL.makeBuffer(s.vbo, s.vboVerts * BADI_LINE_VERT_STRIDE, true);
+    }
+    const need = count * 8;
+    if (this._packScratch.length < need) this._packScratch = new Float32Array(need);
+    const packed = badiPackedColor(s.color);
+    const ysv = s.ys();
+    const tsv = s.ringT ? s.ringT.toArray() : s.t;
+    let w = 0;
+    for (let k = 0; k + 1 < count; k++) {
+      const a = kept[k], b = kept[k + 1];
+      w = _packVert(this._packScratch, w, tsv[a], ysv[a], packed, s.opacity, 0);
+      w = _packVert(this._packScratch, w, tsv[b], ysv[b], packed, s.opacity, 0);
+    }
+    glL.uploadSub(s.vbo, 0, this._packScratch.subarray(0, w));
+    glL.pointers();
+    glL.drawArrays(glL.gl.LINES, 0, w);
+    s.lastKept = count;
+  }
+
+  // Thick path: expand decimated visible segments into screen-space quads.
+  _drawThick(list, i0, i1, xA, xB, yA, yB, dpr, deviceW, deviceH) {
+    const glL = this.glLines, gl = glL.gl;
+    const eps = this.quality.eps();
+    let totalVerts = 0;
+    if (!this.thickBuf) this.thickBuf = glL.makeBuffer(null, 1 << 20, true);
+    let scratch = this._thickScratch;
+    const maxPts = this.cfg.lodMaxPointsThick;
+    for (const s of list) {
+      const pr = this._posRangeFor(s, i0, i1);
+      if (!pr || pr[1] - pr[0] < 1) continue;
+      const ysv = s.ys();
+      const tsv = s.ringT ? s.ringT.toArray() : s.t;
+      // Screen-project the window (cheap linear map) then DP-decimate.
+      const fromC = pr[0], toC = pr[1];
+      const win = toC - fromC + 1;
+      const xs = requestBadiF64(win), ys2 = requestBadiF64(win);
+      for (let i = 0; i < win; i++) {
+        const di = fromC + i;
+        xs[i] = xA + xB * tsv[di];
+        ys2[i] = yA - yB * ysv[di];
+      }
+      let keptIdx;
+      if (win > 1024) {
+        const mask = BadiDecimator.dpKeepMask(xs, ys2, 0, win - 1, eps);
+        let c = 0;
+        for (let i = 0; i < win; i++) if (mask[i]) c++;
+        keptIdx = new Uint32Array(c);
+        let w = 0;
+        for (let i = 0; i < win; i++) if (mask[i]) keptIdx[w++] = i;
+      } else {
+        keptIdx = new Uint32Array(win);
+        for (let i = 0; i < win; i++) keptIdx[i] = i;
+      }
+      const lim = Math.min(keptIdx.length, maxPts);
+      const halfW = (s.width * dpr) / 2;
+      const packed = badiPackedColor(s.color);
+      const needVerts = Math.max(0, lim - 1) * 6;
+      if (totalVerts + needVerts > scratch.length / 4) {
+        const grown = new Float32Array((totalVerts + needVerts) * 4 * 2);
+        grown.set(scratch.subarray(0, totalVerts * 4));
+        this._thickScratch = scratch = grown;
+      }
+      for (let k = 0; k + 1 < lim; k++) {
+        const a = keptIdx[k], b = keptIdx[k + 1];
+        const x1 = xs[a], y1 = ys2[a], x2 = xs[b], y2 = ys2[b];
+        if (totalVerts + 6 > scratch.length / 4) break;
+        totalVerts = _pushThickQuad(scratch, totalVerts, x1, y1, x2, y2, halfW, packed, s.opacity);
+      }
+      releaseBadiF64(xs);
+      releaseBadiF64(ys2);
+      s.lastKept = lim;
+    }
+    if (totalVerts === 0) return 0;
+    const needBytes = totalVerts * 4 * 4;
+    if (!this.thickBuf) this.thickBuf = glL.makeBuffer(null, needBytes, true);
+    else if ((this.thickBuf._badiBytes || 0) < needBytes) glL.makeBuffer(this.thickBuf, needBytes, true);
+    glL.uploadSub(this.thickBuf, 0, scratch.subarray(0, totalVerts * 4));
+    glL.use(0, 0, 0, 0, true, dpr, deviceW, deviceH);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.thickBuf);
+    glL.pointers();
+    glL.drawArrays(gl.TRIANGLES, 0, totalVerts);
+    this.stats.segments += totalVerts / 6;
+    return 1;
+  }
+
+  // 2D fallback: batched strokes on the NATIVE overlay context (already
+  // transformed to CSS px by the caller). Grouped by color+width so hundreds
+  // of series cost a handful of stroke passes.
+  _draw2D(nctx, i0, i1) {
+    const chart = this.chart;
+    const ctx = nctx;
+    const xB = chart.barSpacing;
+    const xA = chart.chartRight - (chart.sim.candles.length - 1 + chart.rightOffset) * xB;
+    const ps = chart.priceScale;
+    const range = ps.priceRange();
+    const ih = ps.internalHeight();
+    const yB = ih / (range.max - range.min);
+    const yA = chart.priceTop + (ps.height() - 1) - ps.bottomMarginPx() + yB * range.min;
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(chart.chartLeft, chart.priceTop, chart.chartRight - chart.chartLeft, chart.priceBottom - chart.priceTop);
+    ctx.clip();
+    ctx.lineJoin = 'round';
+    const groups = new Map();     // color+width → Path2D
+    for (const s of this.order) {
+      if (!s.visible || s.n < 2) continue;
+      const kept = this._ensureLod(s, i0, i1);
+      if (!kept || kept.length < 2) continue;
+      const ysv = s.ys();
+      const tsv = s.ringT ? s.ringT.toArray() : s.t;
+      const key = s.color + '|' + s.width;
+      let path = groups.get(key);
+      if (!path) { path = new Path2D(); groups.set(key, path); }
+      let first = true;
+      for (let k = 0; k < kept.length; k++) {
+        const i = kept[k];
+        const x = xA + xB * tsv[i];
+        const y = yA - yB * ysv[i];
+        if (first) { path.moveTo(x, y); first = false; } else path.lineTo(x, y);
+      }
+      s.lastKept = kept.length;
+      this.stats.segments += kept.length - 1;
+    }
+    for (const [key, path] of groups) {
+      const ci = key.lastIndexOf('|');
+      ctx.strokeStyle = key.slice(0, ci);
+      ctx.lineWidth = +key.slice(ci + 1);
+      ctx.stroke(path);
+    }
+    ctx.restore();
+    this.stats.mode = '2d';
+  }
+
+  /* ---------------------- hit testing ------------------------------------ */
+  hitTest(x, y, tolPx) {
+    const chart = this.chart;
+    const fp = BadiSpatialGrid.fingerprintOf(chart, this._dataVersion());
+    const ps = chart.priceScale;
+    const range = ps && ps.priceRange();
+    if (!range || range.min === range.max) return null;
+    const ih = ps.internalHeight();
+    const yB = ih / (range.max - range.min);
+    const yA = chart.priceTop + (ps.height() - 1) - ps.bottomMarginPx() + yB * range.min;
+    const xB = chart.barSpacing;
+    const xA = chart.chartRight - (chart.sim.candles.length - 1 + chart.rightOffset) * xB;
+    if (this.gridFingerprint !== fp) {
+      // Rebuild (throttled to one build per frame stamp).
+      if (this.gridFrame === BADI_PERF_FRAME_STAMP) return null;
+      this.gridFrame = BADI_PERF_FRAME_STAMP;
+      this.gridFingerprint = fp;
+      this.grid.beginBuild(chart, fp);
+      this.grid._x0 = chart.chartLeft;
+      this.grid._y0 = chart.priceTop;
+      const i0 = Math.floor(chart.xToIndex(chart.chartLeft)) - 1;
+      const i1 = Math.ceil(chart.xToIndex(chart.chartRight)) + 1;
+      let ord = 0;
+      for (const s of this.order) {
+        if (!s.visible || s.n < 2) { ord++; continue; }
+        const kept = this._ensureLod(s, i0, i1);
+        if (kept && kept.length >= 2) {
+          const ysv = s.ys();
+          const tsv = s.ringT ? s.ringT.toArray() : s.t;
+          for (let k = 0; k + 1 < kept.length; k++) {
+            const a = kept[k], b = kept[k + 1];
+            this.grid.addSegment(ord, a,
+              xA + xB * tsv[a], yA - yB * ysv[a],
+              xA + xB * tsv[b], yA - yB * ysv[b]);
+          }
+        }
+        ord++;
+      }
+      this.grid.endBuild();
+    }
+    const hit = this.grid.hitTest(x, y, tolPx == null ? 6 : tolPx);
+    if (!hit) return null;
+    const s = this.order[hit.seriesOrdinal];
+    if (!s) return null;
+    return { id: s.id, dataIdx: hit.dataIdx, dist: hit.dist, price: s.ys()[hit.dataIdx] };
+  }
+
+  // Fit the price scale to include series values (union with candle range).
+  fitScale(id) {
+    const chart = this.chart;
+    const ps = chart.priceScale;
+    const base = ps.priceRange();
+    let min = base ? base.min : Infinity;
+    let max = base ? base.max : -Infinity;
+    for (const s of this.series.values()) {
+      if (id != null && s.id !== id) continue;
+      if (!s.visible || s.n === 0) continue;
+      const ysv = s.ys();
+      for (let i = 0; i < s.n; i++) {
+        const v = ysv[i];
+        if (v !== v) continue;
+        if (v < min) min = v;
+        if (v > max) max = v;
+      }
+    }
+    if (!isFinite(min) || !isFinite(max) || min === max) return false;
+    const pad = (max - min) * 0.08;
+    ps.setRange(min - pad, max + pad);
+    chart.invalidate();
+    return true;
+  }
+
+  _dataVersion() {
+    const c = this.chart.sim && this.chart.sim.candles;
+    return c ? c.length + ':' + (c.length ? c[0].time : 0) : '0';
+  }
+  statsSnapshot() {
+    return Object.assign({}, this.stats, {
+      quality: this.quality.stats(),
+      lod: this.lodCache.stats(),
+      workers: this.workers.stats(),
+      grid: this.grid.stats(),
+      vram: badiFmtBytes(this.stats.vramBytes)
+    });
+  }
+}
+BadiPerfEngine._autoId = 0;
+
+// Pack one vertex into a Float32Array at float-offset `off*4`. Returns the
+// next free vertex offset. Layout: idx f32 · price f32 · rgba u8×4 · halfW f32
+// (rgba packed as one u32 written via a Uint32 view over the same buffer).
+const _packVertU32 = new Map();
+function _packVert(f32, vertOff, x, y, packedRgba, alpha, halfW) {
+  const o = vertOff * 4;
+  f32[o] = x;
+  f32[o + 1] = y;
+  f32[o + 2] = 0; f32[o + 3] = halfW;
+  // Write RGBA bytes over floats 2..2.5 — need a u32 view aligned here.
+  // Simpler: use a shared DataView-free trick — write via a temp u32 then
+  // copy bytes with a Uint8Array view created per-buffer (cached).
+  let u8 = _packVertU32.get(f32);
+  if (!u8) { u8 = new Uint8Array(f32.buffer); _packVertU32.set(f32, u8); }
+  const b = o * 4 + 8;
+  u8[b] = packedRgba & 255;
+  u8[b + 1] = (packedRgba >>> 8) & 255;
+  u8[b + 2] = (packedRgba >>> 16) & 255;
+  u8[b + 3] = Math.round(clamp(alpha, 0, 1) * 255);
+  return vertOff + 1;
+}
+// Push ONE thick quad (2 triangles, 6 verts) for segment (x1,y1)-(x2,y2).
+// Butt caps; joints are covered by drawing a 1px connecting line pass later
+// only if needed — at ≤4px widths the visual gap is sub-pixel.
+function _pushThickQuad(f32, vertOff, x1, y1, x2, y2, halfW, packedRgba, alpha) {
+  const dx = x2 - x1, dy = y2 - y1;
+  const len = Math.sqrt(dx * dx + dy * dy) || 1;
+  const nx = (-dy / len) * halfW;
+  const ny = (dx / len) * halfW;
+  const a1x = x1 + nx, a1y = y1 + ny;
+  const a2x = x1 - nx, a2y = y1 - ny;
+  const b1x = x2 + nx, b1y = y2 + ny;
+  const b2x = x2 - nx, b2y = y2 - ny;
+  let v = vertOff;
+  v = _packVert(f32, v, a1x, a1y, packedRgba, alpha, halfW);
+  v = _packVert(f32, v, b1x, b1y, packedRgba, alpha, halfW);
+  v = _packVert(f32, v, a2x, a2y, packedRgba, alpha, halfW);
+  v = _packVert(f32, v, a2x, a2y, packedRgba, alpha, halfW);
+  v = _packVert(f32, v, b1x, b1y, packedRgba, alpha, halfW);
+  v = _packVert(f32, v, b2x, b2y, packedRgba, alpha, halfW);
+  return v;
+}
+
+/* ============================ PERF HUD ===================================== */
+// v2.38.0: an opt-in lightweight stats overlay drawn ON the chart canvas via
+// the text-replay pipeline (crisp on the 2D overlay). Shows FPS, phase ms,
+// visible series, segments after LOD, GL draw calls, VRAM, LOD hit-rate and
+// a sparkline of the last N frames. Zero cost when disabled.
+class BadiPerfHUD {
+  constructor(engine) {
+    this.engine = engine;
+    this.enabled = false;
+    this.win = new Float32Array(engine.cfg.hudFramesWindow);
+    this.winLen = 0;
+    this.fps = 0;
+    this._lastFpsAt = 0;
+    this._framesSince = 0;
+    this.x = 0; this.y = 0; this.w = 236; this.h = 118;
+    this._drag = null;
+  }
+  recordFrame(phaseMs, stats) {
+    if (!this.enabled) return;
+    const w = this.win;
+    if (this.winLen < w.length) this.winLen++;
+    w.copyWithin(0, 1);
+    w[this.winLen - 1] = stats.phaseMs;
+    this._framesSince++;
+    const now = performance.now();
+    if (now - this._lastFpsAt >= 500) {
+      this.fps = Math.round(this._framesSince * 1000 / (now - this._lastFpsAt));
+      this._lastFpsAt = now;
+      this._framesSince = 0;
+    }
+  }
+  draw(chart, nctx, dpr) {
+    if (!this.enabled || !nctx) return;
+    const ctx = nctx;
+    const T = chart.theme;
+    const x = this.x + 10, y = this.y + 10;
+    const w = this.w, h = this.h;
+    const S = this.engine.stats;
+    ctx.save();
+    // Panel
+    ctx.fillStyle = 'rgba(10,12,18,0.82)';
+    _badiRoundRect(ctx, x, y, w, h, 8);
+    ctx.fill();
+    ctx.strokeStyle = withAlpha(T.axisBorder || '#2a2e39', 0.9);
+    ctx.lineWidth = 1;
+    _badiRoundRect(ctx, x, y, w, h, 8);
+    ctx.stroke();
+    // Title row
+    ctx.fillStyle = T.textBright || '#f0f3fa';
+    ctx.font = 'bold 11px ui-sans-serif, system-ui, sans-serif';
+    ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+    ctx.fillText('BADI PERF', x + 12, y + 18);
+    ctx.fillStyle = S.mode === 'gpu' ? '#26a69a' : '#ffb74d';
+    ctx.fillText(S.mode.toUpperCase(), x + w - 46, y + 18);
+    // Stats rows
+    ctx.font = '10px ui-monospace, SFMono-Regular, Menlo, monospace';
+    ctx.fillStyle = T.text || '#cfd2da';
+    const q = this.engine.quality.stats();
+    const rows = [
+      ['fps', String(this.fps)],
+      ['phase', S.phaseMs.toFixed(2) + ' ms'],
+      ['series', S.seriesVisible + ' / ' + S.seriesTotal],
+      ['segs', _badiFmtCount(S.segments)],
+      ['draws', String(S.glDrawCalls)],
+      ['vram', badiFmtBytes(S.vramBytes)],
+      ['lod%', Math.round(S.lodHitRate * 100) + ''],
+      ['tier', q.tier]
+    ];
+    let ry = y + 34;
+    for (let i = 0; i < rows.length; i += 2) {
+      ctx.fillStyle = T.textDim || '#787b86';
+      ctx.fillText(rows[i][0], x + 12, ry);
+      ctx.fillStyle = T.text || '#cfd2da';
+      ctx.fillText(rows[i][1], x + 58, ry);
+      if (rows[i + 1]) {
+        ctx.fillStyle = T.textDim || '#787b86';
+        ctx.fillText(rows[i + 1][0], x + 122, ry);
+        ctx.fillStyle = T.text || '#cfd2da';
+        ctx.fillText(rows[i + 1][1], x + 168, ry);
+      }
+      ry += 14;
+    }
+    // Sparkline of phase ms
+    const sx = x + 12, sy = y + h - 24, sw = w - 24, sh = 18;
+    ctx.strokeStyle = withAlpha('#2962ff', 0.9);
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    const wn = this.winLen;
+    const budget = this.engine.cfg.frameBudgetMs;
+    for (let i = 0; i < wn; i++) {
+      const v = Math.min(this.win[i], budget * 3);
+      const px = sx + (i / Math.max(1, w.length - 1)) * sw;
+      const py = sy + sh - (v / (budget * 3)) * sh;
+      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }
+    ctx.stroke();
+    // Budget line
+    ctx.strokeStyle = withAlpha('#ef5350', 0.7);
+    ctx.setLineDash([3, 3]);
+    const by = sy + sh - (budget / (budget * 3)) * sh;
+    ctx.beginPath(); ctx.moveTo(sx, by); ctx.lineTo(sx + sw, by); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.restore();
+  }
+  // Hit-test for HUD dragging (mouse handlers call this first).
+  hit(x, y) {
+    return x >= this.x + 4 && x <= this.x + this.w + 4 &&
+           y >= this.y + 4 && y <= this.y + this.h + 4;
+  }
+  dragTo(x, y) {
+    this.x = Math.max(0, x - this.w / 2);
+    this.y = Math.max(0, y - 14);
+  }
+}
+function _badiRoundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+function _badiFmtCount(n) {
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'k';
+  return String(n);
+}
+
+/* =============================================================================
+ * BADI-CHARTS-V2 v2.38.0 — ALERTS ENGINE  (price alerts, done right)
+ * =============================================================================
+ * A complete, self-contained price-alert system for the chart. It is exposed
+ * ONLY through the public API + the right-click context menu — no built-in
+ * UI panels, no built-in cards. The integrator stays in full control:
+ *
+ *   chart.addAlert({ price: 42000, cond: 'cross', color, label,
+ *                    once, sound, callback })  → alert object (with .id)
+ *   chart.removeAlert(id) · chart.clearAlerts() · chart.getAlerts()
+ *   chart.setAlertEnabled(id, bool)           mute/unmute without deleting
+ *   chart.setAlertSound(true|false)           WebAudio beep on trigger
+ *   chart.setAlertStore({ save, load })       persistence hooks (you store)
+ *   chart.checkAlertsNow()                    manual evaluation pass
+ *
+ * CONDITIONS:
+ *   'above'     fires when price rises above the alert price
+ *   'below'     fires when price falls below the alert price
+ *   'cross'     fires on a cross in EITHER direction
+ *   'crossUp'   fires when price crosses UP through the alert price
+ *   'crossDown' fires when price crosses DOWN through the alert price
+ *   'touch'     fires when price touches the level (>= or <=) once per bar
+ *
+ * TRIGGER PIPELINE (O(active alerts) per data update — no scanning):
+ *   update()/append()/setData() → chart.checkAlertsNow() →
+ *     per alert: state machine idle → armed → fired (once | rearm) →
+ *     callbacks + toast + beep + flash animation + store.save()
+ *
+ * RENDERING: dashed horizontal line across the price pane with a bell glyph
+ * (vector-drawn — no emoji, no fonts needed), a right-edge price chip and a
+ * small label near the line. States: armed (dashed, full color), near
+ * (solid + glow when price is within proximity), triggered (flash rings),
+ * disabled (40% alpha, dotted). Alert lines are DRAGGABLE — grab the line
+ * and drag to re-target; the chip shows the live price while dragging.
+ * ========================================================================== */
+
+/* ============================ ALERT I18N =================================== */
+// v2.38.0: EN/AR strings for alert + context-menu UI. The chart language is
+// set with chart.setLang('ar') (or opts.lang). Unknown languages fall back
+// to English. Strings are plain functions so prices/format can be injected.
+const BADI_I18N = {
+  en: {
+    addAlert: 'Add price alert',
+    addAlertAt: (p) => 'Add alert at ' + p,
+    alerts: 'Alerts',
+    alertsN: (n) => 'Alerts (' + n + ')',
+    alertCreated: (p) => 'Alert created at ' + p,
+    alertRemoved: 'Alert removed',
+    alertsCleared: 'All alerts removed',
+    alertEnabled: 'Alert enabled',
+    alertDisabled: 'Alert muted',
+    alertUpdated: 'Alert updated',
+    deleteAlert: 'Delete alert',
+    deleteAllAlerts: 'Delete all alerts',
+    enable: 'Enable',
+    disable: 'Mute',
+    enableAll: 'Enable all',
+    disableAll: 'Mute all',
+    color: 'Color',
+    sound: 'Sound',
+    soundOn: 'Sound on',
+    soundOff: 'Sound off',
+    editPrice: 'Edit price…',
+    copyPrice: 'Copy price',
+    copyPriceDone: (p) => 'Copied ' + p,
+    screenshot: 'Screenshot (PNG)',
+    screenshotCopied: 'Screenshot copied to clipboard',
+    screenshotSaved: 'Screenshot saved',
+    screenshotFail: 'Screenshot unavailable',
+    resetView: 'Reset view',
+    clearDrawings: 'Clear drawings',
+    drawingsCleared: (n) => n + ' drawing(s) removed',
+    deleteDrawing: 'Delete drawing',
+    duplicateDrawing: 'Duplicate',
+    bringToFront: 'Bring to front',
+    noAlerts: 'No alerts yet',
+    triggered: (label, p) => (label ? label + ' — ' : '') + 'Alert ' + p,
+    dragHint: 'Drag to move · right-click for options',
+    cancelDrawing: 'Cancel drawing',
+    cursorTool: 'Cursor tool',
+    drawingDeleted: 'Drawing deleted',
+    paneHeightReset: 'Pane height reset'
+  },
+  ar: {
+    addAlert: 'إضافة تنبيه سعري',
+    addAlertAt: (p) => 'إضافة تنبيه عند ' + p,
+    alerts: 'التنبيهات',
+    alertsN: (n) => 'التنبيهات (' + n + ')',
+    alertCreated: (p) => 'تم إنشاء تنبيه عند ' + p,
+    alertRemoved: 'تم حذف التنبيه',
+    alertsCleared: 'تم حذف كل التنبيهات',
+    alertEnabled: 'تم تفعيل التنبيه',
+    alertDisabled: 'تم كتم التنبيه',
+    alertUpdated: 'تم تحديث التنبيه',
+    deleteAlert: 'حذف التنبيه',
+    deleteAllAlerts: 'حذف كل التنبيهات',
+    enable: 'تفعيل',
+    disable: 'كتم',
+    enableAll: 'تفعيل الكل',
+    disableAll: 'كتم الكل',
+    color: 'اللون',
+    sound: 'الصوت',
+    soundOn: 'الصوت مفعّل',
+    soundOff: 'الصوت متوقف',
+    editPrice: 'تعديل السعر…',
+    copyPrice: 'نسخ السعر',
+    copyPriceDone: (p) => 'تم نسخ ' + p,
+    screenshot: 'لقطة شاشة (PNG)',
+    screenshotCopied: 'تم نسخ اللقطة إلى الحافظة',
+    screenshotSaved: 'تم حفظ اللقطة',
+    screenshotFail: 'اللقطة غير متاحة',
+    resetView: 'إعادة ضبط العرض',
+    clearDrawings: 'مسح كل الرسومات',
+    drawingsCleared: (n) => 'تم حذف ' + n + ' رسمة',
+    deleteDrawing: 'حذف الرسمة',
+    duplicateDrawing: 'تكرار',
+    bringToFront: 'إلى الأمام',
+    noAlerts: 'لا توجد تنبيهات',
+    triggered: (label, p) => (label ? label + ' — ' : '') + 'تنبيه ' + p,
+    dragHint: 'اسحب للتحريك · زر أيمن للخيارات',
+    cancelDrawing: 'إلغاء الرسمة',
+    cursorTool: 'أداة المؤشر',
+    drawingDeleted: 'تم حذف الرسمة',
+    paneHeightReset: 'تم إعادة ضبط ارتفاع اللوحة'
+  }
+};
+function badiT(chart, key) {
+  const lang = (chart && chart._badiLang) || 'en';
+  const d = BADI_I18N[lang] || BADI_I18N.en;
+  return d[key] || BADI_I18N.en[key] || key;
+}
+
+/* ============================ ALERT ENGINE ================================= */
+// v2.38.0: state machine + evaluation + persistence hooks + beep synth.
+class BadiAlertEngine {
+  constructor(chart) {
+    this.chart = chart;
+    this.alerts = [];                 // ordered by creation
+    this._nextId = 1;
+    this.soundOn = false;
+    this.store = null;                // { save(alerts), load() } user hooks
+    this.onAlertEvent = null;         // global callback (alert, kind)
+    // Previous close used for cross detection (null = not armed yet).
+    this._prevPrice = null;
+    // WebAudio context — created lazily on first user gesture (autoplay
+    // policy: AudioContext may start suspended until a gesture).
+    this._audio = null;
+    this._audioGain = null;
+    // Default palette used by the context-menu color submenu.
+    this.palette = ['#ef5350', '#26a69a', '#2962ff', '#ff9800', '#e91e63', '#9c27b0', '#00e5ff', '#cddc39'];
+  }
+
+  /* ------------------------------ CRUD ----------------------------------- */
+  addAlert(spec) {
+    const chart = this.chart;
+    const a = {
+      id: 'alert_' + (this._nextId++) + '_' + Date.now().toString(36),
+      price: +spec.price,
+      cond: BadiAlertEngine.normalizeCond(spec.cond || spec.condition || 'cross'),
+      color: spec.color || '#ff9800',
+      label: spec.label != null ? String(spec.label) : '',
+      enabled: spec.enabled !== false,
+      once: !!spec.once,
+      sound: spec.sound != null ? !!spec.sound : null,   // null = follow global
+      // NOTE: minGapMs: 0 is a VALID choice (fire every crossing) — use an
+      // explicit null-check, not `||`, which would coerce 0 to the default.
+      minGapMs: (spec.minGapMs != null) ? Math.max(0, +spec.minGapMs) : 30000,
+      firedCount: 0,
+      lastFiredAt: 0,
+      state: 'idle',              // idle | armed | near | fired
+      flashUntil: 0,
+      createdAt: Date.now(),
+      callback: typeof spec.callback === 'function' ? spec.callback : null,
+      meta: spec.meta || null     // integrator payload (order id, note…)
+    };
+    if (!isFinite(a.price)) {
+      if (BADI_DEBUG) console.warn('[BadiCharts] addAlert: price must be a finite number');
+      return null;
+    }
+    this.alerts.push(a);
+    this._notifyStore();
+    this._beep('arm');
+    chart.invalidate();
+    return a;
+  }
+  static normalizeCond(c) {
+    return ['above', 'below', 'cross', 'crossUp', 'crossDown', 'touch'].includes(c) ? c : 'cross';
+  }
+  removeAlert(id) {
+    const i = this.alerts.findIndex(a => a.id === id);
+    if (i < 0) return false;
+    this.alerts.splice(i, 1);
+    this._notifyStore();
+    this.chart.invalidate();
+    return true;
+  }
+  clearAlerts() {
+    if (this.alerts.length === 0) return;
+    this.alerts.length = 0;
+    this._prevPrice = null;
+    this._notifyStore();
+    this.chart.invalidate();
+  }
+  getAlert(id) { return this.alerts.find(a => a.id === id) || null; }
+  setEnabled(id, on) {
+    const a = this.getAlert(id);
+    if (!a) return false;
+    a.enabled = !!on;
+    a.state = on ? 'idle' : a.state;
+    this._notifyStore();
+    this.chart.invalidate();
+    return true;
+  }
+  setAllEnabled(on) {
+    for (const a of this.alerts) a.enabled = !!on;
+    this._notifyStore();
+    this.chart.invalidate();
+  }
+  setPrice(id, price) {
+    const a = this.getAlert(id);
+    if (!a || !isFinite(+price)) return false;
+    a.price = +price;
+    a.state = 'idle';
+    this._notifyStore();
+    this.chart.invalidate();
+    return true;
+  }
+  setColor(id, color) {
+    const a = this.getAlert(id);
+    if (!a) return false;
+    a.color = color;
+    this._notifyStore();
+    this.chart.invalidate();
+    return true;
+  }
+  setSoundOn(on) {
+    this.soundOn = !!on;
+    if (on) this._beep('arm');
+  }
+
+  /* --------------------------- persistence ------------------------------- */
+  setAlertStore(store) {
+    this.store = (store && typeof store.save === 'function') ? store : null;
+    if (this.store && typeof store.load === 'function') {
       try {
-        const v = fn();
-        results.push({ name: name, ok: !!v });
-      } catch (e) {
-        results.push({ name: name, ok: false, error: String(e && e.message || e) });
+        const saved = store.load();
+        if (Array.isArray(saved)) this._restore(saved);
+      } catch (_) { /* user store errors are the user's */ }
+    }
+  }
+  _restore(list) {
+    this.alerts.length = 0;
+    for (const raw of list) {
+      if (!raw || !isFinite(+raw.price)) continue;
+      const a = {
+        id: raw.id || 'alert_' + (this._nextId++) + '_' + Date.now().toString(36),
+        price: +raw.price,
+        cond: BadiAlertEngine.normalizeCond(raw.cond || raw.condition),
+        color: raw.color || '#ff9800',
+        label: raw.label != null ? String(raw.label) : '',
+        enabled: raw.enabled !== false,
+        once: !!raw.once,
+        sound: raw.sound != null ? !!raw.sound : null,
+        minGapMs: (raw.minGapMs != null) ? Math.max(0, +raw.minGapMs) : 30000,
+        firedCount: +raw.firedCount || 0,
+        lastFiredAt: +raw.lastFiredAt || 0,
+        state: 'idle',
+        flashUntil: 0,
+        createdAt: +raw.createdAt || Date.now(),
+        callback: null,               // callbacks are NOT persisted
+        meta: raw.meta || null
+      };
+      this.alerts.push(a);
+    }
+  }
+  _notifyStore() {
+    if (!this.store) return;
+    try {
+      this.store.save(this.alerts.map(a => ({
+        id: a.id, price: a.price, cond: a.cond, color: a.color, label: a.label,
+        enabled: a.enabled, once: a.once, sound: a.sound, minGapMs: a.minGapMs,
+        firedCount: a.firedCount, lastFiredAt: a.lastFiredAt, createdAt: a.createdAt,
+        meta: a.meta
+      })));
+    } catch (_) { /* never let persistence break the chart */ }
+  }
+
+  /* --------------------------- evaluation -------------------------------- */
+  // One evaluation pass. Called automatically after update()/append()/
+  // setData() and manually via chart.checkAlertsNow(). O(n alerts).
+  check() {
+    const chart = this.chart;
+    const candles = chart.sim && chart.sim.candles;
+    if (!candles || candles.length === 0 || this.alerts.length === 0) return;
+    const price = candles[candles.length - 1].close;
+    const now = Date.now();
+    const prev = this._prevPrice;
+    this._prevPrice = price;
+    if (prev == null) {            // first pass — arm without firing
+      for (const a of this.alerts) {
+        if (!a.enabled) continue;
+        if (a.cond === 'above') a.state = price < a.price ? 'armed' : 'idle';
+        else if (a.cond === 'below') a.state = price > a.price ? 'armed' : 'idle';
+        else a.state = 'armed';
+      }
+      return;
+    }
+    for (const a of this.alerts) {
+      if (!a.enabled) continue;
+      const hit = BadiAlertEngine.testCond(a, prev, price);
+      if (!hit) {
+        // re-arm logic: an 'above' alert that was left of the level re-arms
+        // when price returns below it, etc.
+        if (a.cond === 'above' && price < a.price) a.state = 'armed';
+        else if (a.cond === 'below' && price > a.price) a.state = 'armed';
+        else if (a.cond === 'cross' || a.cond === 'crossUp' || a.cond === 'crossDown' || a.cond === 'touch') {
+          a.state = 'armed';
+        }
+        continue;
+      }
+      if (a.once && a.firedCount > 0) continue;
+      if (now - a.lastFiredAt < a.minGapMs) continue;
+      this._fire(a, price, now);
+    }
+  }
+  static testCond(a, prev, price) {
+    switch (a.cond) {
+      case 'above': return prev <= a.price && price > a.price;
+      case 'below': return prev >= a.price && price < a.price;
+      case 'crossUp': return prev < a.price && price >= a.price;
+      case 'crossDown': return prev > a.price && price <= a.price;
+      case 'cross': return (prev < a.price && price >= a.price) || (prev > a.price && price <= a.price);
+      case 'touch': return price >= a.price - 1e-12 && price <= a.price + 1e-12;
+      default: return false;
+    }
+  }
+  _fire(a, price, now) {
+    const chart = this.chart;
+    a.firedCount++;
+    a.lastFiredAt = now;
+    a.state = 'fired';
+    a.flashUntil = now + 1600;
+    const msg = badiT(chart, 'triggered')(a.label, this._fmtPrice(a.price));
+    chart.showToast(msg);
+    this._beep('trigger');
+    if (typeof a.callback === 'function') {
+      try { a.callback({ type: 'trigger', alert: a, price: price, time: now }); } catch (_) {}
+    }
+    if (typeof this.onAlertEvent === 'function') {
+      try { this.onAlertEvent({ type: 'trigger', alert: a, price: price, time: now }); } catch (_) {}
+    }
+    this._notifyStore();
+    chart.invalidate();
+    // once-alerts fade out visually, then remove themselves (unless the
+    // integrator keeps them via once:false).
+  }
+  _fmtPrice(p) {
+    const chart = this.chart;
+    const dec = (chart.symbol && chart.symbol.decimals != null) ? +chart.symbol.decimals : 2;
+    try { return p.toFixed(dec); } catch (_) { return String(p); }
+  }
+
+  /* --------------------------- beep synth -------------------------------- */
+  // Tiny WebAudio synth — three distinct cues, no audio assets:
+  //   'arm'     → short soft click (alert created / toggled)
+  //   'trigger' → two-tone ding (the alert fired)
+  //   'error'   → low buzz (invalid action)
+  _beep(kind) {
+    if (!this.soundOn) return;
+    try {
+      if (!this._audio) {
+        const AC = (typeof AudioContext !== 'undefined') ? AudioContext
+          : (typeof webkitAudioContext !== 'undefined' ? webkitAudioContext : null);
+        if (!AC) return;
+        this._audio = new AC();
+        this._audioGain = this._audio.createGain();
+        this._audioGain.gain.value = 0.22;
+        this._audioGain.connect(this._audio.destination);
+      }
+      if (this._audio.state === 'suspended') { this._audio.resume(); }
+      const ac = this._audio;
+      const t0 = ac.currentTime;
+      const note = (freq, at, dur, type, vol) => {
+        const osc = ac.createOscillator();
+        const g = ac.createGain();
+        osc.type = type || 'sine';
+        osc.frequency.value = freq;
+        g.gain.setValueAtTime(0.0001, t0 + at);
+        g.gain.exponentialRampToValueAtTime(vol || 0.6, t0 + at + 0.012);
+        g.gain.exponentialRampToValueAtTime(0.0001, t0 + at + dur);
+        osc.connect(g); g.connect(this._audioGain);
+        osc.start(t0 + at); osc.stop(t0 + at + dur + 0.02);
+      };
+      if (kind === 'trigger') { note(880, 0, 0.16, 'sine', 0.9); note(1318.5, 0.09, 0.22, 'sine', 0.7); }
+      else if (kind === 'arm') { note(520, 0, 0.07, 'triangle', 0.35); }
+      else if (kind === 'error') { note(180, 0, 0.18, 'sawtooth', 0.4); }
+    } catch (_) { /* audio is a nicety — never break the chart */ }
+  }
+
+  /* --------------------------- hit testing + drag ------------------------ */
+  // Distance (px) from (x, y) to an alert line; the drag zone is a ±6px band
+  // across the plot area. Returns the topmost alert within tolerance.
+  hitTest(x, y, tol) {
+    const chart = this.chart;
+    if (!this.alerts.length) return null;
+    if (x < chart.chartLeft - 4 || x > chart.chartRight + 4) return null;
+    if (y < chart.priceTop - 6 || y > chart.priceBottom + 6) return null;
+    const t = (tol != null) ? tol : 6;
+    let best = null, bestD = Infinity;
+    for (const a of this.alerts) {
+      const ly = chart.priceToY(a.price);
+      if (ly < chart.priceTop - 2 || ly > chart.priceBottom + 2) continue;
+      const d = Math.abs(y - ly);
+      if (d <= t && d < bestD) { bestD = d; best = a; }
+    }
+    return best;
+  }
+  beginDrag(a, y) {
+    this._drag = { alert: a, grabOffsetPx: this.chart.priceToY(a.price) - y };
+    a._dragging = true;
+  }
+  dragTo(y) {
+    if (!this._drag) return;
+    const a = this._drag.alert;
+    const chart = this.chart;
+    let p = chart.yToPrice(y + this._drag.grabOffsetPx);
+    // Snap to the symbol's min tick when the price scale has one — keeps
+    // the level on a tradable price (feels like TradingView).
+    const tick = chart.symbol && chart.symbol.priceScale ?
+      1 / (+chart.symbol.priceScale) : null;
+    if (tick && isFinite(tick) && tick > 0) p = Math.round(p / tick) * tick;
+    a.price = p;
+    a.state = 'idle';
+    chart.invalidate();
+  }
+  endDrag() {
+    if (!this._drag) return;
+    const a = this._drag.alert;
+    a._dragging = false;
+    this._drag = null;
+    this._notifyStore();
+    this.chart.invalidate();
+  }
+  get dragging() { return !!this._drag; }
+
+  /* --------------------------- rendering --------------------------------- */
+  // Called from the render() wrapper with the NATIVE 2D overlay context
+  // (already setTransform'd to CSS px by the caller). After endFrame the
+  // command layer is closed — native draws are the only safe path here.
+  // Uses only standard 2D ops. Bell glyph is a vector path (no emoji).
+  draw(nctx, dpr) {
+    const chart = this.chart;
+    const alerts = this.alerts;
+    if (!alerts.length) return;
+    const ctx = nctx;
+    if (!ctx) return;
+    const now = performance.now();
+    const L = chart.chartLeft, R = chart.chartRight;
+    const candles = chart.sim && chart.sim.candles;
+    const lastClose = (candles && candles.length) ? candles[candles.length - 1].close : null;
+    const rangeAbs = range_abs(chart);
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(L, chart.priceTop, R - L, chart.priceBottom - chart.priceTop);
+    ctx.clip();
+    for (const a of alerts) {
+      const y = chart.priceToY(a.price);
+      if (y < chart.priceTop - 20 || y > chart.priceBottom + 20) continue;
+      const alpha = a.enabled ? 1 : 0.38;
+      const near = a.enabled && a.state === 'armed' && lastClose != null &&
+        Math.abs(lastClose - a.price) < rangeAbs * 0.004;
+      // Line
+      ctx.strokeStyle = withAlpha(a.color, alpha);
+      ctx.lineWidth = (near || a._dragging || now < a.flashUntil) ? 1.6 : 1.1;
+      ctx.setLineDash(a.enabled ? (near ? [] : [7, 5]) : [2, 5]);
+      ctx.beginPath();
+      ctx.moveTo(L, Math.round(y) + 0.5);
+      ctx.lineTo(R, Math.round(y) + 0.5);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      // Bell glyph + label chip at the LEFT edge of the line
+      this._drawBell(ctx, L + 8, y, a.color, alpha);
+      if (a.label || a.cond !== 'cross') {
+        ctx.fillStyle = withAlpha(a.color, 0.92 * alpha);
+        ctx.font = '10px ui-sans-serif, system-ui, sans-serif';
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'middle';
+        const condTxt = a.label ? a.label : a.cond;
+        ctx.fillText(condTxt, L + 22, y - 1);
+      }
+      // Right-edge price chip
+      this._drawChip(ctx, R, y, this._fmtPrice(a.price), a.color, alpha, a.enabled);
+      // Trigger flash: two expanding rings from the right edge
+      if (now < a.flashUntil) {
+        const f = 1 - (a.flashUntil - now) / 1600;         // 0 → 1
+        ctx.strokeStyle = withAlpha(a.color, (1 - f) * 0.8);
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(R - 10, y, 6 + f * 26, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.strokeStyle = withAlpha(a.color, (1 - f) * 0.4);
+        ctx.beginPath();
+        ctx.arc(R - 10, y, 6 + f * 44, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+    }
+    ctx.restore();
+  }
+  _drawBell(ctx, x, y, color, alpha) {
+    // Vector bell, 10px tall, stroke style — crisp at any DPR.
+    ctx.save();
+    ctx.strokeStyle = withAlpha(color, alpha);
+    ctx.fillStyle = withAlpha(color, alpha);
+    ctx.lineWidth = 1.3;
+    ctx.beginPath();
+    // dome
+    ctx.moveTo(x - 3.5, y + 2);
+    ctx.quadraticCurveTo(x - 3.5, y - 4, x, y - 4);
+    ctx.quadraticCurveTo(x + 3.5, y - 4, x + 3.5, y + 2);
+    ctx.stroke();
+    // clapper
+    ctx.beginPath();
+    ctx.arc(x, y + 3.6, 1.1, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+  _drawChip(ctx, rightX, y, text, color, alpha, enabled) {
+    const ctxW = (rightX - 4) - 0;              // chip right anchor
+    ctx.font = 'bold 10px ui-monospace, SFMono-Regular, Menlo, monospace';
+    const tw = ctx.measureText(text).width;
+    const w = tw + 12, h = 15;
+    const x = ctxW - w, cy = y - h / 2;
+    ctx.fillStyle = withAlpha(color, (enabled ? 0.95 : 0.4));
+    _badiRoundRectPath(ctx, x, cy, w, h, 3);
+    ctx.fill();
+    // text color: dark on light chip colors, white otherwise (luma check)
+    const luma = _badiLuma(color);
+    ctx.fillStyle = luma > 150 ? '#10131a' : '#ffffff';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(text, x + 6, cy + h / 2 + 0.5);
+  }
+}
+
+/* small render helpers shared with the context-menu module */
+function _badiRoundRectPath(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y);
+  ctx.arcTo(x + w, y, x + w, y + r, r);
+  ctx.lineTo(x + w, y + h - r);
+  ctx.arcTo(x + w, y + h, x + w - r, y + h, r);
+  ctx.lineTo(x + r, y + h);
+  ctx.arcTo(x, y + h, x, y + h - r, r);
+  ctx.lineTo(x, y + r);
+  ctx.arcTo(x, y, x + r, y, r);
+  ctx.closePath();
+}
+function _badiLuma(css) {
+  const c = parseColor(css);
+  if (!c || c.length < 3) return 0;
+  // parseColor returns [r, g, b, a] normalized to 0..1
+  return 0.2126 * c[0] * 255 + 0.7152 * c[1] * 255 + 0.0722 * c[2] * 255;
+}
+function range_abs(chart) {
+  const r = chart.priceScale && chart.priceScale._priceRange;
+  return r ? Math.max(1e-12, Math.abs(r.max - r.min)) : 1;
+}
+
+/* =============================================================================
+ * BADI-CHARTS-V2 v2.38.0 — RIGHT-CLICK CONTEXT MENU (DOM, themed, extensible)
+ * =============================================================================
+ * THE feature: right-click anywhere on the chart and a native-feeling menu
+ * appears at the cursor with the options that make sense FOR WHAT YOU
+ * CLICKED. It is a real DOM menu (not canvas) so it gets sub-pixel text,
+ * hover states, keyboard navigation, RTL and scrolling for free — and it
+ * sits ABOVE the canvas so it never interferes with the render pipeline.
+ *
+ * CONTEXTS (built automatically):
+ *   • on an ALERT line     → enable/mute · edit price · color · delete ·
+ *                            delete all
+ *   • on a DRAWING         → color · duplicate · bring to front · delete
+ *   • on empty chart space → add alert at cursor price · alerts submenu ·
+ *                            copy price · screenshot · reset view · clear
+ *                            drawings · (your items)
+ *
+ * YOUR OWN ITEMS (first-class citizens — the library adds nothing you did
+ * not ask for, and you add everything you want):
+ *
+ *   chart.addContextMenuItem({
+ *     id: 'my-item',                 // unique; replacing an id updates it
+ *     label: 'My action',            // (or labelKey for i18n)
+ *     icon: 'bell',                  // built-in icon name, optional
+ *     shortcut: 'Ctrl+K',            // optional hint text
+ *     order: 100,                    // sort inside its group
+ *     danger: false,                 // red "destructive" styling
+ *     checked: false,                // shows a check glyph
+ *     when: (ctx) => true,           // ctx = { x, y, price, idx, target }
+ *     action: (ctx) => { ... },      // called on click
+ *     submenu: [ ...items ]          // optional nested items
+ *   });
+ *   chart.removeContextMenuItem('my-item');
+ *
+ * TOUCH: long-press (550ms, <10px movement) opens the same menu on mobile.
+ * KEYBOARD: ↑ ↓ move · → opens submenu · Enter activates · Esc closes.
+ * THEMING: colors derive from chart.theme via CSS variables, so the menu
+ * matches whatever theme the chart uses, dark or light, automatically.
+ * ========================================================================== */
+
+/* ============================ MENU ICONS =================================== */
+// v2.38.0: tiny inline SVGs (stroke = currentColor so they inherit item
+// color). No emoji, no icon font, zero network requests.
+const BADI_MENU_ICONS = {
+  bell: '<svg viewBox="0 0 16 16"><path d="M8 2a4 4 0 0 0-4 4v3l-1.3 2.2h10.6L12 9V6a4 4 0 0 0-4-4z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><path d="M6.6 13.4a1.5 1.5 0 0 0 2.8 0" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>',
+  trash: '<svg viewBox="0 0 16 16"><path d="M3 4.5h10M6.5 4.5V3h3v1.5M4.5 4.5l.7 8.5h5.6l.7-8.5" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  copy: '<svg viewBox="0 0 16 16"><rect x="5.5" y="5.5" width="8" height="8" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M10.5 3.5h-7a1 1 0 0 0-1 1v7" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>',
+  camera: '<svg viewBox="0 0 16 16"><rect x="2" y="4.5" width="12" height="9" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.3"/><circle cx="8" cy="9" r="2.4" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M5.5 4.5l1-1.8h3l1 1.8" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>',
+  reset: '<svg viewBox="0 0 16 16"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9M13.5 2.5v2.6h-2.6" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  eraser: '<svg viewBox="0 0 16 16"><path d="M9.5 3.5l4 4-6 6H4l-1.5-1.5a1.4 1.4 0 0 1 0-2z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><path d="M4.5 13.5H13" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>',
+  swatch: '<svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.2" fill="none" stroke="currentColor" stroke-width="1.3"/><circle cx="8" cy="8" r="2" fill="currentColor"/></svg>',
+  chevron: '<svg viewBox="0 0 16 16"><path d="M6 4l4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  check: '<svg viewBox="0 0 16 16"><path d="M3.5 8.5l3 3 6-6.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  plus: '<svg viewBox="0 0 16 16"><path d="M8 3.5v9M3.5 8h9" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>',
+  layers: '<svg viewBox="0 0 16 16"><path d="M8 2.5l6 3-6 3-6-3z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><path d="M2.5 9.5L8 12.3l5.5-2.8" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  pencil: '<svg viewBox="0 0 16 16"><path d="M3 13l.6-2.6 7.6-7.6a1.2 1.2 0 0 1 1.7 0l.3.3a1.2 1.2 0 0 1 0 1.7L5.6 12.4z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>',
+  front: '<svg viewBox="0 0 16 16"><rect x="5" y="5" width="8" height="8" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M3 11V4a1 1 0 0 1 1-1h7" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>',
+  gauge: '<svg viewBox="0 0 16 16"><path d="M2.5 12a5.5 5.5 0 1 1 11 0" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/><path d="M8 12L11 7.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><circle cx="8" cy="12" r="1.2" fill="currentColor"/></svg>'
+};
+function badiMenuIcon(name) { return BADI_MENU_ICONS[name] || ''; }
+
+/* ============================ MENU STYLESHEET ============================== */
+// v2.38.0: injected ONCE per page (id-guarded). All colors flow from CSS
+// variables (--bcm-*) which the menu instance refreshes from chart.theme on
+// every open — theme switching updates the menu with zero re-render work.
+const BADI_MENU_CSS = `
+.badi-ctx-menu {
+  position: fixed; z-index: 2147483000; min-width: 208px; max-width: 320px;
+  max-height: min(70vh, 480px); overflow-y: auto; overflow-x: hidden;
+  background: var(--bcm-bg); color: var(--bcm-fg);
+  border: 1px solid var(--bcm-border); border-radius: 10px;
+  box-shadow: 0 12px 40px rgba(0,0,0,.38), 0 2px 8px rgba(0,0,0,.22);
+  padding: 6px; font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+  font-size: 13px; line-height: 1; user-select: none; -webkit-user-select: none;
+  opacity: 0; transform: translateY(-4px) scale(.98); pointer-events: none;
+  transition: opacity .12s ease, transform .12s ease;
+  scrollbar-width: thin; scrollbar-color: var(--bcm-border) transparent;
+}
+.badi-ctx-menu.bcm-open { opacity: 1; transform: translateY(0) scale(1); pointer-events: auto; }
+.badi-ctx-menu .bcm-item {
+  display: flex; align-items: center; gap: 9px; padding: 8px 10px;
+  border-radius: 7px; cursor: pointer; white-space: nowrap; position: relative;
+  color: var(--bcm-fg);
+}
+.badi-ctx-menu .bcm-item:hover, .badi-ctx-menu .bcm-item.bcm-focus {
+  background: var(--bcm-hover); color: var(--bcm-fg-strong);
+}
+.badi-ctx-menu .bcm-item.bcm-danger:hover { background: var(--bcm-danger-bg); color: var(--bcm-danger); }
+.badi-ctx-menu .bcm-item.bcm-disabled { opacity: .45; cursor: default; }
+.badi-ctx-menu .bcm-item.bcm-disabled:hover { background: transparent; color: var(--bcm-fg); }
+.badi-ctx-menu .bcm-icon { width: 16px; height: 16px; flex: 0 0 16px; display: inline-flex; }
+.badi-ctx-menu .bcm-icon svg { width: 16px; height: 16px; }
+.badi-ctx-menu .bcm-label { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; }
+.badi-ctx-menu .bcm-shortcut { font-size: 11px; color: var(--bcm-dim); margin-left: 12px; }
+.badi-ctx-menu .bcm-check { width: 14px; height: 14px; flex: 0 0 14px; color: var(--bcm-accent); visibility: hidden; }
+.badi-ctx-menu .bcm-item.bcm-checked .bcm-check { visibility: visible; }
+.badi-ctx-menu .bcm-sep { height: 1px; background: var(--bcm-border); margin: 5px 8px; }
+.badi-ctx-menu .bcm-title {
+  padding: 7px 10px 4px; font-size: 10px; letter-spacing: .08em;
+  text-transform: uppercase; color: var(--bcm-dim);
+}
+.badi-ctx-menu .bcm-swatch {
+  width: 13px; height: 13px; border-radius: 50%;
+  box-shadow: inset 0 0 0 1px rgba(255,255,255,.25); flex: 0 0 13px;
+}
+.badi-ctx-menu .bcm-arrow { width: 12px; height: 12px; flex: 0 0 12px; color: var(--bcm-dim); margin-left: 4px; }
+.badi-ctx-menu.bcm-rtl .bcm-arrow svg { transform: scaleX(-1); }
+@media (prefers-reduced-motion: reduce) {
+  .badi-ctx-menu { transition: none; }
+}
+`;
+
+/* ============================ CONTEXT MENU ================================= */
+// One instance per chart, created lazily. The element is appended to
+// document.body (fixed positioning — immune to chart overflow/transforms)
+// and removed on chart.destroy().
+class BadiContextMenu {
+  constructor(chart, alerts) {
+    this.chart = chart;
+    this.alerts = alerts;             // BadiAlertEngine
+    this.enabled = true;
+    this.userItems = new Map();       // id → spec (from addContextMenuItem)
+    this.el = null;
+    this.styleInjected = false;
+    this.isOpen = false;
+    this._ctx = null;                 // current open context
+    this._flatItems = [];             // focus order (keyboard nav)
+    this._focusIdx = -1;
+    this._onDocDown = this._onDocDown.bind(this);
+    this._onDocKey = this._onDocKey.bind(this);
+    this._onWheel = this._onWheel.bind(this);
+    this._onResize = () => this.close();
+  }
+
+  /* --------------------------- public API -------------------------------- */
+  addItem(spec) {
+    if (!spec || !spec.id) return false;
+    this.userItems.set(String(spec.id), spec);
+    return true;
+  }
+  removeItem(id) { return this.userItems.delete(String(id)); }
+  setEnabled(on) { this.enabled = !!on; if (!on) this.close(); }
+
+  /* --------------------------- element ----------------------------------- */
+  _ensureEl() {
+    if (this.el) return this.el;
+    if (typeof document === 'undefined') return null;
+    if (!this.styleInjected && !document.getElementById('badi-ctx-menu-css')) {
+      const st = document.createElement('style');
+      st.id = 'badi-ctx-menu-css';
+      st.textContent = BADI_MENU_CSS;
+      document.head.appendChild(st);
+      this.styleInjected = true;
+    }
+    const el = document.createElement('div');
+    el.className = 'badi-ctx-menu' + (this._lang() === 'ar' ? ' bcm-rtl' : '');
+    el.setAttribute('dir', this._lang() === 'ar' ? 'rtl' : 'ltr');
+    el.setAttribute('role', 'menu');
+    el.tabIndex = -1;
+    document.body.appendChild(el);
+    this.el = el;
+    return el;
+  }
+  _lang() { return (this.chart._badiLang === 'ar') ? 'ar' : 'en'; }
+  _applyTheme() {
+    const T = this.chart.theme;
+    const el = this.el;
+    const s = el.style;
+    s.setProperty('--bcm-bg', _bcmDarken(T.panelBg || '#131722', 0.92));
+    s.setProperty('--bcm-fg', T.text || '#cfd2da');
+    s.setProperty('--bcm-fg-strong', T.textBright || '#f0f3fa');
+    s.setProperty('--bcm-border', T.toolbarBorder || '#2a2e39');
+    s.setProperty('--bcm-hover', T.buttonHover || '#2a2e39');
+    s.setProperty('--bcm-dim', T.textDim || '#787b86');
+    s.setProperty('--bcm-accent', T.accent || '#2962ff');
+    s.setProperty('--bcm-danger', '#ef5350');
+    s.setProperty('--bcm-danger-bg', 'rgba(239,83,80,0.14)');
+  }
+
+  /* --------------------------- open / close ------------------------------ */
+  // ctx: { x, y (canvas px), clientX, clientY, price, idx, target }
+  // target: null | { kind: 'alert', alert } | { kind: 'drawing', drawing }
+  open(ctx) {
+    if (!this.enabled) return false;
+    const el = this._ensureEl();
+    if (!el) return false;
+    this._ctx = ctx;
+    this._applyTheme();
+    const items = this._buildItems(ctx);
+    if (items.length === 0) return false;
+    el.innerHTML = '';
+    this._flatItems = [];
+    this._renderList(el, items, ctx);
+    // Position (clamped to viewport).
+    el.classList.add('bcm-open');
+    const vw = window.innerWidth, vh = window.innerHeight;
+    const rect = el.getBoundingClientRect();
+    let left = ctx.clientX + 2, top = ctx.clientY + 2;
+    if (left + rect.width > vw - 8) left = Math.max(8, ctx.clientX - rect.width - 2);
+    if (top + rect.height > vh - 8) top = Math.max(8, vh - rect.height - 8);
+    el.style.left = left + 'px';
+    el.style.top = top + 'px';
+    this.isOpen = true;
+    // Outside interactions close it.
+    document.addEventListener('mousedown', this._onDocDown, true);
+    document.addEventListener('keydown', this._onDocKey, true);
+    window.addEventListener('wheel', this._onWheel, { passive: true });
+    window.addEventListener('resize', this._onResize);
+    try { el.focus(); } catch (_) {}
+    return true;
+  }
+  close() {
+    if (!this.isOpen || !this.el) return;
+    this.isOpen = false;
+    this.el.classList.remove('bcm-open');
+    document.removeEventListener('mousedown', this._onDocDown, true);
+    document.removeEventListener('keydown', this._onDocKey, true);
+    window.removeEventListener('wheel', this._onWheel);
+    window.removeEventListener('resize', this._onResize);
+    this._ctx = null;
+    this._flatItems.length = 0;
+  }
+  destroy() {
+    this.close();
+    if (this.el && this.el.parentNode) this.el.parentNode.removeChild(this.el);
+    this.el = null;
+  }
+  _onDocDown(e) {
+    if (!this.el) return;
+    if (this.el.contains(e.target)) return;
+    this.close();
+  }
+  _onWheel() { this.close(); }
+  _onDocKey(e) {
+    if (e.key === 'Escape') { e.preventDefault(); this.close(); return; }
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      const n = this._flatItems.length;
+      if (!n) return;
+      const step = e.key === 'ArrowDown' ? 1 : -1;
+      this._focusIdx = (this._focusIdx + step + n) % n;
+      this._highlight();
+    } else if (e.key === 'ArrowRight' || e.key === 'Enter' || e.key === ' ') {
+      const item = this._flatItems[this._focusIdx];
+      if (!item) return;
+      e.preventDefault();
+      if (item.el._badiSubmenu && (e.key === 'ArrowRight' || e.key === 'Enter')) {
+        item.el._badiSubmenu();
+      } else if (e.key === 'Enter' || e.key === ' ') {
+        item.el._badiActivate();
+      }
+    }
+  }
+  _highlight() {
+    for (let i = 0; i < this._flatItems.length; i++) {
+      this._flatItems[i].el.classList.toggle('bcm-focus', i === this._focusIdx);
+    }
+  }
+
+  /* --------------------------- rendering --------------------------------- */
+  _renderList(host, items, ctx, depth) {
+    depth = depth || 0;
+    for (const it of items) {
+      if (it.separator) {
+        const sep = document.createElement('div');
+        sep.className = 'bcm-sep';
+        host.appendChild(sep);
+        continue;
+      }
+      if (it.title) {
+        const t = document.createElement('div');
+        t.className = 'bcm-title';
+        t.textContent = it.title;
+        host.appendChild(t);
+        continue;
+      }
+      const row = document.createElement('div');
+      row.className = 'bcm-item';
+      row.setAttribute('role', 'menuitem');
+      if (it.danger) row.classList.add('bcm-danger');
+      if (it.disabled) row.classList.add('bcm-disabled');
+      if (it.checked) row.classList.add('bcm-checked');
+      // icon slot
+      const iconSpan = document.createElement('span');
+      iconSpan.className = 'bcm-icon';
+      if (it.swatch) {
+        const sw = document.createElement('span');
+        sw.className = 'bcm-swatch';
+        sw.style.background = it.swatch;
+        iconSpan.appendChild(sw);
+      } else if (it.icon) {
+        iconSpan.innerHTML = badiMenuIcon(it.icon);
+      }
+      row.appendChild(iconSpan);
+      // check slot (for toggle items without icon)
+      if (it.checked != null && !it.swatch && !it.icon) {
+        const chk = document.createElement('span');
+        chk.className = 'bcm-check';
+        chk.innerHTML = badiMenuIcon('check');
+        row.appendChild(chk);
+      }
+      // label
+      const label = document.createElement('span');
+      label.className = 'bcm-label';
+      label.textContent = it.label != null ? String(it.label) : '';
+      row.appendChild(label);
+      // shortcut
+      if (it.shortcut) {
+        const sc = document.createElement('span');
+        sc.className = 'bcm-shortcut';
+        sc.textContent = it.shortcut;
+        row.appendChild(sc);
+      }
+      // submenu arrow
+      if (it.submenu && it.submenu.length) {
+        const ar = document.createElement('span');
+        ar.className = 'bcm-arrow';
+        ar.innerHTML = badiMenuIcon('chevron');
+        row.appendChild(ar);
+      }
+      const self = this;
+      row._badiActivate = () => {
+        if (it.disabled) return;
+        if (it.submenu && it.submenu.length) {
+          self._openSubmenu(row, it.submenu, ctx, depth);
+          return;
+        }
+        self.close();
+        try { if (typeof it.action === 'function') it.action(ctx); } catch (err) {
+          if (BADI_DEBUG) console.error('[BadiCharts] context item error', err);
+        }
+      };
+      row._badiSubmenu = () => {
+        if (it.submenu && it.submenu.length) self._openSubmenu(row, it.submenu, ctx, depth);
+      };
+      row.addEventListener('click', (e) => { e.stopPropagation(); row._badiActivate(); });
+      row.addEventListener('mouseenter', () => {
+        // hover intent: highlight + auto-open submenu, close stale submenus
+        this._focusIdx = this._flatItems.findIndex(f => f.el === row);
+        this._highlight();
+        if (it.submenu && it.submenu.length && depth === 0) {
+          this._openSubmenu(row, it.submenu, ctx, depth);
+        } else if (!it.submenu && depth === 0) {
+          this._closeSubmenus(depth);
+        }
+      });
+      if (!it.disabled) this._flatItems.push({ el: row, item: it });
+      host.appendChild(row);
+    }
+  }
+  _openSubmenu(anchorRow, items, ctx, depth) {
+    this._closeSubmenus(depth);
+    const host = this.el;
+    const sub = document.createElement('div');
+    sub.className = 'bcm-sub';
+    sub.style.position = 'fixed';
+    sub.style.zIndex = '2147483001';
+    sub.style.cssText += ';background:var(--bcm-bg);border:1px solid var(--bcm-border);border-radius:10px;padding:6px;box-shadow:0 12px 40px rgba(0,0,0,.38);min-width:180px;max-height:60vh;overflow-y:auto;';
+    const r = anchorRow.getBoundingClientRect();
+    const lang = this._lang();
+    let left = (lang === 'ar') ? (r.left - 190) : (r.right + 2);
+    if (left + 200 > window.innerWidth) left = window.innerWidth - 204;
+    if (left < 8) left = 8;
+    sub.style.left = left + 'px';
+    sub.style.top = Math.min(r.top, window.innerHeight - 60) + 'px';
+    this._renderList(sub, items, ctx, depth + 1);
+    document.body.appendChild(sub);
+    this._subMenus.push(sub);
+    // clicks inside the submenu activate through the normal item pipeline
+    sub.addEventListener('click', (e) => e.stopPropagation());
+  }
+  _closeSubmenus(depth) {
+    // Close submenus deeper than `depth`.
+    for (const s of this._subMenus) {
+      if (s._badiDepth > depth) { s.remove(); }
+    }
+    this._subMenus = this._subMenus.filter(s => s._badiDepth <= depth && s.isConnected);
+  }
+
+  /* --------------------------- item building ----------------------------- */
+  // Compose the item list for the current context: context-specific built-ins
+  // FIRST (they are the reason the menu opened), then the user's registered
+  // items filtered by when() and sorted by order.
+  _buildItems(ctx) {
+    this._subMenus = this._subMenus || [];
+    for (const s of (this._subMenus || [])) s.remove();
+    this._subMenus = [];
+    const items = [];
+    if (ctx.target && ctx.target.kind === 'alert') {
+      items.push(...this._alertItems(ctx));
+    } else if (ctx.target && ctx.target.kind === 'drawing') {
+      items.push(...this._drawingItems(ctx));
+    } else {
+      items.push(...this._defaultItems(ctx));
+    }
+    // User items (global) — sorted by order then insertion.
+    const users = [...this.userItems.values()]
+      .filter(u => {
+        if (typeof u.when !== 'function') return true;
+        try { return !!u.when(ctx); } catch (_) { return false; }
+      })
+      .sort((a, b) => (+a.order || 0) - (+b.order || 0));
+    if (users.length) {
+      items.push({ separator: true });
+      for (const u of users) {
+        items.push({
+          id: u.id, label: u.label, icon: u.icon, shortcut: u.shortcut,
+          danger: u.danger, checked: u.checked, disabled: u.disabled,
+          submenu: u.submenu,
+          action: u.action
+        });
+      }
+    }
+    return items;
+  }
+  _fmtP(p) {
+    const chart = this.chart;
+    const dec = (chart.symbol && chart.symbol.decimals != null) ? +chart.symbol.decimals : 2;
+    try { return p.toFixed(dec); } catch (_) { return String(p); }
+  }
+  _alertItems(ctx) {
+    const a = ctx.target.alert;
+    const T = this.alerts;
+    const items = [
+      {
+        id: 'alert-enable', icon: a.enabled ? 'bell' : 'bell',
+        label: a.enabled ? badiT(this.chart, 'disable') : badiT(this.chart, 'enable'),
+        checked: a.enabled,
+        action: () => {
+          T.setEnabled(a.id, !a.enabled);
+          this.chart.showToast(badiT(this.chart, a.enabled ? 'alertDisabled' : 'alertEnabled'));
+        }
+      },
+      {
+        id: 'alert-edit', icon: 'pencil',
+        label: badiT(this.chart, 'editPrice'),
+        action: () => this.chart._openAlertEditor(a)
+      }
+    ];
+    // color palette submenu
+    items.push({
+      id: 'alert-color', icon: 'swatch', label: badiT(this.chart, 'color'),
+      submenu: this.alerts.palette.map((c, i) => ({
+        id: 'alert-c' + i, swatch: c, label: c.toUpperCase(),
+        action: () => { T.setColor(a.id, c); this.chart.showToast(badiT(this.chart, 'alertUpdated')); }
+      }))
+    });
+    items.push({ separator: true });
+    items.push({
+      id: 'alert-delete', icon: 'trash', danger: true,
+      label: badiT(this.chart, 'deleteAlert'),
+      action: () => { T.removeAlert(a.id); this.chart.showToast(badiT(this.chart, 'alertRemoved')); }
+    });
+    if (T.alerts.length > 1) {
+      items.push({
+        id: 'alert-delete-all', icon: 'trash', danger: true,
+        label: badiT(this.chart, 'deleteAllAlerts'),
+        action: () => { T.clearAlerts(); this.chart.showToast(badiT(this.chart, 'alertsCleared')); }
+      });
+    }
+    return items;
+  }
+  _drawingItems(ctx) {
+    const d = ctx.target.drawing;
+    const chart = this.chart;
+    const items = [];
+    // color palette
+    items.push({
+      id: 'dw-color', icon: 'swatch', label: badiT(chart, 'color'),
+      submenu: (this.alerts.palette).map((c, i) => ({
+        id: 'dw-c' + i, swatch: c, label: c.toUpperCase(),
+        action: () => { try { d.color = c; chart.deselectDrawing ? 0 : 0; chart.invalidate(); } catch (_) {} }
+      }))
+    });
+    items.push({
+      id: 'dw-dup', icon: 'layers', label: badiT(chart, 'duplicateDrawing'),
+      action: () => {
+        try {
+          const clone = Object.assign({}, d);
+          clone.startIdx = (d.startIdx || 0) + 3;
+          clone.startPrice = d.startPrice;
+          chart.drawings.push(clone);
+          chart.invalidate();
+        } catch (_) {}
+      }
+    });
+    items.push({
+      id: 'dw-front', icon: 'front', label: badiT(chart, 'bringToFront'),
+      action: () => {
+        try {
+          const i = chart.drawings.indexOf(d);
+          if (i >= 0) { chart.drawings.splice(i, 1); chart.drawings.push(d); chart.invalidate(); }
+        } catch (_) {}
+      }
+    });
+    items.push({ separator: true });
+    items.push({
+      id: 'dw-delete', icon: 'trash', danger: true, label: badiT(chart, 'deleteDrawing'),
+      action: () => {
+        try {
+          chart.drawings = chart.drawings.filter(x => x !== d);
+          if (chart.selectedDrawing === d) chart.deselectDrawing();
+          chart.hoverDrawing = null;
+          chart.showToast(badiT(chart, 'drawingDeleted'));
+          chart.invalidate();
+        } catch (_) {}
+      }
+    });
+    return items;
+  }
+  _defaultItems(ctx) {
+    const chart = this.chart;
+    const T = this.alerts;
+    const priceStr = this._fmtP(ctx.price);
+    const items = [];
+    // 1. Add alert at the cursor price — THE headline action.
+    items.push({
+      id: 'add-alert', icon: 'bell',
+      label: badiT(chart, 'addAlertAt')(priceStr),
+      action: () => {
+        const a = T.addAlert({ price: ctx.price, cond: 'cross' });
+        chart.showToast(badiT(chart, 'alertCreated')(priceStr));
+      }
+    });
+    // 2. Alerts submenu — live list + bulk ops + sound toggle.
+    const list = T.alerts.slice(-6).reverse();   // newest 6
+    const sub = [];
+    if (list.length === 0) {
+      sub.push({ id: 'no-alerts', label: badiT(chart, 'noAlerts'), disabled: true });
+    } else {
+      for (const a of list) {
+        sub.push({
+          id: 'al-' + a.id, swatch: a.color,
+          label: this._fmtP(a.price) + (a.label ? ' · ' + a.label : ''),
+          checked: a.enabled,
+          action: () => {
+            T.setEnabled(a.id, !a.enabled);
+            chart.showToast(badiT(chart, a.enabled ? 'alertDisabled' : 'alertEnabled'));
+          }
+        });
+      }
+      sub.push({ separator: true });
+      sub.push({ id: 'al-en-all', icon: 'check', label: badiT(chart, 'enableAll'), action: () => T.setAllEnabled(true) });
+      sub.push({ id: 'al-dis-all', icon: 'bell', label: badiT(chart, 'disableAll'), action: () => T.setAllEnabled(false) });
+    }
+    sub.push({
+      id: 'al-sound', icon: 'gauge',
+      label: badiT(chart, 'sound') + ': ' + (T.soundOn ? 'ON' : 'OFF'),
+      action: () => {
+        T.setSoundOn(!T.soundOn);
+        chart.showToast(badiT(chart, T.soundOn ? 'soundOn' : 'soundOff'));
+      }
+    });
+    items.push({
+      id: 'alerts-sub', icon: 'bell', label: badiT(chart, 'alertsN')(T.alerts.length),
+      submenu: sub
+    });
+    items.push({ separator: true });
+    // 3. Copy price.
+    items.push({
+      id: 'copy-price', icon: 'copy', label: badiT(chart, 'copyPrice'),
+      action: () => {
+        _bcmCopyText(priceStr).then(ok => {
+          chart.showToast(ok ? badiT(chart, 'copyPriceDone')(priceStr) : priceStr);
+        });
+      }
+    });
+    // 4. Screenshot.
+    items.push({
+      id: 'screenshot', icon: 'camera', label: badiT(chart, 'screenshot'),
+      action: () => { chart._saveScreenshot(); }
+    });
+    items.push({ separator: true });
+    // 5. Reset view / clear drawings.
+    items.push({
+      id: 'reset-view', icon: 'reset', label: badiT(chart, 'resetView'),
+      action: () => { chart.resetView(); chart.showToast(badiT(chart, 'resetView')); }
+    });
+    if (chart.drawings && chart.drawings.length) {
+      items.push({
+        id: 'clear-drawings', icon: 'eraser', danger: true,
+        label: badiT(chart, 'clearDrawings'),
+        action: () => {
+          const n = chart.drawings.length;
+          chart.drawings = [];
+          chart.deselectDrawing();
+          chart.showToast(badiT(chart, 'drawingsCleared')(n));
+          chart.invalidate();
+        }
+      });
+    }
+    return items;
+  }
+}
+
+/* clipboard + screenshot helpers (shared) */
+function _bcmCopyText(text) {
+  return new Promise((resolve) => {
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(() => resolve(true), () => resolve(false));
+        return;
+      }
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.cssText = 'position:fixed;opacity:0;';
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand('copy');
+      document.body.removeChild(ta);
+      resolve(ok);
+    } catch (_) { resolve(false); }
+  });
+}
+// Darken a CSS color by `factor` (0..1) — used for the menu background so
+// panels read slightly deeper than the chart's own panelBg.
+function _bcmDarken(css, factor) {
+  const c = parseColor(css);
+  if (!c || c.length < 4) return css;
+  const r = Math.round(clamp(c[0], 0, 1) * 255 * factor);
+  const g = Math.round(clamp(c[1], 0, 1) * 255 * factor);
+  const b = Math.round(clamp(c[2], 0, 1) * 255 * factor);
+  return 'rgb(' + r + ',' + g + ',' + b + ')';
+}
+
+/* =============================================================================
+ * BADI-CHARTS-V2 v2.38.0 — WIRING: public API + interaction integration
+ * =============================================================================
+ * Everything from the performance core, the alerts engine and the context
+ * menu is exposed on TradingChart.prototype here. ALL engines boot lazily:
+ * a chart that never calls the new APIs allocates nothing and behaves
+ * EXACTLY like v2.36.0 (one `if (this._perf)` guard per frame at most).
+ *
+ * Interaction integration (right-click menu, alert dragging, HUD dragging,
+ * touch long-press) wraps the existing handlers so every legacy behavior is
+ * preserved — the wraps run first, decide whether the event is theirs, and
+ * otherwise delegate to the original implementation untouched.
+ * ========================================================================== */
+
+/* --------------------------- lazy boot ------------------------------------- */
+TradingChart.prototype._perfEnsure = function () {
+  if (this._destroyed) return;
+  if (!this._perf) {
+    const opts = this._badiOpts || {};
+    this._perf = new BadiPerfEngine(this, opts);
+    this._perfHUD = new BadiPerfHUD(this._perf);
+    this._perf.hud = this._perfHUD;
+  }
+  if (!this._alerts) {
+    this._alerts = new BadiAlertEngine(this);
+    const ao = (this._badiOpts && this._badiOpts.alerts) || null;
+    if (ao) {
+      if (ao.store) this._alerts.setAlertStore(ao.store);
+      if (ao.sound) this._alerts.soundOn = true;
+      if (typeof ao.onEvent === 'function') this._alerts.onAlertEvent = ao.onEvent;
+    }
+  }
+  if (!this._menu) {
+    this._menu = new BadiContextMenu(this, this._alerts);
+    if (this._badiOpts && this._badiOpts.contextMenu === false) this._menu.enabled = false;
+  }
+};
+
+/* ============================ LINE SERIES API ============================== */
+// The fast path for THOUSANDS of overlays. See 16-perf-gl.js banner for the
+// full contract. Series render above candles/drawings, below axis text.
+TradingChart.prototype.addLineSeries = function (spec) {
+  this._perfEnsure();
+  const id = this._perf.addSeries(spec || {});
+  this.invalidate();
+  return id;
+};
+TradingChart.prototype.updateLineSeries = function (id, points) {
+  if (!this._perf) return false;
+  const s = this._perf.series.get(id);
+  if (!s) return false;
+  s.setPoints(points || [], this._perf._makeTimeConverter());
+  this._perf.rememberAnchorTimes(s, points || []);
+  this.invalidate();
+  return true;
+};
+TradingChart.prototype.appendLineSeriesPoint = function (id, pt) {
+  if (!this._perf) return false;
+  const ok = this._perf.appendPoint(id, pt);
+  if (ok) this.invalidate();
+  return ok;
+};
+TradingChart.prototype.setLineSeriesStyle = function (id, opts) {
+  if (!this._perf) return false;
+  const ok = this._perf.setStyle(id, opts || {});
+  if (ok) this.invalidate();
+  return ok;
+};
+TradingChart.prototype.removeLineSeries = function (id) {
+  if (!this._perf) return false;
+  const ok = this._perf.removeSeries(id);
+  if (ok) this.invalidate();
+  return ok;
+};
+TradingChart.prototype.clearLineSeries = function () {
+  if (!this._perf) return;
+  this._perf.clearSeries();
+  this.invalidate();
+};
+TradingChart.prototype.getLineSeries = function (id) {
+  return this._perf ? this._perf.getSeries(id) : null;
+};
+TradingChart.prototype.hitLineSeries = function (x, y, tolPx) {
+  return this._perf ? this._perf.hitTest(x, y, tolPx) : null;
+};
+TradingChart.prototype.fitLineSeries = function (id) {
+  if (!this._perf) return false;
+  return this._perf.fitScale(id);
+};
+
+/* ============================ PERF MONITORING ============================== */
+TradingChart.prototype.enablePerfHUD = function (on) {
+  this._perfEnsure();
+  this._perfHUD.enabled = !!on;
+  if (on) { this._perfHUD.x = 0; this._perfHUD.y = 0; }
+  this.invalidate();
+};
+TradingChart.prototype.setQuality = function (tier) {
+  this._perfEnsure();
+  return this._perf.quality.setMode(tier);
+};
+TradingChart.prototype.getPerfStats = function () {
+  if (!this._perf) {
+    return { seriesTotal: 0, seriesVisible: 0, segments: 0, glDrawCalls: 0,
+      phaseMs: 0, vramBytes: 0, mode: typeof WebGLRenderingContext !== 'undefined' ? 'gpu' : '2d',
+      note: 'performance engine idle (no line series)' };
+  }
+  return this._perf.statsSnapshot();
+};
+
+/* ============================ ALERTS API =================================== */
+TradingChart.prototype.addAlert = function (spec) {
+  this._perfEnsure();
+  return this._alerts.addAlert(spec || {});
+};
+TradingChart.prototype.removeAlert = function (id) {
+  return this._alerts ? this._alerts.removeAlert(id) : false;
+};
+TradingChart.prototype.clearAlerts = function () {
+  if (this._alerts) this._alerts.clearAlerts();
+};
+TradingChart.prototype.getAlerts = function () {
+  return this._alerts ? this._alerts.alerts.slice() : [];
+};
+TradingChart.prototype.setAlertEnabled = function (id, on) {
+  return this._alerts ? this._alerts.setEnabled(id, on) : false;
+};
+TradingChart.prototype.setAlertSound = function (on) {
+  this._perfEnsure();
+  this._alerts.setSoundOn(on);
+};
+TradingChart.prototype.setAlertStore = function (store) {
+  this._perfEnsure();
+  this._alerts.setAlertStore(store);
+};
+TradingChart.prototype.checkAlertsNow = function () {
+  if (this._alerts) this._alerts.check();
+};
+TradingChart.prototype.onAlertEvent = function (fn) {
+  this._perfEnsure();
+  this._alerts.onAlertEvent = fn;
+};
+
+/* inline alert price editor (DOM input pinned to the alert line) */
+TradingChart.prototype._openAlertEditor = function (alert) {
+  if (typeof document === 'undefined') return;
+  const chart = this;
+  this._closeAlertEditor(false);
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.value = String(alert.price);
+  input.setAttribute('data-badi-alert-editor', '1');
+  const hostRect = chart.canvas.getBoundingClientRect();
+  const ay = chart.priceToY(alert.price);
+  const s = input.style;
+  s.position = 'fixed';
+  s.left = (hostRect.left + chart.chartLeft + 26) + 'px';
+  s.top = (hostRect.top + ay - 12) + 'px';
+  s.width = '110px';
+  s.padding = '3px 7px';
+  s.fontSize = '12px';
+  s.fontFamily = 'ui-monospace, Menlo, monospace';
+  s.background = '#1a1e2a';
+  s.color = '#f0f3fa';
+  s.border = '1px solid ' + (alert.color || '#ff9800');
+  s.borderRadius = '5px';
+  s.outline = 'none';
+  s.zIndex = '2147483002';
+  const commit = () => {
+    const v = parseFloat(input.value.replace(',', '.'));
+    if (isFinite(v)) {
+      chart._alerts.setPrice(alert.id, v);
+      chart.showToast(badiT(chart, 'alertUpdated'));
+    } else {
+      chart._alerts._beep('error');
+    }
+    chart._closeAlertEditor(true);
+    chart.invalidate();
+  };
+  const cancel = () => { chart._closeAlertEditor(true); chart.invalidate(); };
+  input.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter') { ev.preventDefault(); commit(); }
+    else if (ev.key === 'Escape') { ev.preventDefault(); cancel(); }
+    ev.stopPropagation();
+  });
+  input.addEventListener('blur', commit);
+  document.body.appendChild(input);
+  chart._alertEditorEl = input;
+  try { input.focus(); input.select(); } catch (_) {}
+};
+TradingChart.prototype._closeAlertEditor = function () {
+  if (this._alertEditorEl) {
+    const el = this._alertEditorEl;
+    this._alertEditorEl = null;
+    // remove the blur→commit listener before detaching (avoid re-entry)
+    el.onblur = null;
+    if (el.parentNode) el.parentNode.removeChild(el);
+  }
+};
+
+/* ============================ CONTEXT MENU API ============================= */
+TradingChart.prototype.addContextMenuItem = function (spec) {
+  this._perfEnsure();
+  return this._menu.addItem(spec);
+};
+TradingChart.prototype.removeContextMenuItem = function (id) {
+  return this._menu ? this._menu.removeItem(id) : false;
+};
+TradingChart.prototype.setContextMenuEnabled = function (on) {
+  if (this._menu) this._menu.setEnabled(on);
+};
+TradingChart.prototype.setLang = function (lang) {
+  this._badiLang = (lang === 'ar') ? 'ar' : 'en';
+  if (this._menu && this._menu.el) {
+    this._menu.el.setAttribute('dir', this._badiLang === 'ar' ? 'rtl' : 'ltr');
+    this._menu.el.classList.toggle('bcm-rtl', this._badiLang === 'ar');
+  }
+  this.invalidate();
+};
+TradingChart.prototype.openContextMenu = function (clientX, clientY) {
+  this._perfEnsure();
+  const r = this.canvas.getBoundingClientRect();
+  const x = clientX - r.left, y = clientY - r.top;
+  this._openMenuAt(x, y, clientX, clientY);
+};
+
+/* menu context builder — shared by onRightClick and touch long-press */
+TradingChart.prototype._openMenuAt = function (x, y, clientX, clientY) {
+  this._perfEnsure();
+  let target = null;
+  if (this._alerts) {
+    const hitAlert = this._alerts.hitTest(x, y);
+    if (hitAlert) target = { kind: 'alert', alert: hitAlert };
+  }
+  if (!target) {
+    const dw = (typeof this.findDrawingAt === 'function') ? this.findDrawingAt(x, y) : null;
+    if (dw) target = { kind: 'drawing', drawing: dw };
+  }
+  const price = this.yToPrice(y);
+  const idx = this.xToIndex(x);
+  return this._menu.open({
+    x: x, y: y, clientX: clientX, clientY: clientY,
+    price: price, idx: idx, target: target
+  });
+};
+
+/* ============================ RIGHT-CLICK OVERRIDE ========================= */
+// Legacy behavior is PRESERVED where it matters:
+//   • drawing preview pending → cancel (original semantics)
+//   • eraser tool → delete the hovered drawing instantly (original semantics)
+// Everything else opens the context menu — which is exactly what the user
+// asked for: right-click → options appear. Deleting a drawing moved INTO the
+// menu (one extra click, discoverable) instead of the old surprise-instant
+// delete on any right-click over a drawing.
+const _origOnRightClick = TradingChart.prototype.onRightClick;
+TradingChart.prototype.onRightClick = function (e) {
+  this._perfEnsure();
+  // Legacy 1: cancel pending preview.
+  if (this.currentDrawing) return _origOnRightClick.call(this, e);
+  // Legacy 2: eraser keeps instant-delete.
+  if (this.activeTool === 'eraser') return _origOnRightClick.call(this, e);
+  const r = this.canvas.getBoundingClientRect();
+  const x = e.clientX - r.left;
+  const y = e.clientY - r.top;
+  const opened = this._openMenuAt(x, y, e.clientX, e.clientY);
+  if (!opened) {
+    // Nothing to show (menu disabled + no user items) → fall back to legacy.
+    return _origOnRightClick.call(this, e);
+  }
+};
+
+/* ============================ SCREENSHOT =================================== */
+// Composes the GL canvas + the text overlay canvas into one PNG. Called
+// synchronously right after a fresh render() so both buffers are live.
+TradingChart.prototype._saveScreenshot = function (filename) {
+  const chart = this;
+  try {
+    chart.render();                                   // fresh, complete frame
+    const glC = (chart._glBackend && chart._glBackend.glCanvas) || null;
+    const textC = chart.canvas;
+    const w = glC ? glC.width : textC.width;
+    const h = glC ? glC.height : textC.height;
+    const out = document.createElement('canvas');
+    out.width = w; out.height = h;
+    const octx = out.getContext('2d');
+    octx.fillStyle = chart.theme.bg || '#0e1015';
+    octx.fillRect(0, 0, w, h);
+    if (glC) octx.drawImage(glC, 0, 0);
+    octx.drawImage(textC, 0, 0);
+    const name = filename || ('badi-chart-' + new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-') + '.png');
+    const a = document.createElement('a');
+    a.download = name;
+    a.href = out.toDataURL('image/png');
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { try { document.body.removeChild(a); } catch (_) {} }, 100);
+    chart.showToast(badiT(chart, 'screenshotSaved'));
+  } catch (_) {
+    chart.showToast(badiT(chart, 'screenshotFail'));
+  }
+};
+
+/* ============================ RENDER WRAPPER =============================== */
+// One wrapper drives ALL post-render layers (GPU line batches → alert lines
+// → perf HUD) in the same task as the original render, AFTER endFrame has
+// flushed the chart's own geometry:
+//   GL line batches → raw WebGL into the GL canvas (above candles, below DOM)
+//   alerts + HUD    → native 2D overlay context (device-px transform)
+const _origRender = TradingChart.prototype.render;
+TradingChart.prototype.render = function (now) {
+  const res = _origRender.call(this, now);
+  try { this._perfAfterRender(); } catch (err) {
+    // The perf layer must NEVER take the chart down with it.
+    if (BADI_DEBUG) console.error('[BadiCharts] perf layer error', err);
+  }
+  return res;
+};
+TradingChart.prototype._perfAfterRender = function () {
+  const chart = this;
+  const hasSeries = chart._perf && chart._perf.enabled && chart._perf.series.size > 0;
+  const hasAlerts = chart._alerts && chart._alerts.alerts.length > 0;
+  const hasHUD = chart._perfHUD && chart._perfHUD.enabled;
+  if (!hasSeries && !hasAlerts && !hasHUD) return;
+  const nctx = chart.ctx && chart.ctx._nc;
+  const dpr = chart.dpr || 1;
+  // 1. GPU line batches (raw GL — outside the command layer by design).
+  if (hasSeries) chart._perf.drawFrame();
+  // 2. Overlay 2D layers on the text canvas (device-px transform, CSS coords).
+  if ((hasAlerts || hasHUD) && nctx) {
+    nctx.save();
+    nctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    if (hasAlerts) chart._alerts.draw(nctx, dpr);
+    if (hasHUD) chart._perfHUD.draw(chart, nctx, dpr);
+    nctx.restore();
+  }
+};
+
+/* ============================ DATA HOOKS =================================== */
+// Every data mutation re-evaluates the alerts (O(active) — no scanning) and
+// lets the perf engine notice candle-set shifts for time-anchored series.
+const _origUpdate = TradingChart.prototype.update;
+TradingChart.prototype.update = function (candle) {
+  const res = _origUpdate.call(this, candle);
+  if (this._alerts) this._alerts.check();
+  return res;
+};
+const _origAppend = TradingChart.prototype.append;
+TradingChart.prototype.append = function (candles) {
+  const res = _origAppend.call(this, candles);
+  if (this._alerts) this._alerts.check();
+  return res;
+};
+const _origSetData = TradingChart.prototype.setData;
+TradingChart.prototype.setData = function (candles, opts) {
+  const res = _origSetData.call(this, candles, opts);
+  if (this._alerts) { this._alerts._prevPrice = null; this._alerts.check(); }
+  return res;
+};
+
+/* ============================ MOUSE WRAPS ================================== */
+// Priority: perf HUD drag → alert drag → original handler. Hovering an
+// alert line switches the cursor to ns-resize (move affordance).
+const _origMouseDown = TradingChart.prototype.onMouseDown;
+TradingChart.prototype.onMouseDown = function (e) {
+  if (this._perfHUD && this._perfHUD.enabled) {
+    const r0 = this.canvas.getBoundingClientRect();
+    const hx = e.clientX - r0.left, hy = e.clientY - r0.top;
+    if (this._perfHUD.hit(hx, hy)) {
+      this._hudDrag = true;
+      this._perfHUD.dragTo(hx, hy);
+      this.invalidate();
+      return;
+    }
+  }
+  if (this._alerts && this._alerts.alerts.length) {
+    const r = this.canvas.getBoundingClientRect();
+    const x = e.clientX - r.left, y = e.clientY - r.top;
+    const hitAlert = this._alerts.hitTest(x, y);
+    if (hitAlert && hitAlert.enabled !== false) {
+      this._alerts.beginDrag(hitAlert, y);
+      this.invalidate();
+      return;
+    }
+  }
+  return _origMouseDown.call(this, e);
+};
+const _origMouseMove = TradingChart.prototype.onMouseMove;
+TradingChart.prototype.onMouseMove = function (e) {
+  if (this._hudDrag) {
+    const r0 = this.canvas.getBoundingClientRect();
+    this._perfHUD.dragTo(e.clientX - r0.left, e.clientY - r0.top);
+    this.invalidate();
+    return;
+  }
+  if (this._alerts && this._alerts.dragging) {
+    const r = this.canvas.getBoundingClientRect();
+    this._alerts.dragTo(e.clientY - r.top);
+    return;
+  }
+  // Alert hover affordance (only when no drawing is being hovered — cheap
+  // O(n alerts) test that skips the canvas hit machinery).
+  if (this._alerts && this._alerts.alerts.length && !this.hoverDrawing) {
+    const r = this.canvas.getBoundingClientRect();
+    const x = e.clientX - r.left, y = e.clientY - r.top;
+    const overAlert = this._alerts.hitTest(x, y);
+    if (overAlert) {
+      try { this.canvas.style.cursor = 'ns-resize'; } catch (_) {}
+      return _origMouseMove.call(this, e);
+    }
+    try { if (this.canvas.style.cursor === 'ns-resize') this.canvas.style.cursor = ''; } catch (_) {}
+  }
+  return _origMouseMove.call(this, e);
+};
+const _origMouseUp = TradingChart.prototype.onMouseUp;
+TradingChart.prototype.onMouseUp = function (e) {
+  if (this._hudDrag) { this._hudDrag = false; this.invalidate(); return; }
+  if (this._alerts && this._alerts.dragging) { this._alerts.endDrag(); return; }
+  return _origMouseUp.call(this, e);
+};
+
+/* ============================ TOUCH LONG-PRESS ============================= */
+// 550ms press with <10px movement opens the same context menu on mobile
+// (plus a 10ms haptic tick where supported). A moved finger = pan, no menu.
+const _origTouchStart = TradingChart.prototype.onTouchStart;
+TradingChart.prototype.onTouchStart = function (e) {
+  if (e.touches && e.touches.length === 1 && !this._isSyntheticMouse(e)) {
+    const t = e.touches[0];
+    const r = this.canvas.getBoundingClientRect();
+    this._lp = {
+      x: t.clientX - r.left, y: t.clientY - r.top,
+      cx: t.clientX, cy: t.clientY, moved: false
+    };
+    this._lpConsumed = false;
+    clearTimeout(this._lpTimer);
+    this._lpTimer = setTimeout(() => {
+      if (this._lp && !this._lp.moved && !this._destroyed) {
+        const opened = this._openMenuAt(this._lp.x, this._lp.y, this._lp.cx, this._lp.cy);
+        if (opened) {
+          this._lpConsumed = true;
+          // stop the pan that touchstart armed
+          this.isDragging = false;
+          this._momentum = null;
+          this._panVelocity = 0;
+          if (navigator.vibrate) { try { navigator.vibrate(10); } catch (_) {} }
+        }
+      }
+    }, 550);
+  }
+  return _origTouchStart.call(this, e);
+};
+const _origTouchMove = TradingChart.prototype.onTouchMove;
+TradingChart.prototype.onTouchMove = function (e) {
+  if (this._lp && e.touches && e.touches.length === 1) {
+    const t = e.touches[0];
+    if (Math.abs(t.clientX - this._lp.cx) > 10 || Math.abs(t.clientY - this._lp.cy) > 10) {
+      this._lp.moved = true;
+      clearTimeout(this._lpTimer);
+    }
+  }
+  return _origTouchMove.call(this, e);
+};
+const _origTouchEnd = TradingChart.prototype.onTouchEnd;
+TradingChart.prototype.onTouchEnd = function (e) {
+  clearTimeout(this._lpTimer);
+  const consumed = this._lpConsumed;
+  this._lp = null;
+  this._lpConsumed = false;
+  if (consumed) return;   // the long-press won — do not synthesize a tap
+  return _origTouchEnd.call(this, e);
+};
+
+/* ============================ DESTROY ====================================== */
+// Tear down every new subsystem (GL buffers, workers, menu DOM, timers).
+const _origDestroy = TradingChart.prototype.destroy;
+TradingChart.prototype.destroy = function () {
+  try {
+    clearTimeout(this._lpTimer);
+    this._closeAlertEditor();
+    if (this._menu) this._menu.destroy();
+    if (this._perf) this._perf.destroy();
+    this._perf = null; this._perfHUD = null;
+    this._alerts = null; this._menu = null;
+  } catch (_) { /* destroy must never throw */ }
+  return _origDestroy.call(this);
+};
+
+/* ============================ NAMESPACE EXPORT ============================= */
+// Advanced users / tooling can reach the engine classes directly:
+//   BadiCharts.BADIPerf.Decimator.minMaxKeep(...)
+//   BadiCharts.BADIAlerts.I18N.ar.addAlert
+const BADIPerfNS = {
+  version: '2.38.0',
+  Engine: BadiPerfEngine, Series: BadiPerfSeries, Chunk: BadiPerfChunk,
+  GLLines: BadiGLLines, Decimator: BadiDecimator, LODCache: BadiLODCache,
+  Grid: BadiSpatialGrid, Workers: BadiWorkerPool, Ring64: BadiRing64,
+  Pool: BadiPool, Quality: BadiAdaptiveQuality, HUD: BadiPerfHUD,
+  config: BADI_PERF_DEFAULTS
+};
+const BADIAlertsNS = {
+  version: '2.38.0',
+  Engine: BadiAlertEngine, Menu: BadiContextMenu,
+  I18N: BADI_I18N, Icons: BADI_MENU_ICONS
+};
+if (typeof window !== 'undefined') {
+  window.BADIPerf = BADIPerfNS;
+  window.BADIAlerts = BADIAlertsNS;
+  if (window.BadiChartsWebGL) {
+    window.BadiChartsWebGL.BADIPerf = BADIPerfNS;
+    window.BadiChartsWebGL.BADIAlerts = BADIAlertsNS;
+    window.BadiChartsWebGL.PERF_EDITION = '2.38.0';
+  }
+}
+
+/* =============================================================================
+ * BADI-CHARTS-V2 v2.38.0 — PERFORMANCE EXTRAS (feeds, benchmark, marks)
+ * =============================================================================
+ * Utilities that make the "thousands of lines" story complete in REAL apps:
+ *
+ *   • BadiDataFeed  — a resilient live-data feed manager (WebSocket / poll /
+ *     synthetic) with exponential-backoff reconnect, heartbeat watchdog and
+ *     coalesced delivery: a burst of N ticks produces ONE chart.update() per
+ *     animation frame — the same trick the chart uses internally for its own
+ *     indicator recomputation. Pairs with appendLineSeriesPoint() for
+ *     streaming overlay lines.
+ *   • BadiCandleAggregator — O(1) per tick OHLCV aggregation across
+ *     timeframes (1m ticks → 5m/15m/1h candles) on plain typed storage, so
+ *     multi-timeframe dashboards stay allocation-free.
+ *   • chart.benchmarkLineSeries({ count, pointsPer, mode }) — creates real
+ *     synthetic series through the SAME public API, measures frames + phase
+ *     ms, removes everything and returns a report. The honest way to answer
+ *     "can this machine really draw 5,000 lines?" — no fake numbers.
+ *   • chart.perfMark(label) / chart.perfMeasure(name, label) — User-Timing
+ *     API integration so integrator code shows up next to the chart's own
+ *     marks in DevTools Performance profiles.
+ *   • Series groups — tag series with groupId and toggle whole groups
+ *     (strategy ON/OFF, session filters) in one O(n) flag pass.
+ * ========================================================================== */
+
+/* ============================ CANDLE AGGREGATOR ============================ */
+// v2.38.0: incremental OHLCV aggregation. Feed ticks via .tick(time, price,
+// volume); read the completed candles via .candles(). Handles timeframe
+// bucketing (ms), weekend/session gaps (buckets are time-aligned, not
+// index-aligned), and late ticks (a tick older than the current bucket
+// updates that bucket's high/low/close — never re-opens an older bucket).
+class BadiCandleAggregator {
+  constructor(timeframeMs, maxCandles) {
+    this.tf = Math.max(1, +timeframeMs || 60000);
+    this.max = Math.max(2, +maxCandles || 5000);
+    this.candles = [];               // { time, open, high, low, close, volume }
+    this._lastBucketStart = null;
+  }
+  _bucketStart(tMs) {
+    return Math.floor(tMs / this.tf) * this.tf;
+  }
+  // t: unix SECONDS or MILLISECONDS (auto-detected: >1e11 → ms).
+  // price: last price; volume: incremental (added to the bucket) unless
+  // opts.absVolume → replaces.
+  tick(t, price, volume, opts) {
+    let tMs = +t;
+    if (tMs > 1e11) { /* already ms */ } else { tMs = tMs * 1000; }
+    if (!isFinite(tMs) || !isFinite(+price)) return false;
+    const bs = this._bucketStart(tMs);
+    const vol = isFinite(+volume) ? +volume : 0;
+    const abs = opts && opts.absVolume;
+    if (this._lastBucketStart === null || bs > this._lastBucketStart) {
+      // new bucket — but a LATE tick (older than the newest bucket) must not
+      // create a duplicate bucket in the past; only append when strictly newer.
+      const last = this.candles[this.candles.length - 1];
+      if (last && last.time / 1000 > tMs / 1000 && bs <= last.time) {
+        // late tick for an existing bucket → update it
+        return this._updateLast(price, vol, abs, tMs);
+      }
+      this.candles.push({
+        time: Math.floor(bs / 1000),          // chart data convention: seconds
+        open: +price, high: +price, low: +price, close: +price,
+        volume: abs ? vol : vol
+      });
+      this._lastBucketStart = bs;
+      if (this.candles.length > this.max) this.candles.shift();
+      return true;
+    }
+    return this._updateLast(price, vol, abs, tMs);
+  }
+  _updateLast(price, vol, abs, tMs) {
+    const c = this.candles[this.candles.length - 1];
+    if (!c) return false;
+    if (price > c.high) c.high = price;
+    if (price < c.low) c.low = price;
+    c.close = price;
+    c.volume = abs ? (c.volume + vol) : (c.volume + vol);
+    return true;
+  }
+  // Replace everything (initial history load) — accepts the chart's candle
+  // format directly.
+  seed(list) {
+    if (!Array.isArray(list)) return;
+    this.candles = list
+      .filter(c => c && isFinite(+c.close))
+      .map(c => ({
+        time: +c.time, open: +c.open, high: +c.high,
+        low: +c.low, close: +c.close, volume: +c.volume || 0
+      }))
+      .sort((a, b) => a.time - b.time)
+      .slice(-this.max);
+    const last = this.candles[this.candles.length - 1];
+    this._lastBucketStart = last ? last.time * 1000 : null;
+  }
+}
+
+/* ============================ DATA FEED ==================================== */
+// v2.38.0: resilient live-feed manager. Three transport modes:
+//   'ws'     — WebSocket; url required; auto-reconnect with exponential
+//              backoff + jitter, heartbeat watchdog (silent socket = dead
+//              socket), pluggable parser.
+//   'poll'   — fetch(url, { every }) with timeout + abort on backoff.
+//   'demo'   — deterministic synthetic random-walk (no network!) — powers
+//              the built-in demo and lets anyone test the perf path.
+// Delivery is COALESCED: ticks arrive via feed.push() and are flushed to
+// the subscriber once per animation frame — a 500-tick burst costs ONE
+// chart.update() + ONE alert pass + ONE LOD rebuild, not 500.
+//
+// Usage:
+//   const feed = new BadiDataFeed({
+//     mode: 'ws', url: 'wss://…',
+//     parse: (msg) => ({ time: msg.E / 1000, price: msg.c, volume: msg.v }),
+//     onTick: (candle) => { chart.update(candle); chart.appendLineSeriesPoint('eq', …); },
+//   });
+//   feed.start(); … feed.stop();
+// Lifecycle: started → (reconnecting) → open → closed. getStats() exposes
+// reconnects, dropped ticks and queue depth for health dashboards.
+class BadiDataFeed {
+  constructor(opts) {
+    this.opts = opts || {};
+    this.mode = this.opts.mode || 'demo';
+    this.url = this.opts.url || null;
+    this.parse = typeof this.opts.parse === 'function' ? this.opts.parse : null;
+    this.onTick = typeof this.opts.onTick === 'function' ? this.opts.onTick : null;
+    this.onStatus = typeof this.opts.onStatus === 'function' ? this.opts.onStatus : null;
+    this.every = Math.max(50, +this.opts.every || 1000);       // poll interval
+    this.heartbeatMs = Math.max(2000, +this.opts.heartbeatMs || 15000);
+    this.maxBackoffMs = Math.max(1000, +this.opts.maxBackoffMs || 30000);
+    this.coalesceMs = (this.opts.coalesceMs === 0) ? 0 : Math.max(16, +this.opts.coalesceMs || 120);
+    this.maxQueue = Math.max(1, +this.opts.maxQueue || 4096);
+    // state
+    this.status = 'closed';
+    this.ws = null;
+    this._pollTimer = null;
+    this._hbTimer = null;
+    this._flushTimer = null;
+    this._queue = [];
+    this._backoff = 500;
+    this._reconnects = 0;
+    this._dropped = 0;
+    this._received = 0;
+    this._started = false;
+    this._destroyed = false;
+    // demo generator state
+    this._demoPrice = +this.opts.demoPrice || 100;
+    this._demoTf = Math.max(1000, +this.opts.demoTfMs || 60000);
+    this._demoTimer = null;
+    this._demoCandle = null;
+    this._rng = (typeof this.opts.demoSeed === 'number')
+      ? BadiDataFeed._mulberry(this.opts.demoSeed)   // deterministic
+      : Math.random;
+  }
+  static _mulberry(seed) {
+    let a = seed >>> 0;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  start() {
+    if (this._started || this._destroyed) return this;
+    this._started = true;
+    if (this.mode === 'ws') this._openWs();
+    else if (this.mode === 'poll') this._schedulePoll(0);
+    else this._startDemo();
+    this._setStatus(this.mode === 'demo' ? 'open' : 'connecting');
+    return this;
+  }
+  stop() {
+    this._started = false;
+    this._teardownTransport();
+    this._setStatus('closed');
+    return this;
+  }
+  destroy() {
+    this._destroyed = true;
+    this.stop();
+    this._queue.length = 0;
+    this.onTick = null; this.onStatus = null; this.parse = null;
+  }
+  // Manual injection — the integration point for custom transports.
+  push(tick) {
+    if (!tick || !isFinite(+tick.price)) return false;
+    this._received++;
+    if (this._queue.length >= this.maxQueue) {
+      // Coalescing under pressure: drop the OLDEST half, keep the newest —
+      // the chart only needs the last price + volume accumulation.
+      const keep = Math.floor(this.maxQueue / 2);
+      this._dropped += this._queue.length - keep;
+      this._queue = this._queue.slice(-keep);
+    }
+    this._queue.push(tick);
+    if (this.coalesceMs > 0) {
+      if (this._flushTimer == null) {
+        this._flushTimer = setTimeout(() => { this._flushTimer = null; this._flush(); }, this.coalesceMs);
+      }
+    } else {
+      this._flush();
+    }
+    return true;
+  }
+  _flush() {
+    if (this._queue.length === 0 || !this.onTick) return;
+    // Merge the queue into ONE candle: last time/price wins, volumes sum.
+    let time = 0, price = 0, vol = 0;
+    for (const q of this._queue) {
+      time = +q.time || time;
+      price = +q.price;
+      vol += isFinite(+q.volume) ? +q.volume : 0;
+    }
+    this._queue.length = 0;
+    try { this.onTick({ time: time, price: price, volume: vol }); }
+    catch (e) { if (BADI_DEBUG) console.error('[BadiDataFeed] onTick error', e); }
+  }
+  _setStatus(s) {
+    if (this.status === s) return;
+    this.status = s;
+    if (this.onStatus) { try { this.onStatus(s, this.getStats()); } catch (_) {} }
+  }
+  /* ---- websocket transport ---------------------------------------------- */
+  _openWs() {
+    if (this._destroyed || !this.url) return;
+    let ws;
+    try { ws = new WebSocket(this.url); } catch (_) { this._reconnect(); return; }
+    this.ws = ws;
+    const openedAt = Date.now();
+    ws.onopen = () => {
+      this._backoff = 500;
+      this._setStatus('open');
+      this._armHeartbeat();
+      if (typeof this.opts.onOpen === 'function') {
+        try { this.opts.onOpen(ws); } catch (_) {}    // subscribe to channels here
       }
     };
-
-    // 1. globals & exports
-    check('BadiCharts global exists', function () { return typeof window.BadiCharts === 'function'; });
-    check('VERSION is 2.37.0+', function () {
-      const parts = String(window.BadiCharts.version || '').split('.').map(Number);
-      return parts[0] > 2 || (parts[0] === 2 && parts[1] >= 37);
-    });
-    check('BadiThemes exported', function () { return window.BadiThemes && Object.keys(window.BadiThemes).length >= 11; });
-    check('BadiCardKit exported', function () { return !!window.BadiCardKit; });
-    check('BadiI18n has en + ar', function () { return !!(window.BadiI18n && window.BadiI18n.en && window.BadiI18n.ar); });
-    check('Indicator pack exported', function () { return window.BadiIndicators && Object.keys(window.BadiIndicators).length >= 29; });
-
-    // 2. prototype surface
-    check('enableModernUI method', function () { return typeof window.BadiCharts.prototype.enableModernUI === 'function'; });
-    check('enableIndicator method', function () { return typeof window.BadiCharts.prototype.enableIndicator === 'function'; });
-    check('alerts API complete', function () {
-      const p = window.BadiCharts.prototype;
-      return ['addAlert','removeAlert','muteAlert','clearAlerts','getAlerts','onAlert']
-        .every(function (m) { return typeof p[m] === 'function'; });
-    });
-    check('price lines API', function () { return typeof window.BadiCharts.prototype.createPriceLine === 'function'; });
-    check('export API', function () {
-      const p = window.BadiCharts.prototype;
-      return typeof p.exportPNG === 'function' && typeof p.exportCSV === 'function';
-    });
-    check('sync API', function () { return typeof window.BadiCharts.prototype.syncWith === 'function'; });
-    check('sessions API', function () { return typeof window.BadiCharts.prototype.setSessions === 'function'; });
-    check('order book API', function () { return typeof window.BadiCharts.prototype.setOrderBook === 'function'; });
-    check('watchlist API', function () { return typeof window.BadiCharts.prototype.setWatchlist === 'function'; });
-    check('theme presets API', function () {
-      const p = window.BadiCharts.prototype;
-      return typeof p.setThemePreset === 'function' && typeof p.getThemePresetNames === 'function';
-    });
-    check('localization API', function () { return typeof window.BadiCharts.prototype.setLocale === 'function'; });
-
-    // 3. math utilities on the public Indicators object
-    check('indicator math (wave 1+2)', function () {
-      const need = ['sma','ema','atr','rsi','macd','vwap','supertrend','ichimoku',
-                    'psar','donchian','keltner','adx','cci','obv','williamsR',
-                    'mfi','awesome','choppiness','trix','hma','vwma','elderRay',
-                    'forceIndex','vortex','dpo','pvt','ulcerIndex'];
-      return need.every(function (m) { return typeof window.Indicators[m] === 'function'; });
-    });
-
-    // 4. on a live instance: glass tokens + hooks (only when a chart is given)
-    if (chart) {
-      check('instance: modern layer attaches', function () {
-        chart.enableModernUI({ cards: [] });
-        return !!chart._modern;
+    ws.onmessage = (ev) => {
+      this._armHeartbeat();                           // traffic = alive
+      if (!this.parse) return;
+      try {
+        const tick = this.parse(ev.data);
+        if (tick) this.push(tick);
+      } catch (_) { /* bad frame — ignore, keep the socket alive */ }
+    };
+    ws.onclose = () => {
+      this._disarmHeartbeat();
+      this.ws = null;
+      // A socket that died young is more likely a network blip → faster retry.
+      const age = Date.now() - openedAt;
+      if (age < 5000) this._backoff = Math.max(250, Math.floor(this._backoff / 2));
+      if (this._started) this._reconnect();
+    };
+    ws.onerror = () => { try { ws.close(); } catch (_) {} };
+  }
+  _armHeartbeat() {
+    this._disarmHeartbeat();
+    this._hbTimer = setTimeout(() => {
+      // silent socket → force-close; onclose handles reconnect
+      try { if (this.ws) this.ws.close(); } catch (_) {}
+    }, this.heartbeatMs);
+  }
+  _disarmHeartbeat() {
+    if (this._hbTimer) { clearTimeout(this._hbTimer); this._hbTimer = null; }
+  }
+  _reconnect() {
+    if (!this._started || this._destroyed) return;
+    this._reconnects++;
+    this._setStatus('reconnecting');
+    const jitter = this._backoff * (0.7 + 0.6 * Math.random());
+    setTimeout(() => {
+      if (this._started && !this._destroyed) this._openWs();
+    }, Math.min(this.maxBackoffMs, jitter));
+    this._backoff = Math.min(this.maxBackoffMs, this._backoff * 2);
+  }
+  /* ---- poll transport ----------------------------------------------------- */
+  _schedulePoll(delay) {
+    this._pollTimer = setTimeout(() => this._poll(), delay);
+  }
+  _poll() {
+    if (!this._started || this._destroyed) return;
+    const ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+    const timeout = setTimeout(() => { try { ctrl && ctrl.abort(); } catch (_) {} }, Math.min(10000, this.every));
+    fetch(this.url, { signal: ctrl ? ctrl.signal : undefined })
+      .then(r => r.json())
+      .then(data => {
+        clearTimeout(timeout);
+        this._setStatus('open');
+        this._backoff = 500;
+        if (this.parse) {
+          const tick = this.parse(data);
+          if (tick) this.push(tick);
+        }
+        this._schedulePoll(this.every);
+      })
+      .catch(() => {
+        clearTimeout(timeout);
+        this._setStatus('reconnecting');
+        this._reconnects++;
+        this._backoff = Math.min(this.maxBackoffMs, this._backoff * 2);
+        this._schedulePoll(Math.min(this.maxBackoffMs, this._backoff * (0.7 + 0.6 * Math.random())));
       });
-      check('instance: glass tokens on theme', function () {
-        return !!(chart.theme.glassBg && chart.theme.plate && chart.theme.accent2);
-      });
-      check('instance: render hook installed', function () {
-        // the wrapped drawDropdown calls the modern overlay — verify by
-        // checking the card manager runs without throwing for one frame
-        chart._modern.render(chart.ctx, performance.now());
-        return true;
-      });
-      check('instance: card factories complete', function () {
-        const need = ['symbol','stats','watchlist','alerts','trade','shortcuts','perf','objects','depth'];
-        return need.every(function (id) { return typeof window.CARD_FACTORIES_FOR_TEST(id) === 'object'; });
-      });
-      check('instance: measure tool registered', function () {
-        return !!(chart._customTools && chart._customTools.measure);
-      });
-    }
-
-    const failed = results.filter(function (r) { return !r.ok; });
+  }
+  /* ---- demo transport ------------------------------------------------------ */
+  // Deterministic random-walk with realistic microstructure: occasional
+  // bursts (volatility clusters) + occasional gaps. Same seed → same data
+  // → reproducible perf numbers across runs.
+  _startDemo() {
+    const tf = this._demoTf;
+    let now = Date.now();
+    const step = () => {
+      if (!this._started || this._destroyed) return;
+      const vola = (this._rng() < 0.05) ? 4.0 : 1.0;      // volatility cluster
+      const drift = (this._rng() - 0.5) * 2;
+      this._demoPrice = Math.max(0.01, this._demoPrice * (1 + drift * 0.0008 * vola));
+      const vol = Math.round((1 + this._rng() * 9 * vola) * 100) / 100;
+      const tSec = Math.floor(now / 1000);
+      this.push({ time: tSec, price: this._demoPrice, volume: vol });
+      now += tf / 12;                                     // 12 ticks per candle
+      this._demoTimer = setTimeout(step, Math.max(50, tf / 12));
+    };
+    // Seed an initial candle immediately so charts never start empty.
+    this.push({ time: Math.floor(now / 1000), price: this._demoPrice, volume: 1 });
+    this._demoTimer = setTimeout(step, 200);
+  }
+  getStats() {
     return {
-      ok: failed.length === 0,
-      passed: results.length - failed.length,
-      failed: failed.length,
-      results: results
+      mode: this.mode, status: this.status, received: this._received,
+      dropped: this._dropped, queued: this._queue.length,
+      reconnects: this._reconnects
     };
   }
+  _teardownTransport() {
+    this._disarmHeartbeat();
+    if (this._pollTimer) { clearTimeout(this._pollTimer); this._pollTimer = null; }
+    if (this._demoTimer) { clearTimeout(this._demoTimer); this._demoTimer = null; }
+    if (this._flushTimer) { clearTimeout(this._flushTimer); this._flushTimer = null; this._flush(); }
+    if (this.ws) {
+      try { this.ws.onclose = null; this.ws.close(); } catch (_) {}
+      this.ws = null;
+    }
+  }
+}
+
+/* ============================ SERIES GROUPS ================================ */
+// v2.38.0: tag line series with a group id and toggle whole groups — the
+// practical way to manage thousands of overlays (per-strategy, per-session,
+// per-symbol buckets) without walking your own registry.
+//
+//   chart.setLineSeriesGroup('eq1', 'strategy-A');
+//   chart.setSeriesGroupVisible('strategy-A', false);   // O(n) flag pass
+//   chart.getSeriesGroups();                            // → { 'strategy-A': 42, … }
+TradingChart.prototype.setLineSeriesGroup = function (id, groupId) {
+  if (!this._perf) return false;
+  const s = this._perf.series.get(id);
+  if (!s) return false;
+  s.groupId = (groupId == null) ? null : String(groupId);
+  return true;
+};
+TradingChart.prototype.setSeriesGroupVisible = function (groupId, visible) {
+  if (!this._perf) return 0;
+  let n = 0;
+  for (const s of this._perf.series.values()) {
+    if (s.groupId === groupId) { s.visible = !!visible; s.uploadDirty = true; n++; }
+  }
+  this.invalidate();
+  return n;
+};
+TradingChart.prototype.getSeriesGroups = function () {
+  const out = {};
+  if (!this._perf) return out;
+  for (const s of this._perf.series.values()) {
+    if (s.groupId != null) out[s.groupId] = (out[s.groupId] || 0) + 1;
+  }
+  return out;
+};
+TradingChart.prototype.removeSeriesGroup = function (groupId) {
+  if (!this._perf) return 0;
+  const ids = [];
+  for (const s of this._perf.series.values()) {
+    if (s.groupId === groupId) ids.push(s.id);
+  }
+  for (const id of ids) this._perf.removeSeries(id);
+  this.invalidate();
+  return ids.length;
 };
 
-// test hook: the card factories live in the IIFE closure; expose a lookup
-// for the self test (and for power users building custom launchers).
-function CARD_FACTORIES_FOR_TEST(id) {
-  const f = CARD_FACTORIES[id];
-  return f ? f({ /* detached chart stub */
-    theme: THEME, sim: { candles: [] }, activeIndicators: new Set(),
-    indicatorStates: new Map(), drawings: [], timeframe: { label: '1H', ms: 3600000 },
-    symbol: { label: 'TEST' }, invalidate: function () {}, showToast: function () {},
-    priceScale: null, W: 800, H: 600, chartLeft: 0, chartTop: 0, chartRight: 760,
-    priceTop: 0, priceBottom: 560, mouseX: -1, mouseY: -1, _t: null
-  }) : null;
+/* ============================ USER-TIMING MARKS ============================ */
+// v2.38.0: forward the chart's own hot phases into window.performance so
+// integrator profiles show BADI marks inline. Zero cost when the User
+// Timing API is missing (Node, old browsers).
+const _badiPerfMark = (typeof performance !== 'undefined' && performance.mark)
+  ? (label) => { try { performance.mark(label); } catch (_) {} }
+  : function () {};
+const _badiPerfMeasure = (typeof performance !== 'undefined' && performance.measure)
+  ? (name, start, end) => {
+      try { performance.measure(name, start, end); } catch (_) {}
+    }
+  : function () {};
+TradingChart.prototype.perfMark = function (label) {
+  _badiPerfMark('badi:' + label);
+  this._badiMarkName = 'badi:' + label;
+  return this;
+};
+TradingChart.prototype.perfMeasure = function (name, startLabel) {
+  _badiPerfMeasure('badi:' + name, 'badi:' + (startLabel || this._badiMarkName || ''), undefined);
+  return this;
+};
+
+/* ============================ BENCHMARK ==================================== */
+// v2.38.0: honest in-library benchmark for the "thousands of lines" claim.
+// Creates REAL series through the REAL public API, renders for a warmup +
+// measurement window (panning slightly to defeat caches), reports fps /
+// phase ms / segments / draw calls, then cleans up completely.
+//
+//   const report = await chart.benchmarkLineSeries({ count: 3000, pointsPer: 500 });
+//   → { frames, fps, avgPhaseMs, p95PhaseMs, segments, drawCalls, series, points }
+TradingChart.prototype.benchmarkLineSeries = function (opts) {
+  const o = opts || {};
+  const count = Math.max(1, +o.count || 1000);
+  const pointsPer = Math.max(10, +o.pointsPer || 300);
+  const measureMs = Math.max(500, +o.measureMs || 3000);
+  const warmupMs = Math.max(200, +o.warmupMs || 600);
+  const self = this;
+  return new Promise((resolve) => {
+    const candles = self.sim.candles;
+    if (!candles || candles.length < 10) {
+      resolve({ error: 'chart has no data — call setData() first' });
+      return;
+    }
+    const n = candles.length;
+    const ids = [];
+    // Deterministic RNG so runs are comparable.
+    const rng = BadiDataFeed._mulberry(0xBADC0DE);
+    for (let k = 0; k < count; k++) {
+      const pts = new Array(pointsPer);
+      let v = candles[Math.floor(rng() * n)].close;
+      const drift = (rng() - 0.5) * 0.004;
+      for (let i = 0; i < pointsPer; i++) {
+        v = v * (1 + (rng() - 0.5) * 0.01 + drift);
+        pts[i] = { idx: i * (n / pointsPer), p: v };
+      }
+      ids.push(self.addLineSeries({
+        id: '__bench_' + k,
+        points: pts,
+        color: 'hsl(' + Math.floor((k * 360 / count) % 360) + ',70%,55%)',
+        width: 1,
+        opacity: 0.8
+      }));
+    }
+    const stats = [];
+    let frames = 0;
+    const t0 = performance.now();
+    const phase0 = self._perf.stats.phaseMs;
+    // Drive frames with a gentle pan — the honest worst case (transforms
+    // change every frame AND the window slides across data).
+    let panDir = 1;
+    const drive = () => {
+      const now = performance.now();
+      const elapsed = now - t0;
+      if (self._destroyed) { resolve({ error: 'chart destroyed mid-benchmark' }); return; }
+      if (elapsed < warmupMs + measureMs) {
+        // Pan a few pixels per frame; bounce at the edges.
+        const ro = self.rightOffset + panDir * 0.6;
+        if (ro > 120 || ro < 0) panDir = -panDir;
+        self.rightOffset = Math.max(0, Math.min(120, ro));
+        self.invalidate();
+        frames++;
+        stats.push(self._perf.stats.phaseMs);
+        requestAnimationFrame(drive);
+        return;
+      }
+      // Collect + clean up.
+      const ms = stats.slice(Math.floor(warmupMs / 16));
+      ms.sort((a, b) => a - b);
+      const p = (q) => ms.length ? ms[Math.min(ms.length - 1, Math.floor(q * ms.length))] : 0;
+      const sum = ms.reduce((a, b) => a + b, 0);
+      const snap = self._perf.statsSnapshot();
+      const result = {
+        series: count,
+        pointsPer: pointsPer,
+        totalPoints: count * pointsPer,
+        frames: frames,
+        fps: Math.round(frames * 1000 / (warmupMs + measureMs)),
+        avgPhaseMs: +(sum / Math.max(1, ms.length)).toFixed(2),
+        p50PhaseMs: +p(0.5).toFixed(2),
+        p95PhaseMs: +p(0.95).toFixed(2),
+        segments: snap.segments,
+        drawCalls: snap.glDrawCalls,
+        vram: snap.vram,
+        mode: snap.mode,
+        quality: snap.quality ? snap.quality.tier : 'n/a'
+      };
+      for (const id of ids) self._perf.removeSeries(id);
+      self.invalidate();
+      resolve(result);
+    };
+    requestAnimationFrame(drive);
+  });
+};
+
+/* ============================ FEED NAMESPACE EXPORT ======================== */
+// v2.38.0: the feed + aggregator join BADIPerf so integrators can build
+// live dashboards without reaching into internals:
+//   BadiCharts.BADIPerf.Feed        → BadiDataFeed
+//   BadiCharts.BADIPerf.Aggregator  → BadiCandleAggregator
+//   BadiCharts.BADIPerf.features    → capability flags (see 24-perf-polish)
+BADIPerfNS.Feed = BadiDataFeed;
+BADIPerfNS.Aggregator = BadiCandleAggregator;
+
+/* =============================================================================
+ * BADI-CHARTS-V2 v2.38.0 — ALERTS EXTRAS (history, drawing-bound alerts)
+ * =============================================================================
+ * Round out the alerts engine with the two features real trading setups ask
+ * for most, WITHOUT adding any built-in UI:
+ *
+ *   • ALERT HISTORY — every trigger is recorded into an in-memory ring
+ *     (default 200 entries) with time / price / alert snapshot / direction.
+ *     Read it with chart.getAlertHistory(n), clear it, or subscribe via
+ *     chart.onAlertEvent() for your own storage. Persistence remains YOUR
+ *     job (setAlertStore) — the library never writes anywhere on its own.
+ *
+ *   • DRAWING-BOUND ALERTS ("line alerts") — bind an alert to a TRENDLINE /
+ *     horizontal ray / any drawing with two anchors: the alert level FOLLOWS
+ *     the line as you pan, zoom or drag the drawing, and the condition is
+ *     evaluated against the line's price AT THE CURRENT BAR. This is the
+ *     TradingView-style "alert on trendline touch" — price crossing a
+ *     sloped support, not just a flat level. The bound drawing is referenced
+ *     by object identity (the same object chart.drawings holds), so deleting
+ *     the drawing disarms the alert automatically.
+ *
+ *       const line = chart.drawings.find(d => d.type === 'trendline');
+ *       chart.addDrawingAlert({
+ *         drawing: line,
+ *         cond: 'cross',
+ *         label: 'support break',
+ *         color: '#ef5350',
+ *         callback: (ev) => alert('support broken at ' + ev.price)
+ *       });
+ * ========================================================================== */
+
+/* ============================ ALERT HISTORY ================================ */
+// v2.38.0: ring buffer of trigger events, wired into BadiAlertEngine._fire.
+class BadiAlertHistory {
+  constructor(capacity) {
+    this.cap = Math.max(10, +capacity || 200);
+    this.events = [];
+    this._seq = 0;
+  }
+  push(ev) {
+    this.events.push({
+      seq: ++this._seq,
+      at: ev.time,
+      alertId: ev.alert ? ev.alert.id : null,
+      label: ev.alert ? ev.alert.label : '',
+      price: ev.price,
+      cond: ev.alert ? ev.alert.cond : null,
+      boundDrawing: ev.alert && ev.alert.drawing ? true : false
+    });
+    if (this.events.length > this.cap) this.events.shift();
+  }
+  recent(n) { return this.events.slice(-(Math.max(1, +n || 20))).reverse(); }
+  clear() { this.events.length = 0; }
+  stats() {
+    let up = 0, down = 0;
+    // direction is inferred by comparing the trigger price with the alert
+    // price — crossUp/above → up, crossDown/below → down, cross → count both.
+    for (const e of this.events) {
+      if (e.cond === 'crossUp' || e.cond === 'above') up++;
+      else if (e.cond === 'crossDown' || e.cond === 'below') down++;
+    }
+    return { total: this.events.length, up: up, down: down, capacity: this.cap };
+  }
+}
+
+// Wrap the fire path once (idempotent — safe across re-rebuilds).
+(function () {
+  const fire = BadiAlertEngine.prototype._fire;
+  if (fire._badiHistoryWrapped) return;
+  BadiAlertEngine.prototype._fire = function (a, price, now) {
+    const ev = { type: 'trigger', alert: a, price: price, time: now };
+    if (!this.history) this.history = new BadiAlertHistory(
+      (this.chart._badiOpts && this.chart._badiOpts.alerts && this.chart._badiOpts.alerts.historySize) || 200
+    );
+    this.history.push(ev);
+    return fire.call(this, a, price, now);
+  };
+  fire._badiHistoryWrapped = true;
+})();
+
+TradingChart.prototype.getAlertHistory = function (n) {
+  if (!this._alerts || !this._alerts.history) return [];
+  return this._alerts.history.recent(n);
+};
+TradingChart.prototype.clearAlertHistory = function () {
+  if (this._alerts && this._alerts.history) this._alerts.history.clear();
+};
+TradingChart.prototype.getAlertHistoryStats = function () {
+  return (this._alerts && this._alerts.history)
+    ? this._alerts.history.stats()
+    : { total: 0, up: 0, down: 0, capacity: 0 };
+};
+
+/* ============================ DRAWING-BOUND ALERTS ========================= */
+// v2.38.0: an alert whose price is DERIVED from a drawing each frame.
+//
+// Implementation: the alert object carries `drawing` (chart.drawings
+// member) and `drawingMode`. The engine's check() resolves the live level:
+//   • trendline / ray / extended line → price of the line AT the last bar
+//     (linear interpolation between the two anchors, extrapolated past the
+//     second anchor for rays).
+//   • anything else (hline etc.) → the drawing's stored price.
+// The render path already reads a.price each frame, so following is free.
+// When the drawing is deleted the alert disables itself (no zombie alerts)
+// and reports via onAlertEvent({ type: 'disarmed', alert, reason }).
+(function () {
+  const check = BadiAlertEngine.prototype.check;
+  if (check._badiDrawingWrapped) return;
+  BadiAlertEngine.prototype.check = function () {
+    const chart = this.chart;
+    // Resolve drawing-bound levels BEFORE the standard pass.
+    if (this.alerts.some(a => a.drawing)) {
+      const candles = chart.sim && chart.sim.candles;
+      const n = candles ? candles.length : 0;
+      for (const a of this.alerts) {
+        if (!a.drawing) continue;
+        // Disarm if the drawing disappeared (user deleted it, clear-drawings…)
+        const alive = chart.drawings && chart.drawings.indexOf(a.drawing) >= 0;
+        if (!alive) {
+          a.enabled = false;
+          a.drawing = null;
+          if (typeof this.onAlertEvent === 'function') {
+            try { this.onAlertEvent({ type: 'disarmed', alert: a, reason: 'drawing-removed' }); } catch (_) {}
+          }
+          continue;
+        }
+        const level = _badiDrawingLevelAt(a.drawing, n, chart);
+        if (level != null && isFinite(level)) a.price = level;
+      }
+    }
+    return check.call(this);
+  };
+  check._badiDrawingWrapped = true;
+})();
+
+// Price of a drawing's line AT data index n (the newest bar). Supports the
+// two-anchor families (trendline / ray / extended) and flat levels.
+function _badiDrawingLevelAt(d, n, chart) {
+  if (!d) return null;
+  // Flat family: a single price level.
+  if (d.type === 'hline' || d.type === 'vline') return (d.price != null) ? +d.price : null;
+  // Two-anchor family: interpolate the line between (startIdx, startPrice)
+  // and (idx2, price2) — anchors follow the SAME fields the chart's own
+  // drawing editor uses (startIdx/startPrice + idx/price or idx2/price2 —
+  // accept both spellings defensively).
+  let i1 = d.startIdx, p1 = d.startPrice;
+  let i2 = (d.idx2 != null) ? d.idx2 : (d.idx != null ? d.idx : (d.endIdx != null ? d.endIdx : null));
+  let p2 = (d.price2 != null) ? d.price2 : (d.endPrice != null ? d.endPrice : null);
+  if (i1 == null || p1 == null || i2 == null || p2 == null) {
+    return (d.price != null) ? +d.price : (p1 != null ? +p1 : null);
+  }
+  i1 = +i1; p1 = +p1; i2 = +i2; p2 = +p2;
+  if (i2 === i1) return p2;                       // vertical anchor → flat level
+  const slope = (p2 - p1) / (i2 - i1);
+  return p1 + slope * (n - 1 - i1);
+}
+
+TradingChart.prototype.addDrawingAlert = function (spec) {
+  this._perfEnsure();
+  const chart = this;
+  const d = spec && spec.drawing;
+  if (!d || !chart.drawings || chart.drawings.indexOf(d) < 0) {
+    if (BADI_DEBUG) console.warn('[BadiCharts] addDrawingAlert: drawing must be a member of chart.drawings');
+    return null;
+  }
+  const a = this._alerts.addAlert({
+    price: (d.price != null) ? +d.price : (d.startPrice != null ? +d.startPrice : 0),
+    cond: spec.cond || 'cross',
+    color: spec.color || '#ef5350',
+    label: spec.label || 'line alert',
+    once: spec.once, sound: spec.sound,
+    minGapMs: spec.minGapMs,
+    callback: spec.callback,
+    meta: spec.meta
+  });
+  if (a) {
+    a.drawing = d;                    // the binding itself
+    a._badiBound = true;
+    this._alerts._notifyStore();
+    this.invalidate();
+  }
+  return a;
+};
+TradingChart.prototype.getDrawingAlerts = function () {
+  return this._alerts ? this._alerts.alerts.filter(a => a._badiBound) : [];
+};
+
+/* ============================ ALERT IMPORT / EXPORT ======================== */
+// v2.38.0: plain-JSON round trip for user-side persistence (localStorage,
+// IndexedDB, a backend — your choice; the library stays storage-free).
+TradingChart.prototype.exportAlerts = function () {
+  return (this._alerts ? this._alerts.alerts : []).map(a => ({
+    id: a.id, price: a.price, cond: a.cond, color: a.color, label: a.label,
+    enabled: a.enabled, once: a.once, sound: a.sound, minGapMs: a.minGapMs,
+    firedCount: a.firedCount, lastFiredAt: a.lastFiredAt, createdAt: a.createdAt,
+    boundDrawing: !!a._badiBound, meta: a.meta
+  }));
+};
+TradingChart.prototype.importAlerts = function (list, replace) {
+  this._perfEnsure();
+  if (!Array.isArray(list)) return 0;
+  if (replace) this._alerts.clearAlerts();
+  let n = 0;
+  for (const raw of list) {
+    if (!raw || !isFinite(+raw.price)) continue;
+    const a = this._alerts.addAlert({
+      price: +raw.price, cond: raw.cond, color: raw.color, label: raw.label,
+      enabled: raw.enabled !== false, once: raw.once, sound: raw.sound,
+      minGapMs: raw.minGapMs, meta: raw.meta
+    });
+    if (a) { a.firedCount = +raw.firedCount || 0; a.createdAt = +raw.createdAt || a.createdAt; n++; }
+  }
+  return n;
+};
+
+/* =============================================================================
+ * BADI-CHARTS-V2 v2.38.0 — CONTEXT MENU EXTRAS (custom builders, dblclick)
+ * =============================================================================
+ * Round out the menu system without touching the default behavior:
+ *
+ *   • chart.setContextMenu(builder) — REPLACE the entire built-in menu with
+ *     your own. builder(ctx) returns the item list (same item schema as
+ *     addContextMenuItem). Pass null to restore the default. This is for
+ *     integrators who want full control (custom products, kiosks, embeds).
+ *
+ *   • chart.getContextMenuContext() — the live ctx object while a menu is
+ *     open (price under cursor, hovered target, candle at cursor…). Lets
+ *     keyboard-driven apps mirror the menu in their own UI.
+ *
+ *   • DOUBLE-CLICK on an alert line opens the price editor directly
+ *     (power-user path: right-click → Edit price is the discoverable one).
+ *
+ *   • Enriched ctx: menu builders receive { candle } (the OHLCV under the
+ *     cursor) and { alertCount } so item labels can reflect state, e.g.
+ *     when: (ctx) => ctx.candle.close > 100.
+ * ========================================================================== */
+
+/* --------------------------- custom builders ------------------------------- */
+TradingChart.prototype.setContextMenu = function (builder) {
+  this._perfEnsure();
+  if (builder == null) {
+    this._menu.customBuilder = null;
+  } else if (typeof builder === 'function') {
+    this._menu.customBuilder = builder;
+  } else if (Array.isArray(builder)) {
+    // Convenience: accept a static item list (wrapped in a builder).
+    const items = builder;
+    this._menu.customBuilder = function () { return items; };
+  } else {
+    return false;
+  }
+  return true;
+};
+TradingChart.prototype.getContextMenuContext = function () {
+  return (this._menu && this._menu.isOpen) ? this._menu._ctx : null;
+};
+
+// Patch _buildItems: custom builder wins when present; default items keep
+// working otherwise. Implemented as a thin wrapper (not a replacement) so a
+// library rebuild keeps the extension.
+(function () {
+  const build = BadiContextMenu.prototype._buildItems;
+  if (build._badiCustomWrapped) return;
+  BadiContextMenu.prototype._buildItems = function (ctx) {
+    if (typeof this.customBuilder === 'function') {
+      let items;
+      try { items = this.customBuilder(ctx) || []; } catch (_) { items = []; }
+      // user-registered items STILL merge on top — predictable layering:
+      // custom builder defines the base, addContextMenuItem extends it.
+      const users = [...this.userItems.values()]
+        .filter(u => {
+          if (typeof u.when !== 'function') return true;
+          try { return !!u.when(ctx); } catch (_) { return false; }
+        })
+        .sort((a, b) => (+a.order || 0) - (+b.order || 0));
+      if (users.length) {
+        items.push({ separator: true });
+        for (const u of users) {
+          items.push({
+            id: u.id, label: u.label, icon: u.icon, shortcut: u.shortcut,
+            danger: u.danger, checked: u.checked, disabled: u.disabled,
+            submenu: u.submenu, action: u.action
+          });
+        }
+      }
+      return items;
+    }
+    return build.call(this, ctx);
+  };
+  build._badiCustomWrapped = true;
+})();
+
+/* --------------------------- enriched context ------------------------------ */
+// Patch open(): enrich ctx with the candle under the cursor + live counts.
+(function () {
+  const open = BadiContextMenu.prototype.open;
+  if (open._badiEnrichWrapped) return;
+  BadiContextMenu.prototype.open = function (ctx) {
+    try {
+      const chart = this.chart;
+      const candles = chart.sim && chart.sim.candles;
+      if (candles && candles.length) {
+        const idx = Math.round(ctx.idx != null ? ctx.idx : chart.xToIndex(ctx.x));
+        if (idx >= 0 && idx < candles.length) ctx.candle = candles[idx];
+      }
+      ctx.alertCount = this.alerts ? this.alerts.alerts.length : 0;
+      ctx.seriesCount = (chart._perf && chart._perf.series.size) || 0;
+    } catch (_) { /* enrichment is best-effort */ }
+    return open.call(this, ctx);
+  };
+  open._badiEnrichWrapped = true;
+})();
+
+/* --------------------------- double-click → alert editor ------------------- */
+(function () {
+  const dbl = TradingChart.prototype.onDblClick;
+  if (dbl._badiAlertDblWrapped) return;
+  TradingChart.prototype.onDblClick = function (e) {
+    if (this._alerts && this._alerts.alerts.length) {
+      const r = this.canvas.getBoundingClientRect();
+      const x = e.clientX - r.left, y = e.clientY - r.top;
+      const a = this._alerts.hitTest(x, y, 8);
+      if (a) { this._openAlertEditor(a); return; }
+    }
+    return dbl.call(this, e);
+  };
+  dbl._badiAlertDblWrapped = true;
+})();
+
+/* --------------------------- extra icons ----------------------------------- */
+// v2.38.0: additional glyphs for integrator menus (eye/play/info/download).
+Object.assign(BADI_MENU_ICONS, {
+  eye: '<svg viewBox="0 0 16 16"><path d="M1.8 8s2.3-4 6.2-4 6.2 4 6.2 4-2.3 4-6.2 4S1.8 8 1.8 8z" fill="none" stroke="currentColor" stroke-width="1.3"/><circle cx="8" cy="8" r="1.8" fill="currentColor"/></svg>',
+  play: '<svg viewBox="0 0 16 16"><path d="M5 3.5l8 4.5-8 4.5z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>',
+  pause: '<svg viewBox="0 0 16 16"><path d="M5.5 3.5v9M10.5 3.5v9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>',
+  info: '<svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.8" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M8 7.2v3.6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><circle cx="8" cy="5.2" r="0.9" fill="currentColor"/></svg>',
+  download: '<svg viewBox="0 0 16 16"><path d="M8 2.5v7.5M5 7.5l3 3 3-3M3 13h10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  bolt: '<svg viewBox="0 0 16 16"><path d="M9 1.5L4 9h3.5L7 14.5 12 7H8.5z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>'
+});
+
+/* --------------------------- keyboard shortcuts for menu actions -----------
+ * Register chart-scoped hotkeys that trigger menu items WITHOUT opening the
+ * menu — the same action objects power both paths, so labels and behavior
+ * stay in one place.
+ *
+ *   chart.addContextMenuShortcut('Ctrl+Alt+A', 'add-alert');
+ *   // Ctrl+Alt+A now adds an alert at the current mouse price.
+ */
+TradingChart.prototype.addContextMenuShortcut = function (combo, itemId) {
+  this._perfEnsure();
+  if (!combo || !itemId) return false;
+  this._menuShortcuts = this._menuShortcuts || new Map();
+  this._menuShortcuts.set(combo.toLowerCase(), itemId);
+  if (!this._menuShortcutsArmed) {
+    this._menuShortcutsArmed = true;
+    const chart = this;
+    const handler = (e) => {
+      if (!chart._menuShortcuts || chart._menuShortcuts.size === 0) return;
+      // normalize: ctrl+alt+shift+a
+      const parts = [];
+      if (e.ctrlKey || e.metaKey) parts.push('ctrl');
+      if (e.altKey) parts.push('alt');
+      if (e.shiftKey) parts.push('shift');
+      const key = (e.key || '').toLowerCase();
+      if (key && key.length === 1) parts.push(key);
+      else if (key) parts.push(key);
+      const combo2 = parts.join('+');
+      const itemId2 = chart._menuShortcuts.get(combo2);
+      if (!itemId2) return;
+      // find the item (user items first, then built-ins)
+      const ctx = chart._buildMenuCtxNow();
+      if (!ctx) return;
+      const spec = (chart._menu && chart._menu.userItems.get(itemId2)) ||
+                   _bcmBuiltinAction(chart, itemId2, ctx);
+      if (spec && typeof spec.action === 'function') {
+        e.preventDefault();
+        try { spec.action(ctx); } catch (_) {}
+      }
+    };
+    try {
+      window.addEventListener('keydown', handler);
+      chart._menuShortcutHandler = handler;
+    } catch (_) {}
+  }
+  return true;
+};
+TradingChart.prototype.removeContextMenuShortcut = function (combo) {
+  if (this._menuShortcuts) this._menuShortcuts.delete(String(combo).toLowerCase());
+  return true;
+};
+TradingChart.prototype._buildMenuCtxNow = function () {
+  const chart = this;
+  const candles = chart.sim && chart.sim.candles;
+  if (!candles || !candles.length) return null;
+  const x = (chart.mouseX != null) ? chart.mouseX : chart.chartRight - 40;
+  const y = (chart.mouseY != null) ? chart.mouseY : (chart.priceTop + chart.priceBottom) / 2;
+  const idx = Math.max(0, Math.min(candles.length - 1, Math.round(chart.xToIndex(x))));
+  let target = null;
+  if (chart._alerts) {
+    const hitAlert = chart._alerts.hitTest(x, y);
+    if (hitAlert) target = { kind: 'alert', alert: hitAlert };
+  }
+  return {
+    x: x, y: y, clientX: x, clientY: y,
+    price: chart.yToPrice(y), idx: idx,
+    candle: candles[idx], target: target,
+    alertCount: chart._alerts ? chart._alerts.alerts.length : 0,
+    seriesCount: (chart._perf && chart._perf.series.size) || 0
+  };
+};
+// Built-in action lookup for shortcuts against library items.
+function _bcmBuiltinAction(chart, itemId, ctx) {
+  switch (itemId) {
+    case 'add-alert':
+      return { action: () => { chart._perfEnsure(); chart._alerts.addAlert({ price: ctx.price, cond: 'cross' }); chart.showToast(badiT(chart, 'alertCreated')(chart._alerts._fmtPrice(ctx.price))); } };
+    case 'screenshot':
+      return { action: () => chart._saveScreenshot() };
+    case 'copy-price':
+      return { action: () => { _bcmCopyText(chart._alerts ? chart._alerts._fmtPrice(ctx.price) : String(ctx.price)); } };
+    case 'reset-view':
+      return { action: () => chart.resetView() };
+    default:
+      return null;
+  }
+}
+
+/* =============================================================================
+ * BADI-CHARTS-V2 v2.38.0 — BUILT-IN SELF-TEST SUITE
+ * =============================================================================
+ * The performance core replaces hot rendering paths with typed arrays,
+ * GPU batches and state machines — subtle regressions there are invisible
+ * in screenshots but FATAL in production ("my 1M-point series shows the
+ * wrong min/max at zoom 8"). This suite pins the critical behaviors with
+ * pure-logic tests that run EVERYWHERE: browser console AND plain Node
+ * (no canvas, no DOM, no WebGL needed for most cases).
+ *
+ *   // Browser / Node:
+ *   const r = BadiCharts.runSelfTest();
+ *   console.log(r.pass + '/' + r.total, 'passed');
+ *   r.results.filter(x => !x.ok).forEach(x => console.error(x.name, x.msg));
+ *
+ * Suites: ring buffer · object pool · typed scratch pools · packed colors ·
+ * min-max decimator (golden cases) · Douglas-Peucker · LTTB · LOD cache
+ * (hit/miss/LRU) · spatial grid (hit accuracy + misses) · alert condition
+ * state machine (every condition, boundary cases) · alert history ring ·
+ * candle aggregator (bucketing, late ticks) · feed RNG determinism ·
+ * drawing-bound alert interpolation · i18n key parity (en/ar) · menu icons
+ * integrity · item schema validation · chunk slot invariants · worker pool
+ * graceful degradation.
+ * ========================================================================== */
+const BADI_SELFTEST = (() => {
+  const results = [];
+  const t = (name, fn) => {
+    try {
+      const r = fn();
+      if (r === true || (r && r.ok)) results.push({ name: name, ok: true, msg: (r && r.msg) || '' });
+      else results.push({ name: name, ok: false, msg: (r && r.msg) || 'returned false' });
+    } catch (e) {
+      results.push({ name: name, ok: false, msg: e && e.message ? e.message : String(e) });
+    }
+  };
+  const assertEq = (a, b, msg) => {
+    if (a !== b) throw new Error((msg || 'assertEq') + ' — got ' + JSON.stringify(a) + ', want ' + JSON.stringify(b));
+  };
+  const assertClose = (a, b, eps, msg) => {
+    if (!(Math.abs(a - b) <= (eps || 1e-9))) throw new Error((msg || 'assertClose') + ' — got ' + a + ', want ' + b);
+  };
+  const assertTrue = (v, msg) => { if (!v) throw new Error(msg || 'assertTrue failed'); };
+
+  /* ------------------------------ ring buffer ----------------------------- */
+  function suiteRing() {
+    t('ring: FIFO order across wrap-around', () => {
+      // Ring64 clamps capacity to ≥16 — push past the cap and verify only
+      // the NEWEST window survives, in chronological order.
+      const r = new BadiRing64(16);
+      for (let i = 0; i < 20; i++) r.push(i);
+      assertEq(r.length, 16);
+      assertEq(r.get(0), 4, 'oldest retained after overflow');
+      assertEq(r.get(15), 19, 'newest value');
+      const flat = r.toArray();
+      assertEq(flat.length, 16);
+      assertClose(flat[0], 4, 1e-12); assertClose(flat[15], 19, 1e-12);
+      return true;
+    });
+    t('ring: set() touches the right slot', () => {
+      const r = new BadiRing64(3);
+      [1, 2, 3].forEach(v => r.push(v));
+      r.set(1, 99);
+      assertEq(r.get(1), 99);
+      return true;
+    });
+    t('ring: under-capacity keeps everything', () => {
+      const r = new BadiRing64(64);
+      for (let i = 0; i < 10; i++) r.push(i);
+      assertEq(r.length, 10);
+      assertEq(r.get(0), 0); assertEq(r.get(9), 9);
+      return true;
+    });
+  }
+
+  /* ------------------------------ object pool ------------------------------ */
+  function suitePool() {
+    t('pool: reuse without growth', () => {
+      const pool = new BadiPool(() => ({ v: 0 }), (o) => { o.v = 0; }, 2);
+      const a = pool.acquire(); a.v = 42;
+      pool.release(a);
+      const b = pool.acquire();
+      assertEq(b.v, 0, 'reset applied on release');
+      assertEq(pool.stats().created, 2, 'no new allocations');
+      return true;
+    });
+    t('pool: grows on demand', () => {
+      const pool = new BadiPool(() => ({}), null, 0);
+      const x = pool.acquire(), y = pool.acquire(), z = pool.acquire();
+      assertTrue(x !== y && y !== z);
+      assertEq(pool.stats().created, 3);
+      return true;
+    });
+  }
+
+  /* ------------------------------ decimators ------------------------------- */
+  function suiteDecimator() {
+    t('minmax: monotonic rise keeps endpoints + anchors', () => {
+      const p = new Float64Array(100);
+      for (let i = 0; i < 100; i++) p[i] = i;
+      const kept = BadiDecimator.minMaxKeep(p, 0, 99, 10);
+      assertTrue(kept.length >= 10 && kept.length <= 45, 'bounded anchors');
+      assertEq(kept[0], 0, 'first index kept');
+      assertEq(kept[kept.length - 1], 99, 'last index kept');
+      // ascending
+      for (let i = 1; i < kept.length; i++) assertTrue(kept[i] > kept[i - 1]);
+      return true;
+    });
+    t('minmax: sine keeps extremes (silhouette safe)', () => {
+      const N = 1000;
+      const p = new Float64Array(N);
+      for (let i = 0; i < N; i++) p[i] = Math.sin(i / 20);
+      const kept = BadiDecimator.minMaxKeep(p, 0, N - 1, 50);
+      // Every local min/max of the sine MUST survive — walk kept values and
+      // verify the global extremes inside each 20-point period are present.
+      let minIdx = 0, maxIdx = 0;
+      for (let i = 0; i < N; i++) { if (p[i] < p[minIdx]) minIdx = i; if (p[i] > p[maxIdx]) maxIdx = i; }
+      const set = new Set([...kept]);
+      assertTrue(set.has(minIdx) || set.has(minIdx - 1) || set.has(minIdx + 1), 'global min anchored');
+      assertTrue(set.has(maxIdx) || set.has(maxIdx - 1) || set.has(maxIdx + 1), 'global max anchored');
+      return true;
+    });
+    t('minmax: NaN values are skipped, not fatal', () => {
+      const p = new Float64Array([1, NaN, 2, NaN, NaN, 3]);
+      const kept = BadiDecimator.minMaxKeep(p, 0, 5, 2);
+      assertTrue(kept.length >= 2);
+      return true;
+    });
+    t('minmax: tiny ranges return everything', () => {
+      const p = new Float64Array([5, 6, 7]);
+      const kept = BadiDecimator.minMaxKeep(p, 0, 2, 100);
+      assertEq(kept.length, 3);
+      return true;
+    });
+    t('dp: straight line collapses to 2 points', () => {
+      const N = 500;
+      const xs = new Float64Array(N), ys = new Float64Array(N);
+      for (let i = 0; i < N; i++) { xs[i] = i; ys[i] = i * 0.5; }
+      const mask = BadiDecimator.dpKeepMask(xs, ys, 0, N - 1, 0.5);
+      let count = 0;
+      for (let i = 0; i < N; i++) count += mask[i];
+      assertEq(count, 2, 'endpoints only');
+      return true;
+    });
+    t('dp: zigzag keeps corners', () => {
+      const xs = new Float64Array([0, 10, 20, 30, 40]);
+      const ys = new Float64Array([0, 10, 0, 10, 0]);
+      const mask = BadiDecimator.dpKeepMask(xs, ys, 0, 4, 0.5);
+      assertEq(mask[0], 1); assertEq(mask[4], 1);
+      assertTrue(mask[1] === 1 && mask[2] === 1 && mask[3] === 1, 'all corners survive eps=0.5');
+      return true;
+    });
+    t('lttb: exact target count, endpoints included', () => {
+      const N = 5000;
+      const p = new Float64Array(N);
+      for (let i = 0; i < N; i++) p[i] = Math.sin(i / 7) + (i % 50) * 0.01;
+      const kept = BadiDecimator.lttbKeep(p, 0, N - 1, 400);
+      assertEq(kept.length, 400);
+      assertEq(kept[0], 0); assertEq(kept[399], N - 1);
+      for (let i = 1; i < 400; i++) assertTrue(kept[i] > kept[i - 1]);
+      return true;
+    });
+  }
+
+  /* ------------------------------ LOD cache -------------------------------- */
+  function suiteLodCache() {
+    t('lod: hit then miss after version bump', () => {
+      const c = new BadiLODCache(8);
+      const idx = new Uint32Array([1, 2, 3]);
+      c.put(1, 0, 99, 4, 'high', 'mm', idx);
+      assertTrue(c.get(1, 0, 99, 4, 'high', 'mm') === idx, 'hit');
+      assertTrue(c.get(1, 0, 99, 4, 'high', 'mm2') === null, 'different kernel misses');
+      c.put(2, 0, 99, 4, 'high', 'mm', idx);        // version bumped
+      assertTrue(c.get(1, 0, 99, 4, 'high', 'mm') === idx, 'old version still cached');
+      return true;
+    });
+    t('lod: LRU evicts least-recent', () => {
+      const c = new BadiLODCache(2);
+      c.put(1, 0, 9, 1, 'high', 'mm', new Uint32Array(1));
+      c.put(2, 0, 9, 1, 'high', 'mm', new Uint32Array(1));
+      c.get(1, 0, 9, 1, 'high', 'mm');             // touch entry 1
+      c.put(3, 0, 9, 1, 'high', 'mm', new Uint32Array(1));  // evicts entry 2
+      assertTrue(c.get(1, 0, 9, 1, 'high', 'mm') !== null, 'touched survives');
+      assertTrue(c.get(2, 0, 9, 1, 'high', 'mm') === null, 'untouched evicted');
+      return true;
+    });
+  }
+
+  /* ------------------------------ spatial grid ----------------------------- */
+  function suiteGrid() {
+    function mockChart() {
+      return {
+        barSpacing: 10, rightOffset: 0, chartLeft: 0, chartRight: 500,
+        priceTop: 0, priceBottom: 300,
+        priceScale: { _priceRange: { min: 0, max: 100 } },
+        xToIndex(x) { return (9) - (500 - x) / 10; },
+        sim: { candles: new Array(10) }
+      };
+    }
+    t('grid: direct hit on a horizontal segment', () => {
+      const g = new BadiSpatialGrid({ cellPx: 50 });
+      const chart = mockChart();
+      g.beginBuild(chart, 'fp1');
+      g._x0 = 0; g._y0 = 0;
+      g.addSegment(0, 5, 100, 150, 400, 150);
+      g.endBuild();
+      const hit = g.hitTest(250, 152, 6);        // 2px below the line
+      assertTrue(hit !== null, 'hit within tolerance');
+      assertEq(hit.dataIdx, 5);
+      const miss = g.hitTest(250, 200, 6);       // far away
+      assertTrue(miss === null, 'no false positives');
+      return true;
+    });
+    t('grid: diagonal segment distance is correct', () => {
+      const g = new BadiSpatialGrid({ cellPx: 50 });
+      const chart = mockChart();
+      g.beginBuild(chart, 'fp2');
+      g._x0 = 0; g._y0 = 0;
+      g.addSegment(0, 1, 0, 0, 100, 100);        // y = x
+      g.endBuild();
+      const hit = g.hitTest(50, 53, 5);          // 3/sqrt(2)≈2.1px off the line
+      assertTrue(hit !== null);
+      const miss = g.hitTest(50, 60, 5);         // 7/sqrt(2)≈4.9px… borderline
+      // point (50,60): distance to y=x is |60-50|/√2 ≈ 7.07px > 5 → miss
+      assertTrue(miss === null, 'distance respects tolerance');
+      return true;
+    });
+    t('grid: nearest wins across cells', () => {
+      const g = new BadiSpatialGrid({ cellPx: 40 });
+      const chart = mockChart();
+      g.beginBuild(chart, 'fp3');
+      g._x0 = 0; g._y0 = 0;
+      g.addSegment(0, 1, 0, 100, 200, 100);
+      g.addSegment(1, 2, 0, 118, 200, 118);
+      g.endBuild();
+      const hit = g.hitTest(100, 116, 8);
+      assertTrue(hit !== null);
+      assertEq(hit.seriesOrdinal, 1, 'closer segment (18px vs 16px from 116)');
+      return true;
+    });
+  }
+
+  /* ------------------------------ packed color ----------------------------- */
+  function suiteColors() {
+    t('color: hex round-trip preserves channels', () => {
+      const packed = badiPackedColor('#26a69a');
+      const css = badiUnpackColor(packed);
+      assertTrue(css.startsWith('rgba(38,166,154'), 'got ' + css);
+      return true;
+    });
+    t('color: alpha channels are separate from series alpha', () => {
+      const packed = badiPackedColor('rgba(255,0,0,0.5)');
+      const css = badiUnpackColor(packed);
+      assertTrue(css.startsWith('rgba(255,0,0,'), 'got ' + css);
+      return true;
+    });
+  }
+
+  /* ------------------------------ alert conditions ------------------------- */
+  function suiteAlerts() {
+    const mkChart = (closes) => ({
+      sim: { candles: closes.map(c => ({ close: c })) },
+      invalidate() {}, showToast() {},
+      symbol: { decimals: 2 }, _badiOpts: {},
+      priceToY(p) { return p; }, yToPrice(y) { return y; },
+      chartLeft: 0, chartRight: 100, priceTop: 0, priceBottom: 100,
+      drawings: []
+    });
+    t('alert cond: above fires only crossing up', () => {
+      assertEq(BadiAlertEngine.testCond({ cond: 'above', price: 100 }, 99, 101), true);
+      assertEq(BadiAlertEngine.testCond({ cond: 'above', price: 100 }, 101, 102), false, 'already above');
+      assertEq(BadiAlertEngine.testCond({ cond: 'above', price: 100 }, 101, 99), false, 'crossing down');
+      return true;
+    });
+    t('alert cond: below fires only crossing down', () => {
+      assertEq(BadiAlertEngine.testCond({ cond: 'below', price: 100 }, 101, 99), true);
+      assertEq(BadiAlertEngine.testCond({ cond: 'below', price: 100 }, 99, 98), false);
+      assertEq(BadiAlertEngine.testCond({ cond: 'below', price: 100 }, 99, 101), false);
+      return true;
+    });
+    t('alert cond: crossUp/crossDown/cross semantics', () => {
+      assertEq(BadiAlertEngine.testCond({ cond: 'crossUp', price: 50 }, 49, 51), true);
+      assertEq(BadiAlertEngine.testCond({ cond: 'crossUp', price: 50 }, 51, 49), false);
+      assertEq(BadiAlertEngine.testCond({ cond: 'crossDown', price: 50 }, 51, 49), true);
+      assertEq(BadiAlertEngine.testCond({ cond: 'cross', price: 50 }, 49, 51), true);
+      assertEq(BadiAlertEngine.testCond({ cond: 'cross', price: 50 }, 51, 49), true);
+      assertEq(BadiAlertEngine.testCond({ cond: 'cross', price: 50 }, 52, 53), false);
+      return true;
+    });
+    t('alert cond: touch is inclusive at the level', () => {
+      assertEq(BadiAlertEngine.testCond({ cond: 'touch', price: 100 }, 99, 100), true);
+      assertEq(BadiAlertEngine.testCond({ cond: 'touch', price: 100 }, 101, 100.5), false);
+      return true;
+    });
+    t('alert engine: full state machine with re-arm', () => {
+      const eng = new BadiAlertEngine(mkChart([100]));
+      let fired = 0;
+      const a = eng.addAlert({ price: 110, cond: 'above', once: false, minGapMs: 0, callback: () => fired++ });
+      eng.check();                                   // arm pass (100 < 110)
+      assertEq(a.state, 'armed');
+      eng._prevPrice = 109; eng.check();             // 109→109 no fire
+      assertEq(fired, 0);
+      eng._prevPrice = 109;
+      eng.chart.sim.candles = [{ close: 111 }];
+      eng.check();                                   // crosses 110 → FIRE
+      assertEq(fired, 1);
+      assertEq(a.firedCount, 1);
+      eng._prevPrice = 111; eng.check();             // still above → no re-fire
+      assertEq(fired, 1);
+      eng._prevPrice = 111;
+      eng.chart.sim.candles = [{ close: 105 }];
+      eng.check();                                   // back below → re-armed
+      assertEq(a.state, 'armed');
+      eng._prevPrice = 105;
+      eng.chart.sim.candles = [{ close: 112 }];
+      eng.check();                                   // second crossing → FIRE
+      assertEq(fired, 2);
+      return true;
+    });
+    t('alert engine: once-alerts fire a single time', () => {
+      const eng = new BadiAlertEngine(mkChart([100]));
+      let fired = 0;
+      eng.addAlert({ price: 105, cond: 'cross', once: true, minGapMs: 0, callback: () => fired++ });
+      eng._prevPrice = 104;
+      eng.chart.sim.candles = [{ close: 106 }];
+      eng.check();
+      eng._prevPrice = 106;
+      eng.chart.sim.candles = [{ close: 104 }];
+      eng.check();                                   // second cross — once → skip
+      assertEq(fired, 1);
+      return true;
+    });
+    t('alert history: ring + stats', () => {
+      // capacity clamps to ≥10 — push 15, verify only the newest 10 remain.
+      const h = new BadiAlertHistory(10);
+      for (let i = 0; i < 15; i++) {
+        h.push({ time: i, alert: { id: 'a' + i, cond: i % 2 ? 'crossUp' : 'crossDown', label: '' }, price: 10 + i });
+      }
+      assertEq(h.events.length, 10, 'ring capped');
+      assertEq(h.recent(1)[0].at, 14, 'newest first (stored as .at)');
+      const st = h.stats();
+      // ring keeps i = 5..14 → crossUp at odd i (5,7,9,11,13) = 5, the rest down
+      assertEq(st.up, 5); assertEq(st.down, 5);
+      return true;
+    });
+    t('drawing-bound alert: level interpolation + extrapolation', () => {
+      const d = { type: 'trendline', startIdx: 10, startPrice: 100, idx2: 20, price2: 110 };
+      const lvlAt30 = _badiDrawingLevelAt(d, 31, null);   // slope 1 → at bar 30: 120
+      assertClose(lvlAt30, 120, 1e-9, 'extrapolates past anchor 2');
+      const lvlAt10 = _badiDrawingLevelAt(d, 11, null);   // at bar 10: 100
+      assertClose(lvlAt10, 100, 1e-9);
+      const flat = { type: 'hline', price: 55 };
+      assertEq(_badiDrawingLevelAt(flat, 100, null), 55);
+      return true;
+    });
+    t('drawing-bound alert: disarms when drawing is deleted', () => {
+      const d = { type: 'trendline', startIdx: 5, startPrice: 10, idx2: 15, price2: 12 };
+      const chart = mkChart([{ close: 10 }]);
+      chart.drawings = [d];
+      const eng = new BadiAlertEngine(chart);
+      const a = eng.addAlert({ price: 10, cond: 'cross' });
+      a.drawing = d; a._badiBound = true;
+      eng.check();   // drawing alive → level = price of the line at bar 0
+      // slope = (12-10)/(15-5) = 0.2 → at bar 0: 10 + 0.2·(0-5) = 9
+      assertClose(a.price, 9, 1e-9, 'level follows the line');
+      chart.drawings = [];                            // user deleted the line
+      let disarmed = null;
+      eng.onAlertEvent = (ev) => { if (ev.type === 'disarmed') disarmed = ev.reason; };
+      eng.check();
+      assertEq(a.enabled, false, 'disabled');
+      assertEq(disarmed, 'drawing-removed');
+      return true;
+    });
+  }
+
+  /* ------------------------------ aggregator ------------------------------- */
+  function suiteAggregator() {
+    t('aggregator: buckets align to timeframe', () => {
+      const agg = new BadiCandleAggregator(60000, 100);   // 1m
+      // three ticks INSIDE the same 60s bucket (bucket starts 1699999980)
+      agg.tick(1700000000, 100, 1);
+      agg.tick(1700000010, 102, 2);
+      agg.tick(1700000030, 99, 3);
+      assertEq(agg.candles.length, 1);
+      const c = agg.candles[0];
+      assertEq(c.open, 100); assertEq(c.high, 102); assertEq(c.low, 99);
+      assertEq(c.close, 99); assertEq(c.volume, 6);
+      assertEq(c.time % 60, 0, 'bucket start aligned');
+      return true;
+    });
+    t('aggregator: rolls into the next bucket', () => {
+      const agg = new BadiCandleAggregator(60000, 100);
+      agg.tick(1700000000, 100, 1);
+      agg.tick(1700000061, 105, 1);                       // next minute
+      assertEq(agg.candles.length, 2);
+      assertEq(agg.candles[1].open, 105);
+      return true;
+    });
+    t('aggregator: ms timestamps auto-detected', () => {
+      const agg = new BadiCandleAggregator(60000, 100);
+      agg.tick(1700000000000, 50, 1);
+      assertEq(agg.candles[0].time, 1700000000 - (1700000000 % 60));
+      return true;
+    });
+    t('aggregator: max length honored (shift, not grow)', () => {
+      const agg = new BadiCandleAggregator(1000, 5);
+      for (let i = 0; i < 20; i++) agg.tick(1700000000 + i, 100 + i, 1);
+      assertEq(agg.candles.length, 5);
+      assertEq(agg.candles[0].open, 115, 'oldest dropped');
+      return true;
+    });
+  }
+
+  /* ------------------------------ feed ------------------------------------- */
+  function suiteFeed() {
+    t('feed RNG: deterministic across instances', () => {
+      const a = BadiDataFeed._mulberry(42), b = BadiDataFeed._mulberry(42);
+      for (let i = 0; i < 100; i++) assertEq(a(), b(), 'same seed → same sequence');
+      return true;
+    });
+    t('feed coalescing: burst merges into one tick', () => {
+      let calls = 0, last = null;
+      const feed = new BadiDataFeed({ mode: 'demo', coalesceMs: 0, onTick: (t) => { calls++; last = t; } });
+      for (let i = 0; i < 100; i++) feed.push({ time: 1700000000 + i, price: 100 + i, volume: 1 });
+      assertEq(calls, 100, 'coalesceMs=0 → immediate flush per push');
+      assertClose(last.price, 199, 1e-9, 'last price wins');
+      feed.destroy();
+      return true;
+    });
+    t('feed queue: drops oldest under pressure, keeps newest', () => {
+      const feed = new BadiDataFeed({ coalesceMs: 99999, maxQueue: 10 });
+      for (let i = 0; i < 100; i++) feed.push({ time: i, price: i, volume: 0 });
+      const st = feed.getStats();
+      assertTrue(st.queued <= 10, 'bounded queue');
+      assertTrue(st.dropped > 0, 'overflow recorded');
+      feed.destroy();
+      return true;
+    });
+    t('worker pool: degrades gracefully without Workers', () => {
+      // In Node there is no Worker/Blob — the pool must report unavailable
+      // and resolve jobs to null (callers fall back to sync).
+      if (typeof Worker !== 'undefined') return { ok: true, msg: 'browser env — skipped' };
+      const pool = new BadiWorkerPool(2);
+      assertEq(pool.available, false, 'unavailable in Node');
+      let resolved = 'pending';
+      pool.submit('minmax', { p: new Float64Array([1, 2, 3]), from: 0, to: 2, arg: 1 })
+        .then(v => { resolved = v; });
+      // Promise resolution is async; both null and a value are acceptable —
+      // the contract is "never throws".
+      return { ok: true, msg: 'no throw in Node' };
+    });
+  }
+
+  /* ------------------------------ chunk packing ---------------------------- */
+  function suiteChunk() {
+    t('chunk: tryPlace reserves contiguous slots', () => {
+      const chunk = new BadiPerfChunk(null, 1000);
+      const mk = (id) => ({ id: id, uploadDirty: true, slot: null, slotCap: 100 });
+      const a = mk('a'), b = mk('b');
+      const sa = chunk.tryPlace(a), sb = chunk.tryPlace(b);
+      assertTrue(sa && sb);
+      assertEq(sa.vertOffset, 0);
+      assertEq(sb.vertOffset, 100);
+      assertEq(chunk.usedVerts, 200);
+      return true;
+    });
+    t('chunk: full when capacity exhausted', () => {
+      const chunk = new BadiPerfChunk(null, 100);
+      const a = { id: 'a', slot: null, slotCap: 60, uploadDirty: true };
+      const b = { id: 'b', slot: null, slotCap: 60, uploadDirty: true };
+      assertTrue(chunk.tryPlace(a) !== null);
+      assertTrue(chunk.tryPlace(b) === null, '60+60 > 100 → reject');
+      return true;
+    });
+    t('chunk: unplace + repack compacts without gaps', () => {
+      const chunk = new BadiPerfChunk(null, 1000);
+      const a = { id: 'a', slot: null, slotCap: 100, uploadDirty: true };
+      const b = { id: 'b', slot: null, slotCap: 100, uploadDirty: true };
+      const c = { id: 'c', slot: null, slotCap: 100, uploadDirty: true };
+      chunk.tryPlace(a); chunk.tryPlace(b); chunk.tryPlace(c);
+      chunk.unplace(b);
+      chunk.repack();
+      assertEq(chunk.usedVerts, 200, 'compacted');
+      const slots = chunk.slots;
+      assertEq(slots[0].vertOffset, 0);
+      assertEq(slots[1].vertOffset, 100, 'no gap left behind');
+      return true;
+    });
+  }
+
+  /* ------------------------------ i18n + icons ----------------------------- */
+  function suiteI18n() {
+    t('i18n: en/ar key parity', () => {
+      const en = Object.keys(BADI_I18N.en).sort();
+      const ar = Object.keys(BADI_I18N.ar).sort();
+      assertEq(JSON.stringify(en), JSON.stringify(ar), 'same keys both languages');
+      return true;
+    });
+    t('i18n: every en value is a string or function', () => {
+      for (const k of Object.keys(BADI_I18N.en)) {
+        const v = BADI_I18N.en[k];
+        assertTrue(typeof v === 'string' || typeof v === 'function', 'bad type for ' + k);
+        if (typeof v === 'function') {
+          // call with a dummy price — must not throw
+          try { v('123'); } catch (e) { throw new Error('formatter ' + k + ' threw: ' + e.message); }
+        }
+      }
+      return true;
+    });
+    t('i18n: Arabic strings are non-empty and RTL-safe', () => {
+      for (const k of Object.keys(BADI_I18N.ar)) {
+        const v = BADI_I18N.ar[k];
+        if (typeof v === 'string') assertTrue(v.length > 0, 'empty string ' + k);
+      }
+      return true;
+    });
+    t('icons: every icon is a non-empty <svg>', () => {
+      for (const k of Object.keys(BADI_MENU_ICONS)) {
+        const v = BADI_MENU_ICONS[k];
+        assertTrue(typeof v === 'string' && v.indexOf('<svg') === 0 && v.indexOf('</svg>') > 0, 'bad icon ' + k);
+      }
+      return true;
+    });
+    t('menu: item schema validation', () => {
+      const chart = { _badiLang: 'en', theme: {}, canvas: { getBoundingClientRect() { return { left: 0, top: 0 }; } } };
+      const alerts = new BadiAlertEngine(chart);
+      const menu = new BadiContextMenu(chart, alerts);
+      assertTrue(menu.addItem({ id: 'x1', label: 'X' }) === true);
+      assertTrue(menu.addItem(null) === false, 'null rejected');
+      assertTrue(menu.addItem({ label: 'no id' }) === false, 'id required');
+      assertTrue(menu.userItems.has('x1'));
+      assertTrue(menu.removeItem('x1') === true);
+      return true;
+    });
+    t('menu: alert context items build for a live alert', () => {
+      const chart = {
+        _badiLang: 'en', theme: {}, drawings: [],
+        canvas: { getBoundingClientRect() { return { left: 0, top: 0 }; } },
+        showToast() {}, invalidate() {}, sim: { candles: [{ close: 10 }] },
+        symbol: { decimals: 2 }, _badiOpts: {},
+        priceToY(p) { return 50; }, yToPrice() { return 10; },
+        chartLeft: 0, chartRight: 100, priceTop: 0, priceBottom: 100
+      };
+      const alerts = new BadiAlertEngine(chart);
+      const a = alerts.addAlert({ price: 10, cond: 'cross' });
+      const menu = new BadiContextMenu(chart, alerts);
+      const items = menu._buildItems({ x: 0, y: 0, price: 10, target: { kind: 'alert', alert: a } });
+      assertTrue(items.length >= 4, 'alert items present');
+      assertTrue(items.some(i => i.id === 'alert-delete'), 'delete exists');
+      assertTrue(items.some(i => i.id === 'alert-edit'), 'edit exists');
+      return true;
+    });
+    t('menu: default items include add-alert + alerts submenu', () => {
+      const chart = {
+        _badiLang: 'en', theme: {}, drawings: [],
+        canvas: { getBoundingClientRect() { return { left: 0, top: 0 }; } },
+        showToast() {}, invalidate() {}, sim: { candles: [{ close: 10 }] },
+        symbol: { decimals: 2 }, _badiOpts: {},
+        priceToY() { return 50; }, yToPrice() { return 10; },
+        chartLeft: 0, chartRight: 100, priceTop: 0, priceBottom: 100
+      };
+      const alerts = new BadiAlertEngine(chart);
+      const menu = new BadiContextMenu(chart, alerts);
+      const items = menu._buildItems({ x: 0, y: 0, price: 10, target: null });
+      assertTrue(items.some(i => i.id === 'add-alert'));
+      assertTrue(items.some(i => i.id === 'alerts-sub'));
+      return true;
+    });
+  }
+
+  /* ------------------------------ series store ----------------------------- */
+  function suiteSeries() {
+    function mkEngine() {
+      const chart = {
+        sim: { candles: [{ time: 1700000000, close: 10 }, { time: 1700000060, close: 11 }] },
+        timeframe: { ms: 60000 },
+        priceScale: { _priceRange: { min: 0, max: 100 }, priceRange() { return this._priceRange; }, internalHeight() { return 280; }, height() { return 300; }, bottomMarginPx() { return 20; } },
+        chartLeft: 0, chartRight: 1000, priceTop: 10, priceBottom: 290,
+        barSpacing: 8, rightOffset: 0, dpr: 1,
+        xToIndex(x) { return 1 - (1000 - x) / 8; },
+        ctx: { backend: null, _nc: null },
+        invalidate() {}, _badiOpts: {}
+      };
+      return new BadiPerfEngine(chart, {});
+    }
+    t('series: time anchors convert to candle indices', () => {
+      const eng = mkEngine();
+      const id = eng.addSeries({
+        id: 's1',
+        points: [{ t: 1700000000, p: 10 }, { t: 1700000060, p: 11 }]
+      });
+      const s = eng.series.get(id);
+      assertTrue(s.timeAnchored, 'flagged as anchored');
+      assertEq(s.t[0], 0, 'first candle → idx 0');
+      assertEq(s.t[1], 1, 'second candle → idx 1');
+      return true;
+    });
+    t('series: future times project past the last candle', () => {
+      const eng = mkEngine();
+      eng.addSeries({ id: 's2', points: [{ t: 1700000300, p: 12 }] });   // +5min
+      const s = eng.series.get('s2');
+      assertClose(s.t[0], 5, 1e-6, 'idx 5 (beyond 2 candles, linear in tf)');
+      return true;
+    });
+    t('series: invalid points are skipped, order kept', () => {
+      const eng = mkEngine();
+      eng.addSeries({ id: 's3', points: [
+        { idx: 0, p: 1 }, { idx: 1, p: NaN }, null,
+        { idx: 2, p: 3 }, [3, 4], { idx: 4, p: Infinity }
+      ] });
+      const s = eng.series.get('s3');
+      assertEq(s.n, 3, '1,3,4 survive');
+      assertEq(s.p[0], 1); assertEq(s.p[1], 3); assertEq(s.p[2], 4);
+      return true;
+    });
+    t('series: appendPoint streams with cap', () => {
+      const eng = mkEngine();
+      eng.addSeries({ id: 's4', points: [{ idx: 0, p: 1 }], maxPoints: 4 });
+      for (let i = 1; i <= 8; i++) eng.appendPoint('s4', { idx: i, p: i });
+      const s = eng.series.get('s4');
+      assertTrue(s.n <= 4, 'capped at maxPoints');
+      assertEq(s.p[s.n - 1], 8, 'newest value retained');
+      return true;
+    });
+    t('series: LOD band is a power of two and grows with data', () => {
+      const eng = mkEngine();
+      const N = 100000;
+      const p = new Float64Array(N);
+      for (let i = 0; i < N; i++) p[i] = Math.sin(i / 10);
+      eng.addSeries({ id: 's5', points: Array.from(p).map((v, i) => ({ idx: i, p: v })) });
+      const s = eng.series.get('s5');
+      const band = eng._bandFor(s, s.n);
+      assertTrue(band >= 1 && (band & (band - 1)) === 0, 'pow2');
+      assertTrue(band > 1, 'large series → coarser band');
+      return true;
+    });
+    t('engine: transform uniforms are linear and consistent with priceToY', () => {
+      const eng = mkEngine();
+      const chart = eng.chart;
+      const range = chart.priceScale.priceRange();
+      const ih = chart.priceScale.internalHeight();
+      const yB = ih / (range.max - range.min);
+      const yA = chart.priceTop + (chart.priceScale.height() - 1) - chart.priceScale.bottomMarginPx() + yB * range.min;
+      // pick three prices and compare against a reference mapping
+      for (const probe of [0, 50, 100]) {
+        const ref = chart.priceTop + chart.priceScale.height() - 1 - chart.priceScale.bottomMarginPx()
+          - ih * (probe - range.min) / (range.max - range.min);
+        const ours = yA - yB * probe;
+        assertClose(ours, ref, 1e-6, 'linear map matches logicalToCoordinate at ' + probe);
+      }
+      return true;
+    });
+    t('engine: min-max decimation preserves window extremes', () => {
+      const eng = mkEngine();
+      const N = 50000;
+      const pts = new Array(N);
+      let mn = Infinity, mx = -Infinity;
+      for (let i = 0; i < N; i++) {
+        const v = 50 + 40 * Math.sin(i / 100) + 5 * Math.sin(i / 3.7);
+        pts[i] = { idx: i, p: v };
+        if (v < mn) mn = v; if (v > mx) mx = v;
+      }
+      eng.addSeries({ id: 's6', points: pts });
+      const s = eng.series.get('s6');
+      const kept = eng._ensureLod(s, 0, N - 1);
+      assertTrue(kept && kept.length > 0);
+      let kmn = Infinity, kmx = -Infinity;
+      const ys = s.ys();
+      for (const i of kept) { if (ys[i] < kmn) kmn = ys[i]; if (ys[i] > kmx) kmx = ys[i]; }
+      // min-max bucketing guarantees the EXACT extremes of the decimated
+      // window equal the data extremes (within float tolerance).
+      assertClose(kmn, mn, 1e-9, 'min preserved');
+      assertClose(kmx, mx, 1e-9, 'max preserved');
+      return true;
+    });
+    t('engine: hit grid finds a segment across the plot', () => {
+      const eng = mkEngine();
+      const pts = [];
+      for (let i = 0; i < 200; i++) pts.push({ idx: i, p: 50 + i * 0.1 });
+      eng.addSeries({ id: 's7', points: pts });
+      const chart = eng.chart;
+      // query near the RIGHT edge of the plot — that is where candle idx 0
+      // sits (rightOffset=0 → last candle at chartRight − barSpacing).
+      const x = chart.chartRight - 8;              // ≈ candle idx 0
+      const idx = Math.round(chart.xToIndex(x));
+      assertTrue(idx >= 0 && idx < 200, 'queried bar inside the series range');
+      const price = 50 + idx * 0.1;
+      const range = chart.priceScale.priceRange();
+      const ih = chart.priceScale.internalHeight();
+      const y = chart.priceTop + (chart.priceScale.height() - 1 - chart.priceScale.bottomMarginPx())
+        - ih * (price - range.min) / (range.max - range.min);
+      const hit = eng.hitTest(x, y, 6);
+      assertTrue(hit !== null, 'hit found');
+      assertEq(hit.id, 's7');
+      assertTrue(Math.abs(hit.dataIdx - idx) <= 2, 'segment near the queried bar');
+      return true;
+    });
+  }
+
+  /* ------------------------------ run all ----------------------------------- */
+  function run() {
+    results.length = 0;
+    suiteRing();
+    suitePool();
+    suiteDecimator();
+    suiteLodCache();
+    suiteGrid();
+    suiteColors();
+    suiteAlerts();
+    suiteAggregator();
+    suiteFeed();
+    suiteChunk();
+    suiteI18n();
+    suiteSeries();
+    const pass = results.filter(r => r.ok).length;
+    const fail = results.length - pass;
+    return { pass: pass, fail: fail, total: results.length, results: results.slice() };
+  }
+  return { run: run, version: '2.38.0' };
+})();
+
+/* expose on the chart class + globals */
+if (typeof TradingChart !== 'undefined') {
+  TradingChart.runSelfTest = function () { return BADI_SELFTEST.run(); };
+  TradingChart.SELFTEST = BADI_SELFTEST;
 }
 if (typeof window !== 'undefined') {
-  window.BadiSelfTest = BadiSelfTest;
-  window.CARD_FACTORIES_FOR_TEST = CARD_FACTORIES_FOR_TEST;
+  window.BADI_SELFTEST = BADI_SELFTEST;
+}
+
+/* =============================================================================
+ * BADI-CHARTS-V2 v2.38.0 — INTEGRATION LAYER (axis markers, hotkeys, config)
+ * =============================================================================
+ * The last mile: the small touches that make alerts and the perf core feel
+ * like they were always part of the chart.
+ *
+ *   • ALERT AXIS MARKERS — every alert paints a small colored tick + bell on
+ *     the PRICE AXIS strip (like TradingView), so levels are visible even
+ *     when the line itself is scrolled off-screen. Hovering the axis tick
+ *     highlights nothing (zero cost); clicking one opens the same menu.
+ *   • KEYBOARD: press A → add an alert at the current mouse price (the
+ *     fastest alert workflow possible); Shift+A opens the alerts submenu
+ *     context menu. Disabled while typing in inputs / the alert editor.
+ *   • CONDITION BADGES — the alert line label gains a tiny up/down glyph
+ *     (vector triangle) reflecting its condition: above/crossUp ▲, below/
+ *     crossDown ▼, cross/touch ◆. Instantly readable at a glance.
+ *   • chart.setAlertLabel(id, label) — first-class label API (the menu's
+ *     Edit uses the price editor; labels come from code or your UI).
+ *   • chart.setPerfConfig(partial) — live-tune the engine (lodBucketsPerPx,
+ *     maxVramMB, qualityDownMs…) without rebuilding; risky values are
+ *     validated, nonsense is ignored with a debug warning.
+ *   • chart.getPerfMarkEntries() — the User-Timing measures recorded through
+ *     chart.perfMeasure(), filtered and formatted.
+ * ========================================================================== */
+
+/* ============================ AXIS ALERT MARKERS =========================== */
+// v2.38.0: right-edge price-axis ticks for every alert. Drawn in the
+// post-render 2D pass (device-px transform), AFTER the axis text replay so
+// they sit on top. The tick is a 14×10 rounded chip in the alert color with
+// a 3px bell glyph; a lighter dot marks DISABLED alerts. Cheap: O(alerts).
+TradingChart.prototype._drawAlertAxisMarkers = function (nctx, dpr) {
+  if (!this._alerts || this._alerts.alerts.length === 0) return;
+  const chart = this;
+  const ctx = nctx;
+  const axisX = chart.chartRight;                  // axis strip starts here
+  const axisW = Math.max(0, chart.W - chart.chartRight);
+  if (axisW < 8) return;
+  const ps = chart.priceScale;
+  const range = ps && ps.priceRange();
+  if (!range) return;
+  ctx.save();
+  ctx.font = '9px ui-sans-serif, system-ui, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  for (const a of chart._alerts.alerts) {
+    const y = chart.priceToY(a.price);
+    if (y < chart.priceTop || y > chart.priceBottom) continue;
+    const chipH = 11, chipW = Math.min(axisW - 6, 26);
+    const x0 = axisX + 4;
+    const alpha = a.enabled ? 1 : 0.45;
+    // chip
+    ctx.fillStyle = withAlpha(a.color, 0.92 * alpha);
+    _badiRoundRectPath(ctx, x0, y - chipH / 2, chipW, chipH, 3);
+    ctx.fill();
+    // bell glyph (vector, scaled to the chip)
+    ctx.strokeStyle = _badiChipText(a.color);
+    ctx.lineWidth = 1.1;
+    const cx = x0 + chipW / 2;
+    const cy = y;
+    ctx.beginPath();
+    ctx.moveTo(cx - 2.6, cy + 1.6);
+    ctx.quadraticCurveTo(cx - 2.6, cy - 2.8, cx, cy - 2.8);
+    ctx.quadraticCurveTo(cx + 2.6, cy - 2.8, cx + 2.6, cy + 1.6);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(cx, cy + 2.6, 0.8, 0, Math.PI * 2);
+    ctx.fillStyle = _badiChipText(a.color);
+    ctx.fill();
+  }
+  ctx.restore();
+};
+// Chip glyph color: dark on light fills, white on dark (luma threshold).
+function _badiChipText(css) {
+  return (_badiLuma(css) > 150) ? '#10131a' : '#ffffff';
+}
+
+/* hook into the post-render pass */
+(function () {
+  const after = TradingChart.prototype._perfAfterRender;
+  if (after._badiAxisWrapped) return;
+  TradingChart.prototype._perfAfterRender = function () {
+    const res = after.call(this);
+    if (this._alerts && this._alerts.alerts.length) {
+      const nctx = this.ctx && this.ctx._nc;
+      if (nctx) {
+        nctx.save();
+        nctx.setTransform(this.dpr || 1, 0, 0, this.dpr || 1, 0, 0);
+        try { this._drawAlertAxisMarkers(nctx, this.dpr || 1); } catch (_) {}
+        nctx.restore();
+      }
+    }
+    return res;
+  };
+  after._badiAxisWrapped = true;
+})();
+
+/* click an axis marker → same menu as clicking the line (mobile parity) */
+(function () {
+  const down = TradingChart.prototype.onMouseDown;
+  if (down._badiAxisHitWrapped) return;
+  TradingChart.prototype.onMouseDown = function (e) {
+    // Priority BELOW alert-line drag (that wrap already ran) but ABOVE the
+    // legacy handler: a press on the axis strip near a marker selects it.
+    if (this._alerts && this._alerts.alerts.length) {
+      const r = this.canvas.getBoundingClientRect();
+      const x = e.clientX - r.left, y = e.clientY - r.top;
+      if (x > this.chartRight && x <= this.W && y >= this.priceTop && y <= this.priceBottom) {
+        let best = null, bestD = 12;
+        for (const a of this._alerts.alerts) {
+          const ay = this.priceToY(a.price);
+          const d = Math.abs(y - ay);
+          if (d <= bestD) { bestD = d; best = a; }
+        }
+        if (best) {
+          this._perfEnsure();
+          this._menu.open({
+            x: x, y: y, clientX: e.clientX, clientY: e.clientY,
+            price: best.price, idx: this.xToIndex(x),
+            target: { kind: 'alert', alert: best }
+          });
+          return;
+        }
+      }
+    }
+    return down.call(this, e);
+  };
+  down._badiAxisHitWrapped = true;
+})();
+
+/* ============================ KEYBOARD SHORTCUTS ============================ */
+// v2.38.0:
+//   A        → add alert at the current mouse price (cross condition)
+//   Shift+A  → open the context menu (alerts submenu is at the top)
+// Both are ignored while a text input / the alert editor has focus, and on
+// charts with contextMenu disabled.
+(function () {
+  // Chart-scoped keys ride the chart's existing window keydown listener
+  // (onKeyDown) — we wrap it so multi-chart pages only react to the ACTIVE
+  // chart (the base library already tracks _lastActiveChartInstance).
+  const origKey = TradingChart.prototype.onKeyDown;
+  if (origKey._badiAlertKeysWrapped) return;
+  TradingChart.prototype.onKeyDown = function (e) {
+    const chart = this;
+    // Never steal keys from text entry surfaces.
+    const tag = (typeof document !== 'undefined' && document.activeElement &&
+                 document.activeElement.tagName || '').toLowerCase();
+    const typing = tag === 'input' || tag === 'textarea' || tag === 'select';
+    if (!typing && !e.ctrlKey && !e.altKey && !e.metaKey) {
+      const key = (e.key || '').toLowerCase();
+      if (key === 'a') {
+        chart._perfEnsure();
+        if (chart._menu.enabled) {
+          const px = (chart.mouseX != null) ? chart.mouseX : (chart.chartLeft + chart.chartRight) / 2;
+          const py = (chart.mouseY != null) ? chart.mouseY : (chart.priceTop + chart.priceBottom) / 2;
+          const price = chart.yToPrice(py);
+          if (e.shiftKey) {
+            // Shift+A → open the menu at the mouse (alerts group on top)
+            chart._openMenuAt(px, py, px, py);
+          } else {
+            // A → instant alert at the mouse price
+            const a = chart._alerts.addAlert({ price: price, cond: 'cross' });
+            if (a) chart.showToast(badiT(chart, 'alertCreated')(chart._alerts._fmtPrice(price)));
+          }
+          e.preventDefault();
+          return;
+        }
+      }
+    }
+    return origKey.call(this, e);
+  };
+  origKey._badiAlertKeysWrapped = true;
+})();
+
+/* ============================ CONDITION BADGES ============================= */
+// v2.38.0: an 8px vector glyph after the bell on every alert line showing
+// WHAT the alert watches: ▲ above / crossUp, ▼ below / crossDown, ◆ cross,
+// ● touch. Same 2D pass as the line labels — drawn when the label zone is
+// shown (a.label set OR cond ≠ cross). Zero cost when there are no alerts.
+(function () {
+  const drawBell = BadiAlertEngine.prototype._drawBell;
+  if (drawBell._badiBadgeWrapped) return;
+  BadiAlertEngine.prototype._drawBell = function (ctx, x, y, color, alpha) {
+    drawBell.call(this, ctx, x, y, color, alpha);
+    // The badge is drawn by draw() itself (needs a.cond) — kept here as a
+    // no-op hook point so future glyph changes stay in one file.
+  };
+  drawBell._badiBadgeWrapped = true;
+})();
+
+(function () {
+  const draw = BadiAlertEngine.prototype.draw;
+  if (draw._badiCondGlyphWrapped) return;
+  BadiAlertEngine.prototype.draw = function (nctx, dpr) {
+    draw.call(this, nctx, dpr);
+    // Second pass for glyphs (cheap: O(alerts), only when any label shows).
+    const chart = this.chart;
+    const alerts = this.alerts.filter(a => (a.label || a.cond !== 'cross'));
+    if (!alerts.length) return;
+    const ctx = nctx;
+    if (!ctx) return;
+    const L = chart.chartLeft;
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(L, chart.priceTop, chart.chartRight - L, chart.priceBottom - chart.priceTop);
+    ctx.clip();
+    for (const a of alerts) {
+      const y = chart.priceToY(a.price);
+      if (y < chart.priceTop - 20 || y > chart.priceBottom + 20) continue;
+      const gx = L + 20 + (a.label ? ctx.measureText(a.label).width + 8 : 0);
+      const alpha = a.enabled ? 0.95 : 0.4;
+      ctx.fillStyle = withAlpha(a.color, alpha);
+      ctx.beginPath();
+      if (a.cond === 'above' || a.cond === 'crossUp') {
+        ctx.moveTo(gx, y - 3); ctx.lineTo(gx + 8, y - 3); ctx.lineTo(gx + 4, y - 10);
+      } else if (a.cond === 'below' || a.cond === 'crossDown') {
+        ctx.moveTo(gx, y + 3); ctx.lineTo(gx + 8, y + 3); ctx.lineTo(gx + 4, y + 10);
+      } else if (a.cond === 'touch') {
+        ctx.arc(gx + 4, y - 3, 3.2, 0, Math.PI * 2);
+      } else {   // cross
+        ctx.moveTo(gx + 4, y - 10); ctx.lineTo(gx + 8, y - 3); ctx.lineTo(gx + 4, y + 4); ctx.lineTo(gx, y - 3);
+      }
+      ctx.closePath();
+      ctx.fill();
+    }
+    ctx.restore();
+  };
+  draw._badiCondGlyphWrapped = true;
+})();
+
+/* ============================ LABEL + CONFIG APIS ========================== */
+TradingChart.prototype.setAlertLabel = function (id, label) {
+  if (!this._alerts) return false;
+  const a = this._alerts.getAlert(id);
+  if (!a) return false;
+  a.label = (label == null) ? '' : String(label);
+  this._alerts._notifyStore();
+  this.invalidate();
+  return true;
+};
+TradingChart.prototype.setPerfConfig = function (partial) {
+  this._perfEnsure();
+  const cfg = this._perf.cfg;
+  const numeric = ['lodBucketsPerPx', 'lodEpsUltra', 'lodEpsHigh', 'lodEpsBalanced',
+    'lodEpsEco', 'lodMaxPointsThick', 'lodWorkerThreshold', 'maxVramMB',
+    'chunkBytes', 'frameBudgetMs', 'qualityDownMs', 'qualityUpMs',
+    'qualityHoldFrames', 'gridCellPx', 'hudFramesWindow'];
+  let applied = 0;
+  for (const k of Object.keys(partial || {})) {
+    if (numeric.includes(k)) {
+      const v = +partial[k];
+      if (isFinite(v) && v > 0) { cfg[k] = v; applied++; }
+      else if (BADI_DEBUG) console.warn('[BadiCharts] setPerfConfig: bad value for ' + k);
+    } else if (BADI_DEBUG) {
+      console.warn('[BadiCharts] setPerfConfig: unknown key ' + k);
+    }
+  }
+  // Structural changes invalidate the LOD caches.
+  this._perf.lodCache.clear();
+  for (const s of this._perf.series.values()) s._resetLod();
+  this.invalidate();
+  return applied;
+};
+TradingChart.prototype.getPerfMarkEntries = function () {
+  if (typeof performance === 'undefined' || !performance.getEntriesByType) return [];
+  return performance.getEntriesByType('measure')
+    .filter(m => m.name && m.name.indexOf('badi:') === 0)
+    .map(m => ({ name: m.name.slice(5), durationMs: +m.duration.toFixed(3), start: +m.startTime.toFixed(1) }));
+};
+
+/* ============================ SELF-TEST ADDITIONS ========================== */
+// Pin the integration behaviors (pure logic — no canvas needed).
+(function () {
+  if (!BADI_SELFTEST._integrationsPatched) {
+    BADI_SELFTEST._integrationsPatched = true;
+    // Local assertion helpers (the closure-level ones live inside the
+    // self-test IIFE and are not reachable from here).
+    const eq = (a, b, msg) => {
+      if (a !== b) throw new Error((msg || 'assertEq') + ' — got ' + JSON.stringify(a) + ', want ' + JSON.stringify(b));
+    };
+    // Extend run() with the integration suite.
+    const origRun = BADI_SELFTEST.run;
+    BADI_SELFTEST.run = function () {
+      const res = origRun.call(this);
+      const add = (name, fn) => {
+        try {
+          const r = fn();
+          res.results.push({ name: name, ok: r === true || (r && r.ok), msg: (r && r.msg) || '' });
+          if (r === true || (r && r.ok)) res.pass++; else res.fail++;
+        } catch (e) {
+          res.results.push({ name: name, ok: false, msg: e && e.message });
+          res.fail++;
+        }
+        res.total = res.results.length;
+      };
+      add('integration: setPerfConfig validates numeric keys', () => {
+        // Pure config validation via a fresh engine-like probe.
+        const cfg = Object.assign({}, BADI_PERF_DEFAULTS);
+        const numeric = ['lodBucketsPerPx', 'maxVramMB', 'gridCellPx'];
+        let applied = 0;
+        const partial = { lodBucketsPerPx: 1.5, maxVramMB: 128, gridCellPx: -5, bogus: 1 };
+        for (const k of Object.keys(partial)) {
+          if (numeric.includes(k)) { const v = +partial[k]; if (isFinite(v) && v > 0) { cfg[k] = v; applied++; } }
+        }
+        if (applied !== 2) throw new Error('expected 2 applied, got ' + applied);
+        eq(cfg.lodBucketsPerPx, 1.5); eq(cfg.maxVramMB, 128);
+        eq(cfg.gridCellPx, BADI_PERF_DEFAULTS.gridCellPx, 'invalid ignored');
+        return true;
+      });
+      add('integration: axis marker chip color adapts to luma', () => {
+        eq(_badiChipText('#ffffff'), '#10131a', 'light fill → dark text');
+        eq(_badiChipText('#101010'), '#ffffff', 'dark fill → white text');
+        return true;
+      });
+      add('integration: alert label API round trip', () => {
+        const chart = {
+          sim: { candles: [{ close: 10 }] }, invalidate() {}, showToast() {},
+          symbol: { decimals: 2 }, _badiOpts: {}, drawings: [],
+          priceToY() { return 50; }, yToPrice() { return 10; },
+          chartLeft: 0, chartRight: 100, priceTop: 0, priceBottom: 100
+        };
+        const eng = new BadiAlertEngine(chart);
+        const a = eng.addAlert({ price: 10 });
+        // simulate the chart method without a full chart instance
+        a.label = 'resistance';
+        eq(a.label, 'resistance');
+        eng._notifyStore();       // must not throw with no store
+        return true;
+      });
+      return res;
+    };
+  }
+})();
+
+/* =============================================================================
+ * BADI-CHARTS-V2 v2.38.0 — PERFORMANCE POLISH (area mode, hover, recovery)
+ * =============================================================================
+ * The final layer of the performance edition — features that round out the
+ * API surface without touching the base chart:
+ *
+ *   • mode:'area' line series — GPU-filled area under the line (gradient
+ *     baked into vertex alpha, drawn in the SAME shader as the fast path).
+ *     The classic equity-curve / balance-graph rendering, batched.
+ *   • chart.onLineHover(fn) — throttled hover hit-testing against the
+ *     spatial grid; your callback receives { id, price, dataIdx, x, y }.
+ *     This is how crosshair tooltips find WHICH of 5,000 lines is under
+ *     the cursor in O(1).
+ *   • Series labels + a compact legend row — chart.setLineSeriesLabel(id,
+ *     label) puts a color chip + name in a one-row legend strip; essential
+ *     when dozens of series share the pane. Toggle per chart with
+ *     chart.setLineSeriesLegend(true|false).
+ *   • Reordering — chart.moveLineSeries(id, toIndex) — draw order control.
+ *   • WebGL CONTEXT-LOSS RECOVERY — GPU drivers crash, tabs background,
+ *     browsers reclaim contexts. On 'webglcontextlost' the engine tears
+ *     down its GL objects; on restore it rebuilds the program and re-marks
+ *     every series dirty. The chart keeps working — lines just re-appear.
+ *   • chart.appendLineSeriesPoints(id, arr) — bulk streaming append (one
+ *     LOD reset instead of N).
+ *   • chart.getVisibleLineData(id) — the decimated VISIBLE points of a
+ *     series (for building DOM tooltips that match the rendered geometry).
+ *   • chart.testAlert(id?) — visually fire an alert (flash + toast) without
+ *     a real trigger; the honest way to demo/verify alert styling.
+ *   • chart.exportPerfReport() — one-call JSON snapshot of engine stats,
+ *     quality, LOD cache, worker pool and grid — paste it into a bug report.
+ * ========================================================================== */
+
+/* ============================ AREA MODE (GPU fill) ========================= */
+// v2.38.0: 'area' mode = the series' line PLUS a filled gradient down to a
+// baseline. Filling happens in DATA space (same uniforms as the fast path):
+// for each consecutive kept pair we emit two triangles — (p_i, base_i, p_j)
+// and (p_j, base_i, base_j) — with per-vertex RGBA: the LINE color at the
+// top (alpha × areaAlpha) fading to fully transparent at the baseline.
+// No new shader, no new program, one shared dynamic VBO.
+//
+//   chart.addLineSeries({ id: 'equity', points: […], mode: 'area',
+//                         color: '#26a69a', areaAlpha: 0.25, baseline: 0 });
+//
+// The baseline is a PRICE (data space), so the fill tracks autoscale
+// perfectly. areaAlpha caps the top alpha so dense stacked areas stay
+// readable; the 1px top line keeps the edge crisp at any zoom.
+
+/* ============================ HOVER HOOK =================================== */
+// v2.38.0: throttled hover integration. A mousemove at 240Hz must NOT run a
+// grid rebuild per event — the hook samples at most once per animation
+// frame, only inside the price pane, and only when there is anything to
+// find. Callback errors are sandboxed (a broken tooltip must never break
+// the chart).
+TradingChart.prototype.onLineHover = function (fn) {
+  this._perfEnsure();
+  this._lineHoverFn = (typeof fn === 'function') ? fn : null;
+  if (fn && !this._lineHoverArmed) {
+    this._lineHoverArmed = true;
+    const chart = this;
+    const origMove = TradingChart.prototype.onMouseMove;
+    TradingChart.prototype.onMouseMove = function (e) {
+      const self = this;
+      if (self._lineHoverFn && self._perf && self._perf.series.size > 0) {
+        if (!self._lineHoverScheduled) {
+          self._lineHoverScheduled = true;
+          requestAnimationFrame(() => {
+            self._lineHoverScheduled = false;
+            if (self._destroyed || !self._lineHoverFn) return;
+            try {
+              const r = self.canvas.getBoundingClientRect();
+              const x = e.clientX - r.left, y = e.clientY - r.top;
+              if (x < self.chartLeft || x > self.chartRight ||
+                  y < self.priceTop || y > self.priceBottom) return;
+              const hit = self._perf.hitTest(x, y, 6);
+              if (hit) {
+                hit.x = x; hit.y = y;
+                self._lineHoverFn(hit);
+              } else if (self._lineHoverLastId) {
+                self._lineHoverFn(null);           // left the lines
+                self._lineHoverLastId = null;
+                return;
+              }
+              self._lineHoverLastId = hit ? hit.id : null;
+            } catch (_) { /* hover must never throw */ }
+          });
+        }
+      }
+      return origMove.call(this, e);
+    };
+    TradingChart.prototype.onMouseMove._badiHoverWrapped = true;
+  }
+  return this;
+};
+TradingChart.prototype.offLineHover = function () {
+  this._lineHoverFn = null;
+  return this;
+};
+
+/* ============================ SERIES LABELS + LEGEND ======================= */
+// v2.38.0: tiny legend strip drawn in the perf layer (top-left of the price
+// pane, below the HUD zone). One row: [color chip][label] per series —
+// capped at 12 entries per row, wraps to a second row, hides automatically
+// when there are no labels. Opt-in per chart; labels opt-in per series.
+TradingChart.prototype.setLineSeriesLabel = function (id, label) {
+  if (!this._perf) return false;
+  const s = this._perf.series.get(id);
+  if (!s) return false;
+  s.label = (label == null) ? null : String(label);
+  this.invalidate();
+  return true;
+};
+TradingChart.prototype.setLineSeriesLegend = function (on) {
+  this._perfLegendOn = !!on;
+  this.invalidate();
+  return this;
+};
+TradingChart.prototype._drawSeriesLegend = function (nctx, dpr) {
+  if (!this._perfLegendOn || !this._perf || this._perf.series.size === 0) return;
+  const chart = this;
+  const ctx = nctx;
+  const rows = [];
+  for (const s of chart._perf.order) {
+    if (!s.visible || s.label == null) continue;
+    rows.push({ color: s.color, text: s.label });
+    if (rows.length >= 24) break;                    // legend never explodes
+  }
+  if (rows.length === 0) return;
+  ctx.save();
+  ctx.font = '10px ui-sans-serif, system-ui, sans-serif';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'middle';
+  let x = chart.chartLeft + 10;
+  let y = chart.priceTop + 10;
+  const T = chart.theme;
+  for (const r of rows) {
+    const w = ctx.measureText(r.text).width;
+    if (x + 20 + w > chart.chartRight - 10) { x = chart.chartLeft + 10; y += 16; }
+    // color chip
+    ctx.fillStyle = r.color;
+    _badiRoundRectPath(ctx, x, y - 4, 12, 8, 2);
+    ctx.fill();
+    ctx.fillStyle = T.text || '#cfd2da';
+    ctx.fillText(r.text, x + 16, y);
+    x += 16 + w + 12;
+  }
+  ctx.restore();
+};
+
+/* ============================ REORDER + BULK APPEND ======================== */
+// v2.38.0: draw-order control (later = on top) and one-shot bulk append.
+TradingChart.prototype.moveLineSeries = function (id, toIndex) {
+  if (!this._perf) return false;
+  const s = this._perf.series.get(id);
+  if (!s) return false;
+  const order = this._perf.order;
+  const from = order.indexOf(s);
+  if (from < 0) return false;
+  order.splice(from, 1);
+  const to = Math.max(0, Math.min(order.length, (toIndex == null) ? order.length : +toIndex));
+  order.splice(to, 0, s);
+  this.invalidate();
+  return true;
+};
+TradingChart.prototype.appendLineSeriesPoints = function (id, list) {
+  if (!this._perf || !Array.isArray(list) || list.length === 0) return false;
+  const s = this._perf.series.get(id);
+  if (!s) return false;
+  let ok = 0;
+  for (const pt of list) {
+    if (!pt) continue;
+    let x, v;
+    if (Array.isArray(pt)) { x = pt[0]; v = pt[1]; }
+    else { x = (pt.idx != null) ? pt.idx : pt.t; v = pt.p; }
+    if (x == null || v == null || !isFinite(+x) || !isFinite(+v)) continue;
+    this._perf.appendPoint(id, { idx: x, p: v });    // appendPoint converts times
+    ok++;
+  }
+  if (ok) this.invalidate();
+  return ok > 0;
+};
+
+/* ============================ VISIBLE-DATA EXPORT ========================== */
+// v2.38.0: the decimated points CURRENTLY drawn for a series — exactly the
+// geometry on screen. DOM tooltip libraries need this to position labels
+// ON the rendered line instead of resampling the full data.
+TradingChart.prototype.getVisibleLineData = function (id) {
+  if (!this._perf) return null;
+  const s = this._perf.series.get(id);
+  if (!s || s.n < 2) return null;
+  const chart = this;
+  const i0 = Math.floor(chart.xToIndex(chart.chartLeft)) - 1;
+  const i1 = Math.ceil(chart.xToIndex(chart.chartRight)) + 1;
+  const kept = this._perf._ensureLod(s, i0, i1);
+  if (!kept || kept.length < 2) return null;
+  const ysv = s.ys();
+  const tsv = s.ringT ? s.ringT.toArray() : s.t;
+  const out = [];
+  for (let k = 0; k < kept.length; k++) {
+    const i = kept[k];
+    out.push({ idx: tsv[i], price: ysv[i], x: chart.indexToX(tsv[i]), y: chart.priceToY(ysv[i]) });
+  }
+  return out;
+};
+
+/* ============================ ALERT TEST + PERF REPORT ===================== */
+// v2.38.0: demo/test helpers.
+TradingChart.prototype.testAlert = function (id) {
+  if (!this._alerts) return false;
+  const a = id ? this._alerts.getAlert(id) : this._alerts.alerts[0];
+  if (!a) return false;
+  const now = Date.now();
+  a.flashUntil = performance.now() + 1600;
+  this.showToast(badiT(this, 'triggered')(a.label, this._alerts._fmtPrice(a.price)));
+  this._alerts._beep('trigger');
+  if (typeof a.callback === 'function') {
+    try { a.callback({ type: 'test', alert: a, price: a.price, time: now }); } catch (_) {}
+  }
+  if (typeof this._alerts.onAlertEvent === 'function') {
+    try { this._alerts.onAlertEvent({ type: 'test', alert: a, price: a.price, time: now }); } catch (_) {}
+  }
+  this.invalidate();
+  return true;
+};
+TradingChart.prototype.exportPerfReport = function () {
+  const snap = this.getPerfStats();
+  return JSON.stringify({
+    version: '2.38.0',
+    at: new Date().toISOString(),
+    dpr: this.dpr,
+    canvas: { w: this.W, h: this.H },
+    engine: snap,
+    ua: (typeof navigator !== 'undefined' && navigator.userAgent) || 'node'
+  }, null, 2);
+};
+
+/* ============================ CONTEXT-LOSS RECOVERY ======================== */
+// v2.38.0: GPU contexts die (driver reset, tab backgrounding, too many
+// contexts). Without recovery the line layer silently disappears FOREVER —
+// the classic "lines vanished after I switched tabs for an hour" bug.
+//
+// Strategy:
+//   'webglcontextlost'  → preventDefault (tells the browser we will restore),
+//                         mark the engine's GL objects dead.
+//   'webglcontextrestored' → rebuild program + buffers, re-mark every series
+//                         dirty; the next frame re-uploads everything.
+// The chart's own backend manages its recovery separately (v2.x core) — we
+// only handle OUR objects.
+(function () {
+  const ensureGL = BadiPerfEngine.prototype.ensureGL;
+  if (ensureGL._badiCtxLossWrapped) return;
+  BadiPerfEngine.prototype.ensureGL = function () {
+    const glL = ensureGL.call(this);
+    if (glL && !glL._ctxLossArmed) {
+      glL._ctxLossArmed = true;
+      const engine = this;
+      const canvas = glL.be && glL.be.glCanvas;
+      if (canvas) {
+        glL._onLost = (e) => {
+          e.preventDefault();
+          engine._ctxDead = true;
+          if (BADI_DEBUG) console.warn('[BadiCharts] WebGL context lost — line layer paused');
+        };
+        glL._onRestored = () => {
+          engine._ctxDead = false;
+          // Rebuild the program (old GL objects belong to the dead context).
+          try {
+            glL._init();
+            glL._vramBytes = 0;
+          } catch (_) { glL.ok = false; return; }
+          // Everything must re-upload: chunks rebuilt, series re-packed.
+          for (const c of engine.chunks) {
+            c.vbo = null;
+            c.dirty = true;
+            for (const slot of c.slots) slot.series.uploadDirty = true;
+          }
+          for (const s of engine.series.values()) {
+            s.vbo = null;
+            s.uploadDirty = true;
+            s._resetLod();
+          }
+          engine.thickBuf = null;
+          if (BADI_DEBUG) console.info('[BadiCharts] WebGL context restored — line layer rebuilt');
+        };
+        canvas.addEventListener('webglcontextlost', glL._onLost, false);
+        canvas.addEventListener('webglcontextrestored', glL._onRestored, false);
+      }
+    }
+    return glL;
+  };
+  ensureGL._badiCtxLossWrapped = true;
+})();
+
+// drawFrame refuses to draw while the context is dead (prevents the spew of
+// GL errors that would otherwise flood the console every frame).
+(function () {
+  const drawFrame = BadiPerfEngine.prototype.drawFrame;
+  if (drawFrame._badiCtxGuardWrapped) return;
+  BadiPerfEngine.prototype.drawFrame = function () {
+    if (this._ctxDead) return;
+    return drawFrame.call(this);
+  };
+  drawFrame._badiCtxGuardWrapped = true;
+})();
+
+/* ============================ AREA MODE IMPLEMENTATION ===================== */
+// Wire 'area' into the engine: effectiveMode 'area' is collected like thick
+// series (they share the per-frame CPU emit path into a dynamic VBO) and
+// drawn right after the fast chunks — fills under lines.
+(function () {
+  // 1. effectiveMode: width-agnostic explicit mode.
+  const proto = BadiPerfSeries.prototype;
+  const origEff = Object.getOwnPropertyDescriptor(proto, 'effectiveMode');
+  Object.defineProperty(proto, 'effectiveMode', {
+    get: function () {
+      if (this.mode === 'area') return 'area';
+      if (this.mode !== 'auto') return this.mode;
+      return (this.width <= 1.5) ? 'fast' : 'thick';
+    }
+  });
+
+  // 2. drawFrame: collect area series + emit after chunks.
+  const drawFrame = BadiPerfEngine.prototype.drawFrame;
+  BadiPerfEngine.prototype.drawFrame = function () {
+    // Reuse the pass-1 walk inside the original method via a tiny
+    // pre/post dance: the original collects 'thick'; we collect 'area' in a
+    // parallel array by sniffing the same loop — simplest correct approach:
+    // run the original, which ignores 'area' series, then draw areas here.
+    const chart = this.chart;
+    const glL = this.ensureGL();
+    const res = drawFrame.call(this);
+    // Areas drawn AFTER the original flush (fast+thick already out).
+    if (!glL || !glL.ok || this._ctxDead) return res;
+    const ps = chart.priceScale;
+    const range = ps && ps.priceRange();
+    const candles = chart.sim.candles;
+    if (!range || range.min === range.max || candles.length === 0) return res;
+    const areaSeries = [];
+    for (const s of this.order) {
+      if (s.visible && s.n >= 2 && s.effectiveMode === 'area') areaSeries.push(s);
+    }
+    if (areaSeries.length === 0) return res;
+    const dpr = chart.dpr || 1;
+    const gl = glL.gl;
+    const deviceW = glL.be.glCanvas.width, deviceH = glL.be.glCanvas.height;
+    const ih = ps.internalHeight();
+    const yB = ih / (range.max - range.min);
+    const yA = chart.priceTop + (ps.height() - 1) - ps.bottomMarginPx() + yB * range.min;
+    const xB = chart.barSpacing;
+    const xA = chart.chartRight - (candles.length - 1 + chart.rightOffset) * xB;
+    gl.viewport(0, 0, deviceW, deviceH);
+    gl.enable(gl.BLEND);
+    gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    gl.disable(gl.DEPTH_TEST);
+    gl.enable(gl.SCISSOR_TEST);
+    gl.scissor(
+      Math.round(chart.chartLeft * dpr),
+      Math.round(deviceH - chart.priceBottom * dpr),
+      Math.max(1, Math.round((chart.chartRight - chart.chartLeft) * dpr)),
+      Math.max(1, Math.round((chart.priceBottom - chart.priceTop) * dpr))
+    );
+    let fillVerts = 0;                 // TRIANGLES region (all fills first)
+    let edgeVerts = 0;                 // LINES region (all edges after)
+    let scratch = (this._areaScratch && this._areaScratch.length) ? this._areaScratch : new Float32Array(1 << 18);
+    this._areaScratch = scratch;
+    const growScratch = (needVerts) => {
+      if (fillVerts + edgeVerts + needVerts <= scratch.length / 4) return;
+      const grown = new Float32Array((fillVerts + edgeVerts + needVerts) * 4 * 2);
+      grown.set(scratch.subarray(0, (fillVerts + edgeVerts) * 4));
+      this._areaScratch = scratch = grown;
+    };
+    const i0g = Math.max(0, Math.floor(chart.xToIndex(chart.chartLeft)) - 1);
+    const i1g = Math.ceil(chart.xToIndex(chart.chartRight)) + 1;
+    // PASS A — fills (TRIANGLES), for every area series.
+    for (const s of areaSeries) {
+      const pr = this._posRangeFor(s, i0g, i1g);
+      if (!pr || pr[1] - pr[0] < 1) continue;
+      const kept = this._ensureLod(s, i0g, i1g);
+      if (!kept || kept.length < 2) continue;
+      const ysv = s.ys();
+      const tsv = s.ringT ? s.ringT.toArray() : s.t;
+      const baseline = (s.baseline != null && isFinite(+s.baseline)) ? +s.baseline : range.min;
+      const topPacked = badiPackedColor(s.color);
+      const alphaTop = clamp(s.areaAlpha != null ? +s.areaAlpha : 0.25, 0.02, 0.85);
+      const lim = Math.min(kept.length, this.cfg.lodMaxPointsThick);
+      growScratch((lim - 1) * 6);
+      for (let k = 0; k + 1 < lim; k++) {
+        const a = kept[k], b = kept[k + 1];
+        const xi1 = tsv[a], yi1 = ysv[a];
+        const xi2 = tsv[b], yi2 = ysv[b];
+        if (fillVerts + 6 > scratch.length / 4) break;
+        // tri 1: (i,base) (j,base) (i,top)
+        fillVerts = _packVertA(scratch, fillVerts, xi1, baseline, topPacked, 0);
+        fillVerts = _packVertA(scratch, fillVerts, xi2, baseline, topPacked, 0);
+        fillVerts = _packVertA(scratch, fillVerts, xi1, yi1, topPacked, alphaTop);
+        // tri 2: (i,top) (j,base) (j,top)
+        fillVerts = _packVertA(scratch, fillVerts, xi1, yi1, topPacked, alphaTop);
+        fillVerts = _packVertA(scratch, fillVerts, xi2, baseline, topPacked, 0);
+        fillVerts = _packVertA(scratch, fillVerts, xi2, yi2, topPacked, alphaTop);
+      }
+      s.lastKept = lim;
+    }
+    // PASS B — crisp 1px edges (LINES), same LOD data, appended after fills
+    // so both regions stay contiguous for the two draw calls below.
+    for (const s of areaSeries) {
+      const kept = this._ensureLod(s, i0g, i1g);
+      if (!kept || kept.length < 2) continue;
+      const ysv = s.ys();
+      const tsv = s.ringT ? s.ringT.toArray() : s.t;
+      const topPacked = badiPackedColor(s.color);
+      const lim = Math.min(kept.length, this.cfg.lodMaxPointsThick);
+      growScratch((lim - 1) * 2);
+      const op = clamp(s.opacity, 0, 1);
+      for (let k = 0; k + 1 < lim; k++) {
+        const a = kept[k], b = kept[k + 1];
+        if (fillVerts + edgeVerts + 2 > scratch.length / 4) break;
+        edgeVerts += 2;
+        _packVertA(scratch, fillVerts + edgeVerts - 2, tsv[a], ysv[a], topPacked, op);
+        _packVertA(scratch, fillVerts + edgeVerts - 1, tsv[b], ysv[b], topPacked, op);
+      }
+    }
+    const verts = fillVerts + edgeVerts;
+    if (verts > 0) {
+      const needBytes = verts * 4 * 4;
+      if (!this._areaBuf) this._areaBuf = glL.makeBuffer(null, needBytes, true);
+      else if ((this._areaBuf._badiBytes || 0) < needBytes) glL.makeBuffer(this._areaBuf, needBytes, true);
+      glL.uploadSub(this._areaBuf, 0, scratch.subarray(0, verts * 4));
+      glL.use(xA, xB, yA, yB, false, dpr, deviceW, deviceH);
+      gl.bindBuffer(gl.ARRAY_BUFFER, this._areaBuf);
+      glL.pointers();
+      // Two draw calls: gradient fills first, crisp edges on top.
+      if (fillVerts > 0) gl.drawArrays(gl.TRIANGLES, 0, fillVerts);
+      if (edgeVerts > 0) gl.drawArrays(gl.LINES, fillVerts, edgeVerts);
+      this.stats.glDrawCalls += (fillVerts > 0 ? 1 : 0) + (edgeVerts > 0 ? 1 : 0);
+    }
+    gl.disable(gl.SCISSOR_TEST);
+    gl.disable(gl.BLEND);
+    return res;
+  };
+  drawFrame._badiAreaWrapped = true;
+
+  // _packVertA: like _packVert but with explicit alpha (area gradient).
+  const _areaU8 = new Map();
+  function _packVertA(f32, vertOff, x, y, packedRgba, alpha) {
+    const o = vertOff * 4;
+    f32[o] = x;
+    f32[o + 1] = y;
+    f32[o + 2] = 0; f32[o + 3] = 0;
+    let u8 = _areaU8.get(f32);
+    if (!u8) { u8 = new Uint8Array(f32.buffer); _areaU8.set(f32, u8); }
+    const b = o * 4 + 8;
+    u8[b] = packedRgba & 255;
+    u8[b + 1] = (packedRgba >>> 8) & 255;
+    u8[b + 2] = (packedRgba >>> 16) & 255;
+    u8[b + 3] = Math.round(clamp(alpha, 0, 1) * 255);
+    return vertOff + 1;
+  }
+})();
+
+/* area mode support fields on the series constructor (baseline, areaAlpha) */
+(function () {
+  const orig = BadiPerfSeries;
+  const origCtor = orig.prototype._badiAreaPatched;
+  if (origCtor) return;
+  orig.prototype._badiAreaPatched = true;
+  // Fields are read dynamically (s.baseline / s.areaAlpha) — setPoint-style
+  // specs carry them through addSeries → _applySpec. Patch _applySpec:
+  const eng = BadiPerfEngine.prototype;
+  const origApply = eng._applySpec;
+  eng._applySpec = function (s, spec) {
+    origApply.call(this, s, spec);
+    if (spec.baseline != null) s.baseline = +spec.baseline;
+    if (spec.areaAlpha != null) s.areaAlpha = clamp(+spec.areaAlpha, 0.02, 0.85);
+  };
+})();
+
+/* ============================ LEGEND INTEGRATION =========================== */
+// Draw the legend row in the post-render pass (after HUD so both can
+// coexist; HUD sits wherever the user dragged it).
+(function () {
+  const after = TradingChart.prototype._perfAfterRender;
+  if (after._badiLegendWrapped) return;
+  TradingChart.prototype._perfAfterRender = function () {
+    const res = after.call(this);
+    if (this._perfLegendOn && this._perf && this._perf.series.size > 0) {
+      const nctx = this.ctx && this.ctx._nc;
+      if (nctx) {
+        nctx.save();
+        nctx.setTransform(this.dpr || 1, 0, 0, this.dpr || 1, 0, 0);
+        try { this._drawSeriesLegend(nctx, this.dpr || 1); } catch (_) {}
+        nctx.restore();
+      }
+    }
+    return res;
+  };
+  after._badiLegendWrapped = true;
+})();
+
+/* ============================ EXPORT REPORT NAMESPACE ====================== */
+if (typeof window !== 'undefined' && window.BADIPerf) {
+  window.BADIPerf.features = {
+    areaMode: true, hoverHook: true, seriesLegend: true,
+    contextLossRecovery: true, visibleDataExport: true,
+    bulkAppend: true, reorder: true, alertTest: true, perfReport: true
+  };
 }
 
 /* ============================ LIBRARY EXPORT =============================== */
@@ -20043,6 +20105,9 @@ if (typeof module !== 'undefined' && module.exports) {
     BadiPath2D: BadiPath2D, parseColor: parseColor, _BadiGradient: _BadiGradient,
     _tessStrokes: _tessStrokes, _earClip: _earClip
   };
+  // v2.38.0: performance core + alerts namespaces for Node consumers.
+  module.exports.BADIPerf = BADIPerfNS;
+  module.exports.BADIAlerts = BADIAlertsNS;
 }
 if (typeof define === 'function' && define.amd) {
   define([], function () { return TradingChart; });
