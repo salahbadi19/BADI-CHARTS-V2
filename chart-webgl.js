@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.38.0 — PERFORMANCE EDITION (chart-webgl.js)
+ * BADI-CHARTS-V2 v2.38.1 — PERFORMANCE EDITION (chart-webgl.js)
  * The complete standalone trading chart library, rendered with real WebGL,
  * hardened with the v2.38.0 PERFORMANCE CORE:
  *   • GPU line-batch engine — chart.addLineSeries() draws THOUSANDS of line
@@ -15,7 +15,21 @@
  *     options, drawing options, copy price, PNG screenshot, reset view and
  *     a first-class API for your own items (chart.addContextMenuItem).
  * No built-in indicators, no built-in cards — everything is opt-in; with
- * none of it enabled, v2.38.0 behaves exactly like v2.36.0.
+ * none of it enabled, v2.38.1 behaves exactly like v2.36.0.
+ *
+ * v2.38.1 — ALERTS UX HARDENING (this release):
+ *   • REMOVED the floating condition-glyph badges (▲▼◆●) that appeared as
+ *     unexplained shapes next to alert lines (user report).
+ *   • REMOVED the duplicate in-plot price chip + tiny axis bell chip; the
+ *     alert's exact price now lives in ONE full-slot tag on the price axis
+ *     (same geometry as the last-price tag), stacked/clamped so tags never
+ *     overwrite each other or the current-price row.
+ *   • Label chip moved ABOVE the line — the dashed line no longer strikes
+ *     through the Arabic label text.
+ *   • Drag hardened: muted alerts are draggable, the hit zone covers the
+ *     axis tag too (±9px), the level is clamped to the visible range while
+ *     dragging (it can never be lost off-screen), touch-drag works on
+ *     mobile, and snapping falls back to the symbol's decimal precision.
  *
  * THIS FILE IS A FULL LIBRARY, NOT A LAYER. Load it INSTEAD of chart.js —
  * nothing else is required. Every feature of the 2D edition ships inside
@@ -400,7 +414,7 @@
 'use strict';
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.38.0';
+const VERSION = '2.38.1';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 
 // v2.31.0/v2.32.0: the supported chart types (ids + display labels) — 20
@@ -16173,7 +16187,13 @@ class BadiAlertEngine {
       case 'crossUp': return prev < a.price && price >= a.price;
       case 'crossDown': return prev > a.price && price <= a.price;
       case 'cross': return (prev < a.price && price >= a.price) || (prev > a.price && price <= a.price);
-      case 'touch': return price >= a.price - 1e-12 && price <= a.price + 1e-12;
+      // v2.38.1: 'touch' means the price REACHED the level during the move —
+      // the old epsilon-only test (±1e-12) demanded an exact float match, so
+      // on real feeds the alert almost never fired ("it doesn't know the
+      // price accurately"). Now any move that crosses or lands on the level
+      // counts, and a small epsilon absorbs floating-point noise.
+      case 'touch': return (prev - a.price) * (price - a.price) <= 0 ||
+                            Math.abs(price - a.price) <= 1e-9;
       default: return false;
     }
   }
@@ -16182,7 +16202,13 @@ class BadiAlertEngine {
     a.firedCount++;
     a.lastFiredAt = now;
     a.state = 'fired';
-    a.flashUntil = now + 1600;
+    // v2.38.1 CRITICAL FIX: flashUntil MUST live on the performance.now()
+    // clock — draw() compares it against performance.now(). Seeding it with
+    // Date.now() (epoch ≈1.7e12 vs page-ms ≈1e4) made `now < flashUntil`
+    // true ~forever, so the flash ring's radius went to −2.9e10 →
+    // IndexSizeError EVERY frame after any alert fired, silently killing the
+    // whole post-render pass (axis tags, HUD, legend — "رسم خاطئ").
+    a.flashUntil = performance.now() + 1600;
     const msg = badiT(chart, 'triggered')(a.label, this._fmtPrice(a.price));
     chart.showToast(msg);
     this._beep('trigger');
@@ -16241,22 +16267,65 @@ class BadiAlertEngine {
   }
 
   /* --------------------------- hit testing + drag ------------------------ */
-  // Distance (px) from (x, y) to an alert line; the drag zone is a ±6px band
-  // across the plot area. Returns the topmost alert within tolerance.
+  // Distance (px) from (x, y) to an alert line OR its axis tag; the drag
+  // zone is a ±9px band across the plot area AND the price-axis strip (the
+  // tag is part of the handle — TradingView lets you grab the label too).
+  // Returns the topmost alert within tolerance.
   hitTest(x, y, tol) {
     const chart = this.chart;
     if (!this.alerts.length) return null;
-    if (x < chart.chartLeft - 4 || x > chart.chartRight + 4) return null;
+    if (x < chart.chartLeft - 4 || x > chart.W) return null;
     if (y < chart.priceTop - 6 || y > chart.priceBottom + 6) return null;
-    const t = (tol != null) ? tol : 6;
+    const t = (tol != null) ? tol : 9;
+    const layout = this._tagLayout();
     let best = null, bestD = Infinity;
-    for (const a of this.alerts) {
+    for (const it of layout) {
+      const a = it.a;
       const ly = chart.priceToY(a.price);
-      if (ly < chart.priceTop - 2 || ly > chart.priceBottom + 2) continue;
-      const d = Math.abs(y - ly);
+      // miss if BOTH the line and the tag are out of reach
+      const inPlot = ly >= chart.priceTop - 2 && ly <= chart.priceBottom + 2;
+      const dLine = inPlot ? Math.abs(y - ly) : Infinity;
+      const dTag = Math.abs(y - it.tagY);
+      const d = Math.min(dLine, dTag);
       if (d <= t && d < bestD) { bestD = d; best = a; }
     }
     return best;
+  }
+  /* v2.38.1 — axis tag layout (shared by the renderer and the hit test).
+   * Each alert gets ONE full-slot tag on the price axis at its exact price.
+   * Tags clamp to the plot edges (an alert priced outside the view stays
+   * reachable → draggable back in) and stack 19px apart so two alerts on
+   * nearly the same level never overwrite each other; the built-in
+   * last-price tag's row is respected the same way. O(n log n), n = alerts.
+   * Stacking is a single top-down sweep (tags are pushed DOWN only) — the
+   * naive push-away-then-clamp version let two clamped tags collapse onto
+   * the same edge row. */
+  _tagLayout() {
+    const chart = this.chart;
+    const top = chart.priceTop + 9, bot = chart.priceBottom - 9;
+    const clampY = (v) => (v < top ? top : (v > bot ? bot : v));
+    const candles = chart.sim && chart.sim.candles;
+    const lastY = (candles && candles.length)
+      ? chart.priceToY(candles[candles.length - 1].close) : null;
+    const items = this.alerts.map(a => ({
+      a: a, y: chart.priceToY(a.price), tagY: 0
+    })).sort((p, q) => p.y - q.y);
+    const GAP = 19;
+    let floor = top;                     // sweep: every tag sits ≥ GAP lower
+    for (const it of items) {
+      let y = clampY(it.y);
+      if (y < floor) y = floor;
+      // the immovable last-price row: shift to the alert's natural side
+      if (lastY != null && Math.abs(y - lastY) < GAP) {
+        const down = lastY + GAP, up = lastY - GAP;
+        y = (it.y >= lastY && down <= bot) ? down
+          : (up >= top ? up : down);
+        if (y < floor) y = floor;
+      }
+      it.tagY = y;
+      floor = y + GAP;
+    }
+    return items;
   }
   beginDrag(a, y) {
     this._drag = { alert: a, grabOffsetPx: this.chart.priceToY(a.price) - y };
@@ -16268,10 +16337,20 @@ class BadiAlertEngine {
     const chart = this.chart;
     let p = chart.yToPrice(y + this._drag.grabOffsetPx);
     // Snap to the symbol's min tick when the price scale has one — keeps
-    // the level on a tradable price (feels like TradingView).
-    const tick = chart.symbol && chart.symbol.priceScale ?
-      1 / (+chart.symbol.priceScale) : null;
+    // the level on a tradable price (feels like TradingView). No explicit
+    // priceScale → fall back to the symbol's decimal precision.
+    const sym = chart.symbol || {};
+    const tick = sym.priceScale ? 1 / (+sym.priceScale)
+      : (sym.decimals != null ? Math.pow(10, -(+sym.decimals)) : null);
     if (tick && isFinite(tick) && tick > 0) p = Math.round(p / tick) * tick;
+    // v2.38.1: keep the level INSIDE the visible price range while dragging
+    // — an alert dragged out of sight can no longer be grabbed, which made
+    // the line effectively unmovable ("must be draggable up and down").
+    const hi = Math.max(chart.yToPrice(chart.priceBottom - 9),
+                        chart.yToPrice(chart.priceTop + 9));
+    const lo = Math.min(chart.yToPrice(chart.priceBottom - 9),
+                        chart.yToPrice(chart.priceTop + 9));
+    p = Math.min(hi, Math.max(lo, p));
     a.price = p;
     a.state = 'idle';
     chart.invalidate();
@@ -16321,29 +16400,46 @@ class BadiAlertEngine {
       ctx.lineTo(R, Math.round(y) + 0.5);
       ctx.stroke();
       ctx.setLineDash([]);
-      // Bell glyph + label chip at the LEFT edge of the line
+      // Bell glyph at the LEFT edge of the line
       this._drawBell(ctx, L + 8, y, a.color, alpha);
-      if (a.label || a.cond !== 'cross') {
-        ctx.fillStyle = withAlpha(a.color, 0.92 * alpha);
-        ctx.font = '10px ui-sans-serif, system-ui, sans-serif';
+      // v2.38.1: user label chip ABOVE the line (was centered ON it — the
+      // dashed line struck through the Arabic text and read as garbled
+      // shapes). Opaque backing keeps it readable over candles/lines.
+      if (a.label) {
+        ctx.font = 'bold 10px ui-sans-serif, system-ui, sans-serif';
+        const tw = ctx.measureText(a.label).width;
+        const cw = tw + 10, ch = 14;
+        const cx = L + 18, cy = y - ch - 3;
+        ctx.fillStyle = withAlpha('#10131a', 0.72 * alpha);
+        _badiRoundRectPath(ctx, cx, cy, cw, ch, 4);
+        ctx.fill();
+        ctx.strokeStyle = withAlpha(a.color, 0.9 * alpha);
+        ctx.lineWidth = 1;
+        _badiRoundRectPath(ctx, cx, cy, cw, ch, 4);
+        ctx.stroke();
+        ctx.fillStyle = withAlpha(a.color, alpha);
         ctx.textAlign = 'left';
         ctx.textBaseline = 'middle';
-        const condTxt = a.label ? a.label : a.cond;
-        ctx.fillText(condTxt, L + 22, y - 1);
+        ctx.fillText(a.label, cx + 5, cy + ch / 2 + 0.5);
       }
-      // Right-edge price chip
-      this._drawChip(ctx, R, y, this._fmtPrice(a.price), a.color, alpha, a.enabled);
-      // Trigger flash: two expanding rings from the right edge
+      // v2.38.1: the exact price now lives in ONE place — the full-slot tag
+      // on the price axis (drawn later by _drawAlertAxisMarkers). The old
+      // in-plot right-edge chip + axis bell chip drew TWO extra floating
+      // cards per alert ("mystery shapes" per user report) — both removed.
+      // Trigger flash: two expanding rings from the right edge.
+      // v2.38.1: f is clamped to [0,1] and radii floored at 0.1 — a stale or
+      // foreign-clock flashUntil can no longer produce a negative arc radius
+      // (which threw IndexSizeError and killed the render pass).
       if (now < a.flashUntil) {
-        const f = 1 - (a.flashUntil - now) / 1600;         // 0 → 1
+        const f = Math.max(0, Math.min(1, 1 - (a.flashUntil - now) / 1600));  // 0 → 1
         ctx.strokeStyle = withAlpha(a.color, (1 - f) * 0.8);
         ctx.lineWidth = 2;
         ctx.beginPath();
-        ctx.arc(R - 10, y, 6 + f * 26, 0, Math.PI * 2);
+        ctx.arc(R - 10, y, Math.max(0.1, 6 + f * 26), 0, Math.PI * 2);
         ctx.stroke();
         ctx.strokeStyle = withAlpha(a.color, (1 - f) * 0.4);
         ctx.beginPath();
-        ctx.arc(R - 10, y, 6 + f * 44, 0, Math.PI * 2);
+        ctx.arc(R - 10, y, Math.max(0.1, 6 + f * 44), 0, Math.PI * 2);
         ctx.stroke();
       }
     }
@@ -16366,22 +16462,6 @@ class BadiAlertEngine {
     ctx.arc(x, y + 3.6, 1.1, 0, Math.PI * 2);
     ctx.fill();
     ctx.restore();
-  }
-  _drawChip(ctx, rightX, y, text, color, alpha, enabled) {
-    const ctxW = (rightX - 4) - 0;              // chip right anchor
-    ctx.font = 'bold 10px ui-monospace, SFMono-Regular, Menlo, monospace';
-    const tw = ctx.measureText(text).width;
-    const w = tw + 12, h = 15;
-    const x = ctxW - w, cy = y - h / 2;
-    ctx.fillStyle = withAlpha(color, (enabled ? 0.95 : 0.4));
-    _badiRoundRectPath(ctx, x, cy, w, h, 3);
-    ctx.fill();
-    // text color: dark on light chip colors, white otherwise (luma check)
-    const luma = _badiLuma(color);
-    ctx.fillStyle = luma > 150 ? '#10131a' : '#ffffff';
-    ctx.textAlign = 'left';
-    ctx.textBaseline = 'middle';
-    ctx.fillText(text, x + 6, cy + h / 2 + 0.5);
   }
 }
 
@@ -17412,8 +17492,11 @@ TradingChart.prototype.onMouseDown = function (e) {
   if (this._alerts && this._alerts.alerts.length) {
     const r = this.canvas.getBoundingClientRect();
     const x = e.clientX - r.left, y = e.clientY - r.top;
+    // v2.38.1: disabled (muted) alerts are draggable too — muting an alert
+    // must not freeze it in place; the dimmed styling already communicates
+    // its state, and the right-click menu still manages enable/disable.
     const hitAlert = this._alerts.hitTest(x, y);
-    if (hitAlert && hitAlert.enabled !== false) {
+    if (hitAlert) {
       this._alerts.beginDrag(hitAlert, y);
       this.invalidate();
       return;
@@ -17458,8 +17541,25 @@ TradingChart.prototype.onMouseUp = function (e) {
 /* ============================ TOUCH LONG-PRESS ============================= */
 // 550ms press with <10px movement opens the same context menu on mobile
 // (plus a 10ms haptic tick where supported). A moved finger = pan, no menu.
+// v2.38.1: a finger that starts ON an alert line/tag drags THE ALERT up and
+// down (mobile parity with the mouse drag) — moving cancels the long-press
+// timer, holding still for 550ms still opens the menu, and the pan is
+// suppressed while an alert is being dragged.
 const _origTouchStart = TradingChart.prototype.onTouchStart;
 TradingChart.prototype.onTouchStart = function (e) {
+  // alert grab — before the long-press machinery, so the drag wins on move
+  this._alertTouchDrag = null;
+  if (e.touches && e.touches.length === 1 && !this._isSyntheticMouse(e) &&
+      this._alerts && this._alerts.alerts.length) {
+    const t = e.touches[0];
+    const r = this.canvas.getBoundingClientRect();
+    const hitAlert = this._alerts.hitTest(t.clientX - r.left, t.clientY - r.top);
+    if (hitAlert) {
+      this._alertTouchDrag = hitAlert;
+      this._alerts.beginDrag(hitAlert, t.clientY - r.top);
+      this.invalidate();
+    }
+  }
   if (e.touches && e.touches.length === 1 && !this._isSyntheticMouse(e)) {
     const t = e.touches[0];
     const r = this.canvas.getBoundingClientRect();
@@ -17478,6 +17578,12 @@ TradingChart.prototype.onTouchStart = function (e) {
           this.isDragging = false;
           this._momentum = null;
           this._panVelocity = 0;
+          // a long-press that opened the menu is NOT a drag — release the
+          // alert grabbed by touchstart so the menu doesn't fight the drag
+          if (this._alertTouchDrag) {
+            this._alertTouchDrag = null;
+            this._alerts.endDrag();
+          }
           if (navigator.vibrate) { try { navigator.vibrate(10); } catch (_) {} }
         }
       }
@@ -17487,6 +17593,18 @@ TradingChart.prototype.onTouchStart = function (e) {
 };
 const _origTouchMove = TradingChart.prototype.onTouchMove;
 TradingChart.prototype.onTouchMove = function (e) {
+  if (this._alertTouchDrag && e.touches && e.touches.length === 1) {
+    const t = e.touches[0];
+    const r = this.canvas.getBoundingClientRect();
+    // cancel the long-press menu — a moving finger on an alert is a DRAG
+    if (this._lp) this._lp.moved = true;
+    clearTimeout(this._lpTimer);
+    this.isDragging = false;          // suppress the pan armed by touchstart
+    this._momentum = null;
+    this._panVelocity = 0;
+    this._alerts.dragTo(t.clientY - r.top);
+    return;
+  }
   if (this._lp && e.touches && e.touches.length === 1) {
     const t = e.touches[0];
     if (Math.abs(t.clientX - this._lp.cx) > 10 || Math.abs(t.clientY - this._lp.cy) > 10) {
@@ -17499,6 +17617,13 @@ TradingChart.prototype.onTouchMove = function (e) {
 const _origTouchEnd = TradingChart.prototype.onTouchEnd;
 TradingChart.prototype.onTouchEnd = function (e) {
   clearTimeout(this._lpTimer);
+  if (this._alertTouchDrag) {
+    this._alertTouchDrag = null;
+    this._alerts.endDrag();
+    this._lp = null;
+    this._lpConsumed = false;
+    return;
+  }
   const consumed = this._lpConsumed;
   this._lp = null;
   this._lpConsumed = false;
@@ -17526,7 +17651,7 @@ TradingChart.prototype.destroy = function () {
 //   BadiCharts.BADIPerf.Decimator.minMaxKeep(...)
 //   BadiCharts.BADIAlerts.I18N.ar.addAlert
 const BADIPerfNS = {
-  version: '2.38.0',
+  version: '2.38.1',
   Engine: BadiPerfEngine, Series: BadiPerfSeries, Chunk: BadiPerfChunk,
   GLLines: BadiGLLines, Decimator: BadiDecimator, LODCache: BadiLODCache,
   Grid: BadiSpatialGrid, Workers: BadiWorkerPool, Ring64: BadiRing64,
@@ -17534,7 +17659,7 @@ const BADIPerfNS = {
   config: BADI_PERF_DEFAULTS
 };
 const BADIAlertsNS = {
-  version: '2.38.0',
+  version: '2.38.1',
   Engine: BadiAlertEngine, Menu: BadiContextMenu,
   I18N: BADI_I18N, Icons: BADI_MENU_ICONS
 };
@@ -17544,7 +17669,7 @@ if (typeof window !== 'undefined') {
   if (window.BadiChartsWebGL) {
     window.BadiChartsWebGL.BADIPerf = BADIPerfNS;
     window.BadiChartsWebGL.BADIAlerts = BADIAlertsNS;
-    window.BadiChartsWebGL.PERF_EDITION = '2.38.0';
+    window.BadiChartsWebGL.PERF_EDITION = '2.38.1';
   }
 }
 
@@ -19200,7 +19325,7 @@ const BADI_SELFTEST = (() => {
     const fail = results.length - pass;
     return { pass: pass, fail: fail, total: results.length, results: results.slice() };
   }
-  return { run: run, version: '2.38.0' };
+  return { run: run, version: '2.38.1' };
 })();
 
 /* expose on the chart class + globals */
@@ -19238,10 +19363,11 @@ if (typeof window !== 'undefined') {
  * ========================================================================== */
 
 /* ============================ AXIS ALERT MARKERS =========================== */
-// v2.38.0: right-edge price-axis ticks for every alert. Drawn in the
+// v2.38.1: right-edge price-axis TAGS for every alert. Drawn in the
 // post-render 2D pass (device-px transform), AFTER the axis text replay so
-// they sit on top. The tick is a 14×10 rounded chip in the alert color with
-// a 3px bell glyph; a lighter dot marks DISABLED alerts. Cheap: O(alerts).
+// they sit on top. One full-slot price tag per alert (last-price tag
+// geometry) — the exact alert price is always readable on the axis, tags
+// stack and clamp via the engine's _tagLayout(). Cheap: O(alerts).
 TradingChart.prototype._drawAlertAxisMarkers = function (nctx, dpr) {
   if (!this._alerts || this._alerts.alerts.length === 0) return;
   const chart = this;
@@ -19249,37 +19375,29 @@ TradingChart.prototype._drawAlertAxisMarkers = function (nctx, dpr) {
   const axisX = chart.chartRight;                  // axis strip starts here
   const axisW = Math.max(0, chart.W - chart.chartRight);
   if (axisW < 8) return;
-  const ps = chart.priceScale;
-  const range = ps && ps.priceRange();
-  if (!range) return;
   ctx.save();
-  ctx.font = '9px ui-sans-serif, system-ui, sans-serif';
-  ctx.textAlign = 'center';
+  ctx.font = '11px -apple-system, Segoe UI, Roboto, sans-serif';
+  ctx.textAlign = 'right';
   ctx.textBaseline = 'middle';
-  for (const a of chart._alerts.alerts) {
-    const y = chart.priceToY(a.price);
-    if (y < chart.priceTop || y > chart.priceBottom) continue;
-    const chipH = 11, chipW = Math.min(axisW - 6, 26);
-    const x0 = axisX + 4;
+  // v2.38.1: ONE full-slot tag per alert — same geometry as the built-in
+  // last-price tag (spans chartRight..W, 18px tall, text right-aligned at
+  // W-6 with the axis digits' own font). Replaces the old floating in-plot
+  // chip + tiny bell chip that read as unexplained shapes on the axis.
+  // Layout (clamp + stacking, incl. the last-price row) comes from the
+  // engine so the hit test and the picture can never disagree.
+  for (const it of chart._alerts._tagLayout()) {
+    const a = it.a;
+    const tagY = Math.round(it.tagY) - 9;
     const alpha = a.enabled ? 1 : 0.45;
-    // chip
-    ctx.fillStyle = withAlpha(a.color, 0.92 * alpha);
-    _badiRoundRectPath(ctx, x0, y - chipH / 2, chipW, chipH, 3);
-    ctx.fill();
-    // bell glyph (vector, scaled to the chip)
-    ctx.strokeStyle = _badiChipText(a.color);
-    ctx.lineWidth = 1.1;
-    const cx = x0 + chipW / 2;
-    const cy = y;
-    ctx.beginPath();
-    ctx.moveTo(cx - 2.6, cy + 1.6);
-    ctx.quadraticCurveTo(cx - 2.6, cy - 2.8, cx, cy - 2.8);
-    ctx.quadraticCurveTo(cx + 2.6, cy - 2.8, cx + 2.6, cy + 1.6);
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.arc(cx, cy + 2.6, 0.8, 0, Math.PI * 2);
+    // opaque slot + colored fill (dims when the alert is muted)
+    ctx.fillStyle = withAlpha(a.color, 0.95 * alpha);
+    ctx.fillRect(axisX, tagY, axisW, 18);
+    // 1px darker seam above/below so the slot reads as a "row", not a blob
+    ctx.fillStyle = withAlpha('#000000', 0.18 * alpha);
+    ctx.fillRect(axisX, tagY + 17, axisW, 1);
+    // price text — dark on light tag colors, white otherwise (luma check)
     ctx.fillStyle = _badiChipText(a.color);
-    ctx.fill();
+    ctx.fillText(chart._alerts._fmtPrice(a.price), chart.W - 6, tagY + 9.5);
   }
   ctx.restore();
 };
@@ -19308,38 +19426,13 @@ function _badiChipText(css) {
   after._badiAxisWrapped = true;
 })();
 
-/* click an axis marker → same menu as clicking the line (mobile parity) */
-(function () {
-  const down = TradingChart.prototype.onMouseDown;
-  if (down._badiAxisHitWrapped) return;
-  TradingChart.prototype.onMouseDown = function (e) {
-    // Priority BELOW alert-line drag (that wrap already ran) but ABOVE the
-    // legacy handler: a press on the axis strip near a marker selects it.
-    if (this._alerts && this._alerts.alerts.length) {
-      const r = this.canvas.getBoundingClientRect();
-      const x = e.clientX - r.left, y = e.clientY - r.top;
-      if (x > this.chartRight && x <= this.W && y >= this.priceTop && y <= this.priceBottom) {
-        let best = null, bestD = 12;
-        for (const a of this._alerts.alerts) {
-          const ay = this.priceToY(a.price);
-          const d = Math.abs(y - ay);
-          if (d <= bestD) { bestD = d; best = a; }
-        }
-        if (best) {
-          this._perfEnsure();
-          this._menu.open({
-            x: x, y: y, clientX: e.clientX, clientY: e.clientY,
-            price: best.price, idx: this.xToIndex(x),
-            target: { kind: 'alert', alert: best }
-          });
-          return;
-        }
-      }
-    }
-    return down.call(this, e);
-  };
-  down._badiAxisHitWrapped = true;
-})();
+/* click an axis marker → same menu as clicking the line (mobile parity)
+ * v2.38.1 REMOVED: this wrap hijacked EVERY left-press near the axis, so an
+ * alert could no longer be dragged by its tag (and it duplicated what the
+ * right-click path already does — onRightClick → _openMenuAt → hitTest,
+ * whose zone now covers the axis strip incl. the tags). Left-press on a tag
+ * now falls through to the alert-drag wrap; right-click / long-press still
+ * open the alert menu. */
 
 /* ============================ KEYBOARD SHORTCUTS ============================ */
 // v2.38.0:
@@ -19386,60 +19479,13 @@ function _badiChipText(css) {
 })();
 
 /* ============================ CONDITION BADGES ============================= */
-// v2.38.0: an 8px vector glyph after the bell on every alert line showing
-// WHAT the alert watches: ▲ above / crossUp, ▼ below / crossDown, ◆ cross,
-// ● touch. Same 2D pass as the line labels — drawn when the label zone is
-// shown (a.label set OR cond ≠ cross). Zero cost when there are no alerts.
-(function () {
-  const drawBell = BadiAlertEngine.prototype._drawBell;
-  if (drawBell._badiBadgeWrapped) return;
-  BadiAlertEngine.prototype._drawBell = function (ctx, x, y, color, alpha) {
-    drawBell.call(this, ctx, x, y, color, alpha);
-    // The badge is drawn by draw() itself (needs a.cond) — kept here as a
-    // no-op hook point so future glyph changes stay in one file.
-  };
-  drawBell._badiBadgeWrapped = true;
-})();
-
-(function () {
-  const draw = BadiAlertEngine.prototype.draw;
-  if (draw._badiCondGlyphWrapped) return;
-  BadiAlertEngine.prototype.draw = function (nctx, dpr) {
-    draw.call(this, nctx, dpr);
-    // Second pass for glyphs (cheap: O(alerts), only when any label shows).
-    const chart = this.chart;
-    const alerts = this.alerts.filter(a => (a.label || a.cond !== 'cross'));
-    if (!alerts.length) return;
-    const ctx = nctx;
-    if (!ctx) return;
-    const L = chart.chartLeft;
-    ctx.save();
-    ctx.beginPath();
-    ctx.rect(L, chart.priceTop, chart.chartRight - L, chart.priceBottom - chart.priceTop);
-    ctx.clip();
-    for (const a of alerts) {
-      const y = chart.priceToY(a.price);
-      if (y < chart.priceTop - 20 || y > chart.priceBottom + 20) continue;
-      const gx = L + 20 + (a.label ? ctx.measureText(a.label).width + 8 : 0);
-      const alpha = a.enabled ? 0.95 : 0.4;
-      ctx.fillStyle = withAlpha(a.color, alpha);
-      ctx.beginPath();
-      if (a.cond === 'above' || a.cond === 'crossUp') {
-        ctx.moveTo(gx, y - 3); ctx.lineTo(gx + 8, y - 3); ctx.lineTo(gx + 4, y - 10);
-      } else if (a.cond === 'below' || a.cond === 'crossDown') {
-        ctx.moveTo(gx, y + 3); ctx.lineTo(gx + 8, y + 3); ctx.lineTo(gx + 4, y + 10);
-      } else if (a.cond === 'touch') {
-        ctx.arc(gx + 4, y - 3, 3.2, 0, Math.PI * 2);
-      } else {   // cross
-        ctx.moveTo(gx + 4, y - 10); ctx.lineTo(gx + 8, y - 3); ctx.lineTo(gx + 4, y + 4); ctx.lineTo(gx, y - 3);
-      }
-      ctx.closePath();
-      ctx.fill();
-    }
-    ctx.restore();
-  };
-  draw._badiCondGlyphWrapped = true;
-})();
+/* v2.38.1 REMOVED (user report: "mystery shapes appear on the alert line —
+ * remove them"): the second-pass glyph painter drew ▲/▼/◆/● badges NEXT to
+ * each label, but it measured the label with the WRONG canvas font (draw()
+ * had already restored its state), so the badge landed at a shifted x — on
+ * short Arabic labels it floated mid-chart as an unexplained diamond blob.
+ * The condition stays visible where it belongs: the right-click menu on the
+ * alert line and the trigger toast — no extra canvas glyphs. */
 
 /* ============================ LABEL + CONFIG APIS ========================== */
 TradingChart.prototype.setAlertLabel = function (id, label) {
@@ -19771,7 +19817,7 @@ TradingChart.prototype.testAlert = function (id) {
 TradingChart.prototype.exportPerfReport = function () {
   const snap = this.getPerfStats();
   return JSON.stringify({
-    version: '2.38.0',
+    version: '2.38.1',
     at: new Date().toISOString(),
     dpr: this.dpr,
     canvas: { w: this.W, h: this.H },
