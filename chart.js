@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.36.0 — Pixel-Perfect Pure JavaScript Trading Chart Library
+ * BADI-CHARTS-V2 v2.38.2 — Pixel-Perfect Pure JavaScript Trading Chart Library
  *
  * A lightweight, dependency-free candlestick charting library built entirely
  * with the HTML5 Canvas API. Inspired by TradingView Lightweight Charts.
@@ -378,7 +378,7 @@ var Path2D = (typeof window !== 'undefined' && window.Path2D)
     })();
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.36.0';
+const VERSION = '2.38.2';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 
 // v2.31.0/v2.32.0: the supported chart types (ids + display labels) — 20
@@ -9719,21 +9719,26 @@ class TradingChart {
     const fmt = this._countdown.format || 'auto';
     let text;
     if (fmt === 'auto') {
-      // v2.20.2: pick the largest unit whose value fits in 2 digits, based on
-      // the ACTUAL remaining time (not the timeframe).
-      if (remainingSec < 100) {
-        text = pad2(remainingSec);
-      } else if (remainingSec < 6000) {
-        text = pad2(Math.floor(remainingSec / 60));
-      } else if (remainingSec < 360000) {
-        text = pad2(Math.floor(remainingSec / 3600));
-      } else if (remainingSec < 8640000) {
-        text = pad2(Math.floor(remainingSec / 86400));
+      // v2.38.2 FIX: 'auto' is TIMEFRAME-BASED (TradingView-style). The
+      // countdown keeps a CONSTANT shape on every candle of a timeframe:
+      //   tf <= 1m    → "ss"       (2 digits, e.g. "59")
+      //   1m < tf < 1h → "mm:ss"   (4 digits, e.g. "04:31" on 5m/15m/30m)
+      //   tf >= 1h    → "hh:mm:ss" (6 digits, e.g. "02:59:59" on 4H/1D)
+      // The old remaining-based picker showed a bare 2-digit unit ("03"
+      // hours on a 4H chart) which read as broken on big timeframes.
+      if (tfSec <= 60) {
+        text = pad2(remainingSec % 60);
+      } else if (tfSec < 3600) {
+        text = pad2(Math.floor(remainingSec / 60)) + ':' + pad2(remainingSec % 60);
       } else {
-        text = pad2(Math.min(99, Math.floor(remainingSec / 604800)));
+        text = pad2(Math.floor(remainingSec / 3600)) + ':' +
+          pad2(Math.floor((remainingSec % 3600) / 60)) + ':' + pad2(remainingSec % 60);
       }
+    } else if (fmt === 'hh:mm:ss') {
+      text = pad2(Math.floor(remainingSec / 3600)) + ':' +
+        pad2(Math.floor((remainingSec % 3600) / 60)) + ':' + pad2(remainingSec % 60);
     } else if (fmt === 'hh:mm') {
-      text = Math.floor(remainingSec / 3600) + ':' + pad2(Math.floor((remainingSec % 3600) / 60));
+      text = pad2(Math.floor(remainingSec / 3600)) + ':' + pad2(Math.floor((remainingSec % 3600) / 60));
     } else if (fmt === 'mm:ss') {
       text = Math.floor(remainingSec / 60) + ':' + pad2(remainingSec % 60);
     } else if (fmt === 'ss') {

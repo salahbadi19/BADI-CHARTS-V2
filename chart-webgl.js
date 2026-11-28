@@ -1,5 +1,5 @@
 /* =============================================================================
- * BADI-CHARTS-V2 v2.38.1 — PERFORMANCE EDITION (chart-webgl.js)
+ * BADI-CHARTS-V2 v2.38.2 — PERFORMANCE EDITION (chart-webgl.js)
  * The complete standalone trading chart library, rendered with real WebGL,
  * hardened with the v2.38.0 PERFORMANCE CORE:
  *   • GPU line-batch engine — chart.addLineSeries() draws THOUSANDS of line
@@ -30,6 +30,15 @@
  *     axis tag too (±9px), the level is clamped to the visible range while
  *     dragging (it can never be lost off-screen), touch-drag works on
  *     mobile, and snapping falls back to the symbol's decimal precision.
+ *
+ * v2.38.2 — COUNTDOWN FIX (this release):
+ *   • 'auto' countdown format is TIMEFRAME-BASED (TradingView-style):
+ *     <= 1m shows "ss" (2 digits), 2m-30m shows "mm:ss" (4 digits),
+ *     1H and above shows "hh:mm:ss" (6 digits — e.g. 4H → "02:59:59",
+ *     1D → "23:59:59"). The old remaining-based picker showed a bare
+ *     2-digit unit ("03" hours on 4H) which read as broken on big
+ *     timeframes (user report).
+ *   • New explicit format 'hh:mm:ss'. Fixed in BOTH engines.
  *
  * THIS FILE IS A FULL LIBRARY, NOT A LAYER. Load it INSTEAD of chart.js —
  * nothing else is required. Every feature of the 2D edition ships inside
@@ -414,7 +423,7 @@
 'use strict';
 
 /* ============================ VERSION ====================================== */
-const VERSION = '2.38.1';
+const VERSION = '2.38.2';
 const BADI_DEBUG = false; // Set to true to enable debug logging
 
 // v2.31.0/v2.32.0: the supported chart types (ids + display labels) — 20
@@ -11776,7 +11785,8 @@ class TradingChart {
   //   < 100 hours   → hours    (e.g. "23", "04", "01")
   //   < 100 days    → days     (e.g. "30", "07", "01")
   //   else          → weeks    (clamped at 99 — only for 2+ year candles)
-  // Explicit formats still supported: 'hh:mm' | 'mm:ss' | 'ss' | 'hh' | 'mm'.
+  // v2.38.2: 'auto' is TIMEFRAME-BASED — <=1m "ss" | <1h "mm:ss" | >=1h "hh:mm:ss".
+  // Explicit formats still supported: 'hh:mm:ss' | 'hh:mm' | 'mm:ss' | 'ss' | 'hh' | 'mm'.
   drawCountdown(now) {
     if (!this._countdown || !this._countdown.enabled) return;
     const candles = this.sim.candles;
@@ -11816,25 +11826,26 @@ class TradingChart {
     const fmt = this._countdown.format || 'auto';
     let text;
     if (fmt === 'auto') {
-      // v2.20.2: pick the largest unit whose value fits in 2 digits, based on
-      // the ACTUAL remaining time (not the timeframe). This way a misaligned
-      // feed that puts the last candle in the future can't pin the countdown
-      // at "99" — it gracefully shows the right unit (e.g. "03" hours for a
-      // 3-hour-out close on an H1 chart).
-      if (remainingSec < 100) {
-        text = pad2(remainingSec);
-      } else if (remainingSec < 6000) {
-        text = pad2(Math.floor(remainingSec / 60));
-      } else if (remainingSec < 360000) {
-        text = pad2(Math.floor(remainingSec / 3600));
-      } else if (remainingSec < 8640000) {
-        text = pad2(Math.floor(remainingSec / 86400));
+      // v2.38.2 FIX: 'auto' is TIMEFRAME-BASED (TradingView-style). The
+      // countdown keeps a CONSTANT shape on every candle of a timeframe:
+      //   tf <= 1m    → "ss"       (2 digits, e.g. "59")
+      //   1m < tf < 1h → "mm:ss"   (4 digits, e.g. "04:31" on 5m/15m/30m)
+      //   tf >= 1h    → "hh:mm:ss" (6 digits, e.g. "02:59:59" on 4H/1D)
+      // The old remaining-based picker showed a bare 2-digit unit ("03"
+      // hours on a 4H chart) which read as broken on big timeframes.
+      if (tfSec <= 60) {
+        text = pad2(remainingSec % 60);
+      } else if (tfSec < 3600) {
+        text = pad2(Math.floor(remainingSec / 60)) + ':' + pad2(remainingSec % 60);
       } else {
-        // 100+ days → weeks. Clamp at 99 (only fires for 2+ year candles).
-        text = pad2(Math.min(99, Math.floor(remainingSec / 604800)));
+        text = pad2(Math.floor(remainingSec / 3600)) + ':' +
+          pad2(Math.floor((remainingSec % 3600) / 60)) + ':' + pad2(remainingSec % 60);
       }
+    } else if (fmt === 'hh:mm:ss') {
+      text = pad2(Math.floor(remainingSec / 3600)) + ':' +
+        pad2(Math.floor((remainingSec % 3600) / 60)) + ':' + pad2(remainingSec % 60);
     } else if (fmt === 'hh:mm') {
-      text = Math.floor(remainingSec / 3600) + ':' + pad2(Math.floor((remainingSec % 3600) / 60));
+      text = pad2(Math.floor(remainingSec / 3600)) + ':' + pad2(Math.floor((remainingSec % 3600) / 60));
     } else if (fmt === 'mm:ss') {
       text = Math.floor(remainingSec / 60) + ':' + pad2(remainingSec % 60);
     } else if (fmt === 'ss') {
